@@ -1,4 +1,5 @@
 packages:
   - "artifacts/*"
-minimumReleaseAgeExclude:
-  - '@anthropic-ai/sdk@0.97.0'
+
+onlyBuiltDependencies:
+  - better-sqlite3
