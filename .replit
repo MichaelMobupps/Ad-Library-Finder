@@ -14,3 +14,4 @@ externalPort = 80
 [env]
 NODE_ENV = "production"
 PORT = "3001"
+PLAYWRIGHT_BROWSERS_PATH = "0"
