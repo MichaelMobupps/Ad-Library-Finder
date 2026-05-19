@@ -1,0 +1,12 @@
+{
+  "name": "ad-library-finder",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "pnpm --filter dashboard build && pnpm --filter api-server build",
+    "start": "pnpm --filter api-server start",
+    "dev:api": "pnpm --filter api-server dev",
+    "dev:ui": "pnpm --filter dashboard dev",
+    "install:playwright": "pnpm --filter api-server exec playwright install chromium"
+  }
+}

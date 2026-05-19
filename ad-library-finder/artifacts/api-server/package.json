@@ -1,0 +1,29 @@
+{
+  "name": "api-server",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.97.0",
+    "better-sqlite3": "^11.5.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.1",
+    "google-auth-library": "^9.14.0",
+    "googleapis": "^144.0.0",
+    "nanoid": "^5.0.7",
+    "playwright": "^1.48.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.7.5",
+    "tsx": "^4.19.1",
+    "typescript": "^5.6.3"
+  }
+}
