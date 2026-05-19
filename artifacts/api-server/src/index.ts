@@ -1,25 +1,53 @@
-import app from "./app";
-import { logger } from "./lib/logger";
+import 'dotenv/config';
+import express from 'express';
+import { existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
+import { initDb } from './db.js';
+import { jobsRouter } from './routes-jobs.js';
+import { healthRouter } from './routes-health.js';
+import { authRouter } from './routes-auth.js';
+import { settingsRouter } from './routes-settings.js';
+import { startQueue } from './queue.js';
+import { log } from './logger.js';
 
-const rawPort = process.env["PORT"];
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-if (!rawPort) {
-  throw new Error(
-    "PORT environment variable is required but was not provided.",
-  );
-}
+async function main() {
+  await initDb();
 
-const port = Number(rawPort);
+  const app = express();
+  app.use(express.json({ limit: '1mb' }));
 
-if (Number.isNaN(port) || port <= 0) {
-  throw new Error(`Invalid PORT value: "${rawPort}"`);
-}
+  app.use((req, _res, next) => {
+    log.info(`${req.method} ${req.path}`);
+    next();
+  });
 
-app.listen(port, (err) => {
-  if (err) {
-    logger.error({ err }, "Error listening on port");
-    process.exit(1);
+  app.use('/api/health', healthRouter);
+  app.use('/api/jobs', jobsRouter);
+  app.use('/api/auth', authRouter);
+  app.use('/api/settings', settingsRouter);
+
+  const dashboardDist = path.resolve(__dirname, '../../dashboard/dist');
+  if (existsSync(dashboardDist)) {
+    app.use(express.static(dashboardDist));
+    app.get('*', (_req, res) => {
+      res.sendFile(path.join(dashboardDist, 'index.html'));
+    });
+  } else {
+    log.warn(`Dashboard build not found at ${dashboardDist}. Run 'pnpm --filter dashboard build'.`);
   }
 
-  logger.info({ port }, "Server listening");
+  startQueue();
+
+  const port = Number(process.env.PORT) || 3001;
+  app.listen(port, '0.0.0.0', () => {
+    log.info(`api-server listening on :${port}`);
+  });
+}
+
+main().catch((err) => {
+  console.error('Fatal startup error:', err);
+  process.exit(1);
 });
