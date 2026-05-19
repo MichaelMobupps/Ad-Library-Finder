@@ -3,6 +3,22 @@ import { mkdirSync, existsSync, copyFileSync, readdirSync, accessSync, constants
 import path from 'node:path';
 import { log } from './logger.js';
 
+/**
+ * Stable-library-closure fix for Playwright on NixOS-based hosts (Replit).
+ *
+ * Problem: Chromium's headless-shell binary links against /nix/store/<hash>-name/lib/...
+ * paths. Between Replit deploys those hashes "rot" — the exact /nix/store paths the
+ * binary was linked against may no longer exist, so chromium fails to launch with
+ * "libglib-2.0.so.0: cannot open shared object file".
+ *
+ * Fix: at process startup, ldd the binary, snapshot every resolved /nix/store/*.so
+ * path to a project-local ./.lib-stable/ directory, and prepend that directory to
+ * LD_LIBRARY_PATH. Subsequent Chromium launches inherit the env and resolve their
+ * libs from the snapshot instead of /nix/store.
+ *
+ * Mirrors the v2.5b.5.3 Phase B fix from LinkedIn Prospector.
+ */
+
 const LIB_STABLE_DIR = path.resolve('.lib-stable');
 
 export function prepareStableLibraryClosure(): void {
@@ -28,6 +44,7 @@ export function prepareStableLibraryClosure(): void {
   try {
     lddOutput = execSync(`ldd "${chromium}"`, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
   } catch (err) {
+    // ldd exits non-zero when libs are missing, but still prints the resolved ones
     const e = err as { stdout?: Buffer | string };
     lddOutput = typeof e.stdout === 'string' ? e.stdout : e.stdout?.toString('utf8') ?? '';
     if (!lddOutput) {
@@ -49,7 +66,7 @@ export function prepareStableLibraryClosure(): void {
       accessSync(src, constants.R_OK);
     } catch {
       missing++;
-      continue;
+      continue; // Phantom hwcaps / vdso etc. — silently skip
     }
     const dest = path.join(LIB_STABLE_DIR, path.basename(src));
     if (existsSync(dest)) {
@@ -71,6 +88,8 @@ export function prepareStableLibraryClosure(): void {
 }
 
 function findChromiumBinary(): string | null {
+  // Primary path with pnpm + PLAYWRIGHT_BROWSERS_PATH=0:
+  //   node_modules/.pnpm/playwright-core@<ver>/node_modules/playwright-core/.local-browsers/chromium_headless_shell-<rev>/chrome-headless-shell-linux64/chrome-headless-shell
   const pnpmDir = 'node_modules/.pnpm';
   if (existsSync(pnpmDir)) {
     const pwDirs = readdirSync(pnpmDir).filter((n) => n.startsWith('playwright-core@'));
@@ -80,7 +99,9 @@ function findChromiumBinary(): string | null {
       if (found) return found;
     }
   }
-  return locateInBrowsersDir('node_modules/playwright-core/.local-browsers');
+  // Hoisted fallback
+  const hoisted = 'node_modules/playwright-core/.local-browsers';
+  return locateInBrowsersDir(hoisted);
 }
 
 function locateInBrowsersDir(browsersDir: string): string | null {
