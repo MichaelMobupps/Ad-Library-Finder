@@ -8,6 +8,7 @@ import { jobsRouter } from './routes-jobs.js';
 import { healthRouter } from './routes-health.js';
 import { authRouter } from './routes-auth.js';
 import { settingsRouter } from './routes-settings.js';
+import { prepareStableLibraryClosure } from './browserSetup.js';
 import { startQueue } from './queue.js';
 import { log } from './logger.js';
 
@@ -15,6 +16,9 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 async function main() {
   await initDb();
+
+  // Nix-rot fix: snapshot Chromium shared-library deps before any Playwright launch
+  prepareStableLibraryClosure();
 
   const app = express();
   app.use(express.json({ limit: '1mb' }));
