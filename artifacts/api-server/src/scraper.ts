@@ -157,93 +157,204 @@ async function dismissOverlays(page: Page) {
 }
 
 /**
- * Extracts ad cards from the current Ad Library DOM.
- * NOTE: Meta's class names are obfuscated and change. This selector strategy
- * targets stable structural cues: each ad card is a child of a result list
- * container, has an "Library ID" label, and a link to fbclid-tracked landing.
+ * Extract ad cards from the Ad Library DOM.
  *
- * If this breaks, the right fix is to update the selectors in this single fn.
+ * Card structure (verified live 2026-05-20 against US "mobile game" query):
+ *
+ *   - Each card is the smallest DOM ancestor that contains BOTH a
+ *     "Library ID: <digits>" leaf AND a "Sponsored" leaf (~150-200
+ *     descendant elements).
+ *
+ *   - Advertiser name + page URL: first <a> in the card whose href is
+ *     of the form facebook.com/<page-id-or-handle>/ (NOT a
+ *     /ads/library/?view_all_page_id=... link, which sometimes is also
+ *     present but isn't always the primary). Its visible text is the
+ *     advertiser name.
+ *
+ *   - Store URL (CRITICAL): the card holds an <a> whose href is
+ *     `https://l.facebook.com/l.php?u=<url-encoded store URL>&h=...`.
+ *     The `u` parameter decodes to a real play.google.com or
+ *     itunes.apple.com / apps.apple.com URL. This is what the previous
+ *     extractor missed — it rejected anything containing "facebook.com"
+ *     before checking the redirect form, so the store URL never flowed
+ *     through to the classifier and every mobile row was dropped at
+ *     CSV time.
+ *
+ *   - Ad copy: a leaf text node inside the card, longer than 30 chars
+ *     and not matching the metadata-block patterns (Library ID, dates,
+ *     platform labels, durations, "Sponsored", "Active", etc.).
+ *
+ * Dedup by Library ID. Cards without an advertiser name are skipped.
  */
 async function extractAdsFromDom(page: Page, country: string): Promise<RawAd[]> {
-  return await page.evaluate((cc: string) => {
-    function getAdvertiserName(card: Element): string | null {
-      // Advertiser name is usually an <a> with bold text near the top of the card
-      const candidates = card.querySelectorAll('a[role="link"] span');
-      for (const span of Array.from(candidates)) {
-        const t = (span.textContent || '').trim();
-        if (t.length > 0 && t.length < 80 && !t.startsWith('Library ID') && !t.includes('Sponsored')) {
-          return t;
-        }
-      }
-      return null;
-    }
-    function getPageUrl(card: Element): string | null {
-      const a = card.querySelector('a[href*="/ads/library/?view_all_page_id="]') as HTMLAnchorElement | null;
-      return a?.href || null;
-    }
-    function getLandingUrl(card: Element): string | null {
-      // CTA link — usually has rel="nofollow" and target="_blank"
-      const links = card.querySelectorAll('a[href]') as NodeListOf<HTMLAnchorElement>;
-      for (const a of Array.from(links)) {
-        const href = a.href || '';
-        if (
-          href &&
-          !href.includes('facebook.com') &&
-          !href.startsWith('javascript:') &&
-          !href.startsWith('mailto:')
-        ) {
+  // The page.evaluate is passed as a STRING to avoid tsx codegen helpers
+  // (__name, etc.) being injected into the compiled function body — those
+  // helpers reference module-scope vars that don't exist in the page context
+  // and cause a ReferenceError at runtime.
+  return await page.evaluate(
+    `(({ cc }) => {
+      function decodeFbRedirect(href) {
+        try {
+          const u = new URL(href);
+          if (u.hostname === 'l.facebook.com' || u.hostname.endsWith('.l.facebook.com')) {
+            const real = u.searchParams.get('u');
+            if (real) return decodeURIComponent(real);
+          }
+          return href;
+        } catch {
           return href;
         }
-        // Facebook wraps external links in l.facebook.com redirect — capture the underlying u param
-        if (href.includes('l.facebook.com/l.php')) {
-          try {
-            const u = new URL(href).searchParams.get('u');
-            if (u) return decodeURIComponent(u);
-          } catch {
-            /* ignore */
-          }
+      }
+      function isStoreUrl(href) {
+        return /play\\.google\\.com\\/store\\/apps\\/details/i.test(href)
+          || /itunes\\.apple\\.com\\/app/i.test(href)
+          || /apps\\.apple\\.com\\//i.test(href);
+      }
+      function isPageUrl(href) {
+        try {
+          const u = new URL(href);
+          if (u.hostname !== 'www.facebook.com' && u.hostname !== 'facebook.com') return false;
+          if (u.pathname.startsWith('/ads/')) return false;
+          if (u.pathname.startsWith('/l.php')) return false;
+          // /<single-segment>/ shape (numeric page id or handle)
+          return /^\\/[^\\/]+\\/?$/.test(u.pathname);
+        } catch {
+          return false;
         }
       }
-      return null;
-    }
-    function getAdText(card: Element): string | null {
-      // Ad copy is in a div with role="presentation" or the longest text node
-      const textNodes = Array.from(card.querySelectorAll('div')).map((d) => (d.textContent || '').trim());
-      const longest = textNodes.sort((a, b) => b.length - a.length)[0];
-      return longest && longest.length > 30 ? longest.slice(0, 1200) : null;
-    }
 
-    // Cards: divs containing the text "Library ID"
-    const allDivs = Array.from(document.querySelectorAll('div'));
-    const cards = allDivs.filter((d) => {
-      const t = d.textContent || '';
-      return /Library ID:\s*\d/.test(t) && d.querySelectorAll('div').length < 200;
-    });
-
-    // Dedup: pick the smallest containing card for each Library ID
-    const byId = new Map<string, Element>();
-    for (const c of cards) {
-      const m = (c.textContent || '').match(/Library ID:\s*(\d+)/);
-      if (!m) continue;
-      const id = m[1];
-      const existing = byId.get(id);
-      if (!existing || c.querySelectorAll('div').length < existing.querySelectorAll('div').length) {
-        byId.set(id, c);
+      const META_RES = [
+        /^Library ID:/,
+        /^Started running/,
+        /^Platforms$/,
+        /^Sponsored$/,
+        /^Active$/,
+        /^Inactive$/,
+        /^\\d+\\s+ads?$/,
+        /^See summary details$/,
+        /^Open Drop-down$/,
+        /^Open$/,
+        /^Like$/,
+        /^Comment$/,
+        /^Share$/,
+        /^\\d+:\\d+$/,
+        /^\\/$/,
+        /^​$/,
+        /^This ad has multiple versions/,
+      ];
+      function isMetaText(t) {
+        for (const re of META_RES) if (re.test(t)) return true;
+        return false;
       }
-    }
 
-    const results: RawAd[] = [];
-    for (const card of byId.values()) {
-      const advertiser_name = getAdvertiserName(card);
-      if (!advertiser_name) continue;
-      results.push({
-        advertiser_name,
-        page_url: getPageUrl(card),
-        landing_url: getLandingUrl(card),
-        ad_text: getAdText(card),
-        country: cc,
-      });
-    }
-    return results;
-  }, country);
+      // 1) Find all "Library ID:" leaf texts.
+      const allElts = Array.from(document.querySelectorAll('*'));
+      const libIdLeaves = [];
+      for (const e of allElts) {
+        if (e.children.length !== 0) continue;
+        const t = e.textContent || '';
+        if (/Library ID:\\s*\\d+/.test(t)) libIdLeaves.push(e);
+      }
+
+      // 2) Climb each leaf to the smallest ancestor that ALSO contains "Sponsored".
+      //    Dedup by Library ID.
+      const cardByLibId = new Map();
+      for (const leaf of libIdLeaves) {
+        const m = (leaf.textContent || '').match(/Library ID:\\s*(\\d+)/);
+        if (!m) continue;
+        const libId = m[1];
+        if (cardByLibId.has(libId)) continue;
+
+        let cur = leaf;
+        let card = null;
+        for (let depth = 0; depth < 30 && cur.parentElement; depth++) {
+          cur = cur.parentElement;
+          if (cur === document.body) break;
+          const t = cur.textContent || '';
+          if (/Sponsored/.test(t)) { card = cur; break; }
+        }
+        if (card) cardByLibId.set(libId, card);
+      }
+
+      // 3) Extract per-card fields.
+      const results = [];
+      for (const card of cardByLibId.values()) {
+        const anchors = Array.from(card.querySelectorAll('a[href]'));
+
+        // advertiser_name + page_url: first anchor pointing at facebook.com/<id-or-handle>/
+        // with non-empty visible text.
+        let advertiser_name = null;
+        let page_url = null;
+        for (const a of anchors) {
+          if (!isPageUrl(a.href)) continue;
+          const text = (a.textContent || '').trim();
+          if (text.length === 0 || text.length > 120) continue;
+          if (isMetaText(text)) continue;
+          advertiser_name = text;
+          page_url = a.href;
+          break;
+        }
+        // Fallback: view_all_page_id anchor (older Meta surfaces)
+        if (!advertiser_name) {
+          for (const a of anchors) {
+            if (!a.href.includes('view_all_page_id=')) continue;
+            const text = (a.textContent || '').trim();
+            if (text.length === 0 || text.length > 120) continue;
+            if (isMetaText(text)) continue;
+            advertiser_name = text;
+            page_url = a.href;
+            break;
+          }
+        }
+        if (!advertiser_name) continue;
+
+        // landing_url: prefer store URL (decoded via l.facebook.com redirect),
+        // fall back to first non-facebook external link.
+        let landing_url = null;
+        for (const a of anchors) {
+          const decoded = decodeFbRedirect(a.href);
+          if (isStoreUrl(decoded)) { landing_url = decoded; break; }
+        }
+        if (!landing_url) {
+          for (const a of anchors) {
+            const decoded = decodeFbRedirect(a.href);
+            if (!decoded) continue;
+            if (decoded.startsWith('javascript:')) continue;
+            if (decoded.startsWith('mailto:')) continue;
+            // Skip facebook.com internal links (page profile, ad library, etc.)
+            try {
+              const h = new URL(decoded).hostname;
+              if (/(^|\\.)facebook\\.com$/.test(h)) continue;
+              if (/(^|\\.)fb\\.com$/.test(h)) continue;
+            } catch { continue; }
+            landing_url = decoded;
+            break;
+          }
+        }
+
+        // ad_text: longest non-meta leaf >= 30 chars.
+        let ad_text = null;
+        let longest = '';
+        for (const e of Array.from(card.querySelectorAll('*'))) {
+          if (e.children.length !== 0) continue;
+          const t = (e.textContent || '').trim();
+          if (t.length < 30) continue;
+          if (isMetaText(t)) continue;
+          if (/^https?:\\/\\//.test(t)) continue;
+          if (t.length > longest.length) longest = t;
+        }
+        if (longest.length >= 30) ad_text = longest.slice(0, 1500);
+
+        results.push({
+          advertiser_name,
+          page_url,
+          landing_url,
+          ad_text,
+          country: cc,
+        });
+      }
+
+      return results;
+    })({ cc: ${JSON.stringify(country)} })`
+  ) as RawAd[];
 }
