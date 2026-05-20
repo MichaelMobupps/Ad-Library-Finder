@@ -1,5 +1,6 @@
 import { chromium, Browser, BrowserContext, Page } from 'playwright';
 import { log } from './logger.js';
+import { browserSpawnEnv } from './browserSetup.js';
 
 export interface RawAd {
   advertiser_name: string;
@@ -35,9 +36,14 @@ let sharedBrowser: Browser | null = null;
 
 async function getBrowser(): Promise<Browser> {
   if (sharedBrowser && sharedBrowser.isConnected()) return sharedBrowser;
+  // Pass env explicitly so the LD_LIBRARY_PATH we set in browserSetup.ts
+  // reaches the chromium child process. Node's default child env is
+  // process.env, but being explicit here defends against any Playwright
+  // internal env scrubbing.
   sharedBrowser = await chromium.launch({
     headless: true,
     args: ['--disable-blink-features=AutomationControlled', '--no-sandbox', '--disable-setuid-sandbox'],
+    env: browserSpawnEnv(),
   });
   return sharedBrowser;
 }
