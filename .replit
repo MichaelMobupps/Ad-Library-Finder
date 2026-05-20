@@ -15,3 +15,6 @@ externalPort = 80
 NODE_ENV = "production"
 PORT = "3001"
 PLAYWRIGHT_BROWSERS_PATH = "0"
+
+[agent]
+expertMode = true
