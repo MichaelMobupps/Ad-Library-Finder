@@ -1,6 +1,6 @@
 import { chromium, Browser, BrowserContext, Page } from 'playwright';
 import { log } from './logger.js';
-import { browserSpawnEnv } from './browserSetup.js';
+import { browserSpawnEnv, browserExecutablePath } from './browserSetup.js';
 
 export interface RawAd {
   advertiser_name: string;
@@ -40,10 +40,23 @@ async function getBrowser(): Promise<Browser> {
   // reaches the chromium child process. Node's default child env is
   // process.env, but being explicit here defends against any Playwright
   // internal env scrubbing.
+  //
+  // Pass executablePath explicitly so we use the binary that browserSetup.ts
+  // resolved AND patchelf'd at startup. Without this, Playwright's auto-
+  // discovery can pick a different (unpatched, or missing) location based
+  // on PLAYWRIGHT_BROWSERS_PATH state — in deploy contexts this has been
+  // seen to fall through to ~/.cache/ms-playwright/ which is empty.
+  const executablePath = browserExecutablePath();
+  if (executablePath) {
+    log.info(`scraper: launching chromium at ${executablePath}`);
+  } else {
+    log.warn('scraper: no resolved chromium path, falling back to Playwright auto-discovery');
+  }
   sharedBrowser = await chromium.launch({
     headless: true,
     args: ['--disable-blink-features=AutomationControlled', '--no-sandbox', '--disable-setuid-sandbox'],
     env: browserSpawnEnv(),
+    ...(executablePath ? { executablePath } : {}),
   });
   return sharedBrowser;
 }
