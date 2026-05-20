@@ -41,6 +41,16 @@ import { log } from './logger.js';
  * was built against glibc 2.38 and crashes if its dynamic loader resolves
  * libc/libm from nix glibc 2.33. Instead, the Chromium-specific env is
  * built and passed via chromium.launch({ env }) (see scraper.ts).
+ *
+ * Path Resolution (added 2025-05-20)
+ * ----------------------------------
+ * In production deploys, Playwright's auto-discovery sometimes ignored
+ * PLAYWRIGHT_BROWSERS_PATH=0 from .replit [env] and looked at the default
+ * ~/.cache/ms-playwright/chromium_headless_shell-1223/ path — which is
+ * empty because pnpm-installed playwright-core stores browsers in
+ * node_modules/.../.local-browsers/. We solved this by exporting the
+ * resolved binary path and having scraper.ts pass it as executablePath
+ * to chromium.launch(), bypassing Playwright's env-driven lookup entirely.
  */
 
 interface CachedEnv {
@@ -219,6 +229,19 @@ export function browserSpawnEnv(): NodeJS.ProcessEnv {
   return env;
 }
 
+/**
+ * The absolute path to the chrome-headless-shell binary we resolved at
+ * startup. Pass this to chromium.launch({ executablePath }) so Playwright
+ * doesn't fall back to its env-driven auto-discovery (which has been seen
+ * to ignore PLAYWRIGHT_BROWSERS_PATH=0 in deploy contexts).
+ *
+ * Returns undefined if startup failed to find the binary; callers can let
+ * Playwright surface its own error in that case.
+ */
+export function browserExecutablePath(): string | undefined {
+  return cached?.chromiumPath ?? undefined;
+}
+
 function findWorkspaceRoot(): string {
   let dir = process.cwd();
   for (let i = 0; i < 8; i++) {
@@ -235,15 +258,9 @@ function findChromiumBinary(): string | null {
   const root = findWorkspaceRoot();
   log.info(`browser libs: workspace root = ${root}`);
 
-  const candidates: string[] = [
-    path.join(os.homedir(), '.cache/ms-playwright'),
-    path.join(root, '.cache/ms-playwright'),
-  ];
-  for (const browsersDir of candidates) {
-    const found = locateInBrowsersDir(browsersDir);
-    if (found) return found;
-  }
-
+  // Search order — prefer node_modules location (PLAYWRIGHT_BROWSERS_PATH=0
+  // layout) because that's where `pnpm install:playwright` puts it during
+  // our deploy build. Fall back to .cache layouts.
   const pnpmDir = path.join(root, 'node_modules/.pnpm');
   if (existsSync(pnpmDir)) {
     let pwDirs: string[] = [];
@@ -258,7 +275,22 @@ function findChromiumBinary(): string | null {
       if (found) return found;
     }
   }
-  return locateInBrowsersDir(path.join(root, 'node_modules/playwright-core/.local-browsers'));
+
+  const directNodeModules = locateInBrowsersDir(
+    path.join(root, 'node_modules/playwright-core/.local-browsers')
+  );
+  if (directNodeModules) return directNodeModules;
+
+  const cacheCandidates: string[] = [
+    path.join(os.homedir(), '.cache/ms-playwright'),
+    path.join(root, '.cache/ms-playwright'),
+  ];
+  for (const browsersDir of cacheCandidates) {
+    const found = locateInBrowsersDir(browsersDir);
+    if (found) return found;
+  }
+
+  return null;
 }
 
 function locateInBrowsersDir(browsersDir: string): string | null {
