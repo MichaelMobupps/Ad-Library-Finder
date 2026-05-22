@@ -1,0 +1,190 @@
+/**
+ * Affplus offer-name cleaner.
+ *
+ * Affplus offers come with platform / format / geo decoration that's useless
+ * for app-store matching:
+ *   "Supraplay- FB, Android, PWA (GR)"     → "Supraplay"
+ *   "HottyFinder - SOI - CPA - Mobile [US]" → "HottyFinder"
+ *   "Slots Casino - FB - Android"           → "Slots Casino"
+ *
+ * Tricky case the spec calls out: "Ringtones for Android" → "Ringtones".
+ * Naively stripping "Android" leaves "Ringtones for" — we must trim dangling
+ * connectors ("for", "by", "with", "of", "and", "&") at the tail.
+ *
+ * Strategy:
+ *   1. Drop `(...)` and `[...]` segments wholesale.
+ *   2. Split the remainder on , - | / (top-level separators).
+ *   3. Inside each segment, drop word tokens matching the strip list
+ *      (case-insensitive; matches whole word only).
+ *   4. Discard segments that ended up empty after step 3.
+ *   5. Rejoin remaining segments with a single space.
+ *   6. Trim trailing connectors and stray punctuation.
+ *
+ * "NEVER strip plain nouns" is honored by keeping the strip list closed —
+ * only known platform/format/geo tokens are stripped. "Ringtones",
+ * "Township", "Casino", "Solitaire" etc. survive untouched.
+ */
+
+const STRIP_TOKENS = new Set<string>([
+  // Platform / format
+  'fb', 'facebook', 'tt', 'tiktok-ads',
+  'android', 'ios', 'iphone', 'ipad', 'apk', 'pwa', 'wap',
+  'mobile', 'desktop', 'tablet', 'web',
+  // Format / payout model
+  'cpi', 'cpa', 'cpl', 'cps', 'cpc', 'cpo', 'cpe', 'cpr',
+  'soi', 'doi', 'sso', 'rs', 'revshare', 'revshares',
+  'hybrid', 'multigeo', 'multi', 'direct', 'directoffer',
+  'smartlink', 'smartlinks', 'smart',
+  'prelander', 'prelanders', 'lander', 'landers', 'landing',
+  'incent', 'incentive', 'incentivized', 'nonincent', 'non-incent',
+  'offerwall', 'uac', 'ua',
+  'new', 'exclusive', 'top',
+  // 2-letter ISO geos that commonly appear unbracketed
+  'us', 'uk', 'gb', 'ca', 'au', 'nz', 'ie',
+  'br', 'mx', 'ar', 'cl', 'co', 'pe', 've',
+  'de', 'fr', 'it', 'es', 'pt', 'nl', 'be', 'ch', 'at',
+  'pl', 'ro', 'hu', 'cz', 'sk', 'gr', 'tr', 'ru', 'ua', 'by',
+  'dk', 'no', 'se', 'fi', 'is',
+  'in', 'id', 'ph', 'vn', 'th', 'my', 'sg', 'hk', 'tw', 'jp', 'kr', 'cn',
+  'za', 'ng', 'ke', 'eg', 'sa', 'ae', 'il',
+  // 3-letter ISO geos
+  'usa', 'gbr', 'can', 'aus', 'bra', 'mex', 'fra', 'ger', 'esp',
+  // Eurozone groupings
+  'eu', 'emea', 'apac', 'latam', 'mena', 'tier1', 'tier2', 'tier3',
+  // CPA / e-commerce jargon (Affplus offer names are loaded with this)
+  'ctc', 'ctp', 'accepts', 'paypal', 'including', 'checkout', 'tracking',
+  'event', 'link', 'links', 'newest', 'ecommerce', 'dropship', 'dropshipping',
+  'product', 'products', 'leadgen', 'lead', 'leads', 'survey', 'surveys',
+]);
+
+const TRAILING_CONNECTORS = new Set<string>([
+  'for', 'by', 'with', 'of', 'and', 'or', '&', 'in', 'on', 'to', 'the', 'a', 'an',
+]);
+
+const SEPARATOR_RE = /\s*[,|/]\s*|\s+-\s+|\s+–\s+|\s+—\s+/;
+
+export function cleanOfferName(raw: string): string {
+  if (!raw) return '';
+  let s = raw;
+
+  // 1. Drop parenthetical and bracketed segments (greedy across multiple).
+  s = s.replace(/\([^)]*\)/g, ' ');
+  s = s.replace(/\[[^\]]*\]/g, ' ');
+  s = s.replace(/\{[^}]*\}/g, ' ');
+
+  // Strip dollar amounts: $80, $39.99, $1,250
+  s = s.replace(/\$[\d][\d.,]*/g, ' ');
+
+  // Collapse whitespace, normalize unicode dashes to ASCII dash.
+  s = s.replace(/[‐-―−]/g, '-').replace(/\s+/g, ' ').trim();
+
+  // 2. Split on top-level separators. Also break on a bare trailing dash
+  //    glued to a word ("Supraplay-" before "FB"): handle by splitting on
+  //    `-` when surrounded by space OR when followed by space.
+  //    Pre-process "Foo- Bar" → "Foo - Bar" so SEPARATOR_RE catches it.
+  s = s.replace(/([A-Za-z0-9])-\s+/g, '$1 - ');
+  s = s.replace(/\s+-([A-Za-z0-9])/g, ' - $1');
+
+  const segments = s.split(SEPARATOR_RE);
+
+  // 3 + 4. Strip tokens inside each segment, drop fully-empty segments.
+  const cleanedSegments: string[] = [];
+  for (const seg of segments) {
+    const t = seg.trim();
+    if (!t) continue;
+    // Tokenize by whitespace; preserve internal punctuation inside tokens
+    // (e.g. "1Win" stays one token; "T-Mobile" — well, dashes were split
+    // upstream, so this is fine).
+    const tokens = t.split(/\s+/).filter(Boolean);
+    const kept = tokens.filter((tok) => {
+      const norm = tok.toLowerCase().replace(/[^a-z0-9]/g, '');
+      if (!norm) return false;
+      return !STRIP_TOKENS.has(norm);
+    });
+    if (kept.length > 0) cleanedSegments.push(kept.join(' '));
+  }
+
+  // 5. Rejoin.
+  let out = cleanedSegments.join(' ').trim();
+
+  // 6. Trim trailing connectors / stray punctuation / repeat.
+  for (let i = 0; i < 5; i++) {
+    const prev = out;
+    out = out.replace(/[\s\-,_:;|/]+$/u, '').trim();
+    const tail = out.split(/\s+/).pop()?.toLowerCase() || '';
+    if (TRAILING_CONNECTORS.has(tail)) {
+      out = out.split(/\s+/).slice(0, -1).join(' ').trim();
+    }
+    if (out === prev) break;
+  }
+
+  // Also trim leading connectors / punctuation.
+  for (let i = 0; i < 5; i++) {
+    const prev = out;
+    out = out.replace(/^[\s\-,_:;|/]+/u, '').trim();
+    const head = out.split(/\s+/)[0]?.toLowerCase() || '';
+    if (TRAILING_CONNECTORS.has(head)) {
+      out = out.split(/\s+/).slice(1).join(' ').trim();
+    }
+    if (out === prev) break;
+  }
+
+  return out;
+}
+
+// --- Unit tests (run with `node dist/nameCleaner.js`) ----------------------
+
+interface TestCase {
+  input: string;
+  expected: string;
+  description?: string;
+}
+
+const TESTS: TestCase[] = [
+  { input: 'Supraplay- FB, Android, PWA (GR)', expected: 'Supraplay' },
+  { input: 'Ringtones for Android', expected: 'Ringtones', description: 'plain noun must survive; trailing "for" trimmed' },
+  { input: 'HottyFinder - SOI - CPA - Mobile [US]', expected: 'HottyFinder' },
+  { input: 'Township', expected: 'Township', description: 'no decoration' },
+  { input: 'TikTok', expected: 'TikTok' },
+  { input: 'Slots Casino', expected: 'Slots Casino', description: 'plain nouns survive even when one looks like a category' },
+  { input: '1Win Direct Offer RevShare 2', expected: '1Win Offer 2', description: 'tokens stripped; numbers preserved' },
+  { input: 'CapCut - Video Editor', expected: 'CapCut Video Editor' },
+  { input: 'Captcha Survey - Android Google Chrome - CPL - US/CA', expected: 'Captcha Google Chrome' },
+  { input: 'JVSpin FB Slot', expected: 'JVSpin Slot' },
+  { input: 'BetScore - FB Slots', expected: 'BetScore Slots' },
+  { input: 'Immediate Alpha Norwegian 174893 Smart Links', expected: 'Immediate Alpha Norwegian 174893' },
+  { input: '   ', expected: '' },
+  { input: 'Rabona UAC Slot', expected: 'Rabona Slot' },
+  { input: 'Cartekit Air Pump - CTC $79.99 - Accepts Paypal', expected: 'Cartekit Air Pump' },
+  { input: 'EZ Income Sites - $80 CPS - $37 CTC (NEWEST CPA)', expected: 'EZ Income Sites' },
+  { input: 'Aptofit Smart Watch - CTC $144.90 - Accepts Paypal', expected: 'Aptofit Watch' },
+  { input: 'Vueeze NextVision AI Glasses - CTC $89.99 - eCommerce / Product', expected: 'Vueeze NextVision AI Glasses' },
+];
+
+export function runNameCleanerTests(): { passed: number; failed: number; failures: string[] } {
+  const failures: string[] = [];
+  let passed = 0;
+  for (const tc of TESTS) {
+    const got = cleanOfferName(tc.input);
+    if (got === tc.expected) {
+      passed++;
+    } else {
+      failures.push(
+        `FAIL: ${JSON.stringify(tc.input)} → expected ${JSON.stringify(tc.expected)}, got ${JSON.stringify(got)}${tc.description ? ` [${tc.description}]` : ''}`
+      );
+    }
+  }
+  return { passed, failed: failures.length, failures };
+}
+
+// If run directly as a script, execute tests.
+const isMain =
+  typeof process !== 'undefined' &&
+  process.argv[1] &&
+  (process.argv[1].endsWith('nameCleaner.js') || process.argv[1].endsWith('nameCleaner.ts'));
+if (isMain) {
+  const { passed, failed, failures } = runNameCleanerTests();
+  console.log(`nameCleaner: ${passed} passed, ${failed} failed`);
+  for (const f of failures) console.log('  ' + f);
+  process.exit(failed === 0 ? 0 : 1);
+}

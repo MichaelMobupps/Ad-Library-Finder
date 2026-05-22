@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback } from 'react';
-import { api, Job, JobLog, ProductType, JobSource, Settings, Me, AuthRequiredError } from './api/client';
+import { api, Job, JobLog, ProductType, Settings, Me, AuthRequiredError } from './api/client';
 
 type View = { kind: 'list' } | { kind: 'new' } | { kind: 'detail'; id: string } | { kind: 'settings' };
 type AuthState = { kind: 'loading' } | { kind: 'anon' } | { kind: 'signed-in'; me: Me };
@@ -166,7 +166,7 @@ function JobsList({ jobs, onSelect, onNew }: { jobs: Job[]; onSelect: (id: strin
     return (
       <div className="empty">
         <p className="empty-title">No jobs yet</p>
-        <p className="empty-sub">Submit a scrape to find advertisers from Meta Ad Library or Affplus.</p>
+        <p className="empty-sub">Submit a scrape to find advertisers from Meta Ad Library.</p>
         <button className="btn primary" onClick={onNew}>+ New Job</button>
       </div>
     );
@@ -182,7 +182,6 @@ function JobsList({ jobs, onSelect, onNew }: { jobs: Job[]; onSelect: (id: strin
         <thead>
           <tr>
             <th>ID</th>
-            <th>Source</th>
             <th>Type</th>
             <th>Countries</th>
             <th>Status</th>
@@ -196,7 +195,6 @@ function JobsList({ jobs, onSelect, onNew }: { jobs: Job[]; onSelect: (id: strin
           {jobs.map((j) => (
             <tr key={j.id} onClick={() => onSelect(j.id)} className="jobs-row">
               <td className="mono">{j.id}</td>
-              <td><span className={`tag tag-${j.source || 'meta'}`}>{(j.source || 'meta').toUpperCase()}</span></td>
               <td><span className={`tag tag-${j.product_type}`}>{j.product_type.toUpperCase()}</span></td>
               <td className="mono small">{(JSON.parse(j.countries) as string[]).join(', ')}</td>
               <td><StatusBadge status={j.status} /></td>
@@ -233,7 +231,6 @@ function NewJob({
   onCreated: () => void;
   onCancel: () => void;
 }) {
-  const [source, setSource] = useState<JobSource>('meta');
   const [countriesText, setCountriesText] = useState('US, BR, IN');
   const [productTypes, setProductTypes] = useState<ProductType[]>(['mobile']);
   const [recipientEmail, setRecipientEmail] = useState('');
@@ -242,12 +239,6 @@ function NewJob({
 
   const toggleType = (pt: ProductType) => {
     setProductTypes((prev) => (prev.includes(pt) ? prev.filter((x) => x !== pt) : [...prev, pt]));
-  };
-
-  // When switching to Affplus, force productType to mobile (Affplus supports mobile only).
-  const handleSourceChange = (s: JobSource) => {
-    setSource(s);
-    if (s === 'affplus') setProductTypes(['mobile']);
   };
 
   const submit = async () => {
@@ -261,13 +252,9 @@ function NewJob({
       setError('Pick at least one product type');
       return;
     }
-    if (source === 'affplus' && productTypes.some((pt) => pt !== 'mobile')) {
-      setError('Affplus source supports Mobile only');
-      return;
-    }
     setSubmitting(true);
     try {
-      await api.createJobs(countries, productTypes, recipientEmail.trim() || null, source);
+      await api.createJobs(countries, productTypes, recipientEmail.trim() || null);
       onCreated();
     } catch (err) {
       setError((err as Error).message);
@@ -286,34 +273,6 @@ function NewJob({
       </div>
 
       <div className="form-row">
-        <label>Source</label>
-        <div className="checkbox-row">
-          <label className="checkbox">
-            <input
-              type="radio"
-              name="source"
-              checked={source === 'meta'}
-              onChange={() => handleSourceChange('meta')}
-            />
-            <span>Meta Ad Library <span className="muted">(Facebook ads → landing URLs)</span></span>
-          </label>
-          <label className="checkbox">
-            <input
-              type="radio"
-              name="source"
-              checked={source === 'affplus'}
-              onChange={() => handleSourceChange('affplus')}
-            />
-            <span>Affplus <span className="muted">(affiliate offer directory; Mobile only)</span></span>
-          </label>
-        </div>
-        <p className="form-hint">
-          Meta scrapes the Facebook Ad Library and classifies landing pages. Affplus lists CPA/CPI mobile
-          offers and verifies each against the Google Play / App Store.
-        </p>
-      </div>
-
-      <div className="form-row">
         <label>Countries (ISO 2-letter, comma-separated)</label>
         <input
           className="input"
@@ -328,28 +287,15 @@ function NewJob({
         <label>Product Type</label>
         <div className="checkbox-row">
           <label className="checkbox">
-            <input
-              type="checkbox"
-              checked={productTypes.includes('mobile')}
-              onChange={() => toggleType('mobile')}
-            />
+            <input type="checkbox" checked={productTypes.includes('mobile')} onChange={() => toggleType('mobile')} />
             <span>Mobile <span className="muted">(Google Play / iTunes preview URLs)</span></span>
           </label>
           <label className="checkbox">
-            <input
-              type="checkbox"
-              checked={productTypes.includes('cps')}
-              onChange={() => toggleType('cps')}
-              disabled={source === 'affplus'}
-            />
+            <input type="checkbox" checked={productTypes.includes('cps')} onChange={() => toggleType('cps')} />
             <span>CPS <span className="muted">(web product, website URLs)</span></span>
           </label>
         </div>
-        <p className="form-hint">
-          {source === 'affplus'
-            ? 'Affplus supports Mobile only.'
-            : 'Selecting both creates two separate jobs (one CSV per type).'}
-        </p>
+        <p className="form-hint">Selecting both creates two separate jobs (one CSV per type).</p>
       </div>
 
       <div className="form-row">
@@ -422,7 +368,6 @@ function JobDetail({ id, onBack }: { id: string; onBack: () => void }) {
       </div>
 
       <div className="detail-grid">
-        <Field label="Source"><span className={`tag tag-${job.source || 'meta'}`}>{(job.source || 'meta').toUpperCase()}</span></Field>
         <Field label="Product Type"><span className={`tag tag-${job.product_type}`}>{job.product_type.toUpperCase()}</span></Field>
         <Field label="Countries"><code>{countries.join(', ')}</code></Field>
         <Field label="Recipient">{job.recipient_email || <span className="muted">(default)</span>}</Field>

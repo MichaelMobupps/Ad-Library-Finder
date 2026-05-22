@@ -5,7 +5,6 @@ import path from 'node:path';
 
 export type ProductType = 'mobile' | 'cps';
 export type JobStatus = 'pending' | 'running' | 'completed' | 'failed';
-export type JobSource = 'meta' | 'affplus';
 
 export interface JobRow {
   id: string;
@@ -22,7 +21,6 @@ export interface JobRow {
   recipient_email: string | null;
   notification_status: string | null; // 'sent' | 'failed' | null
   created_by_user_id: string | null;
-  source: JobSource; // 'meta' (default) | 'affplus'
 }
 
 export interface JobLogRow {
@@ -139,6 +137,8 @@ export async function initDb() {
       created_at INTEGER NOT NULL
     );
 
+    CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+
     CREATE TABLE IF NOT EXISTS sessions (
       token TEXT PRIMARY KEY,
       user_id TEXT NOT NULL,
@@ -146,6 +146,9 @@ export async function initDb() {
       expires_at INTEGER NOT NULL,
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     );
+
+    CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+    CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
 
     CREATE TABLE IF NOT EXISTS gmail_tokens (
       user_id TEXT PRIMARY KEY,
@@ -169,9 +172,6 @@ export async function initDb() {
   }
   if (!colNames.has('created_by_user_id')) {
     db.exec(`ALTER TABLE jobs ADD COLUMN created_by_user_id TEXT`);
-  }
-  if (!colNames.has('source')) {
-    db.exec(`ALTER TABLE jobs ADD COLUMN source TEXT NOT NULL DEFAULT 'meta'`);
   }
 
   db.exec(`CREATE INDEX IF NOT EXISTS idx_jobs_user ON jobs(created_by_user_id)`);
@@ -198,13 +198,12 @@ export function createJob(input: {
   countries: string[];
   recipientEmail?: string | null;
   createdByUserId: string;
-  source?: JobSource;
 }): JobRow {
   const now = Date.now();
   getDb()
     .prepare(
-      `INSERT INTO jobs (id, product_type, countries, status, created_at, total_ads_scraped, total_advertisers, recipient_email, created_by_user_id, source)
-       VALUES (?, ?, ?, 'pending', ?, 0, 0, ?, ?, ?)`
+      `INSERT INTO jobs (id, product_type, countries, status, created_at, total_ads_scraped, total_advertisers, recipient_email, created_by_user_id)
+       VALUES (?, ?, ?, 'pending', ?, 0, 0, ?, ?)`
     )
     .run(
       input.id,
@@ -212,8 +211,7 @@ export function createJob(input: {
       JSON.stringify(input.countries),
       now,
       input.recipientEmail ?? null,
-      input.createdByUserId,
-      input.source ?? 'meta'
+      input.createdByUserId
     );
   return getJob(input.id)!;
 }
@@ -276,67 +274,49 @@ export function getLogs(jobId: string): JobLogRow[] {
 
 // ---------- Result helpers ----------
 
-export function insertResult(input: {
-  job_id: string;
-  advertiser_name: string;
-  page_url: string | null;
-  landing_url: string | null;
-  classification: string | null;
-  store_url: string | null;
-  ad_text: string | null;
-  country: string;
-}) {
+export function insertResult(r: Omit<JobResultRow, 'id' | 'created_at'>) {
   getDb()
     .prepare(
       `INSERT INTO job_results (job_id, advertiser_name, page_url, landing_url, classification, store_url, ad_text, country, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .run(
-      input.job_id,
-      input.advertiser_name,
-      input.page_url,
-      input.landing_url,
-      input.classification,
-      input.store_url,
-      input.ad_text,
-      input.country,
+      r.job_id,
+      r.advertiser_name,
+      r.page_url,
+      r.landing_url,
+      r.classification,
+      r.store_url,
+      r.ad_text,
+      r.country,
       Date.now()
     );
 }
 
 export function getResults(jobId: string): JobResultRow[] {
-  return getDb()
-    .prepare(`SELECT * FROM job_results WHERE job_id = ? ORDER BY id ASC`)
-    .all(jobId) as JobResultRow[];
+  return getDb().prepare(`SELECT * FROM job_results WHERE job_id = ?`).all(jobId) as JobResultRow[];
 }
 
 // ---------- User helpers ----------
 
-export function getUserByEmail(email: string): UserRow | null {
-  return (getDb().prepare(`SELECT * FROM users WHERE email = ?`).get(email) as UserRow) ?? null;
+export function upsertUserByEmail(email: string, name: string | null): UserRow {
+  const normalized = email.toLowerCase().trim();
+  const existing = getDb().prepare(`SELECT * FROM users WHERE email = ?`).get(normalized) as UserRow | undefined;
+  if (existing) {
+    if (name && name !== existing.name) {
+      getDb().prepare(`UPDATE users SET name = ? WHERE id = ?`).run(name, existing.id);
+    }
+    return getUserById(existing.id)!;
+  }
+  const id = `usr_${cryptoRandom(12)}`;
+  getDb()
+    .prepare(`INSERT INTO users (id, email, name, created_at) VALUES (?, ?, ?, ?)`)
+    .run(id, normalized, name, Date.now());
+  return getUserById(id)!;
 }
 
 export function getUserById(id: string): UserRow | null {
   return (getDb().prepare(`SELECT * FROM users WHERE id = ?`).get(id) as UserRow) ?? null;
-}
-
-export function upsertUser(input: { id?: string; email: string; name?: string | null }): UserRow {
-  const existing = getUserByEmail(input.email);
-  if (existing) {
-    if (input.name && input.name !== existing.name) {
-      getDb().prepare(`UPDATE users SET name = ? WHERE id = ?`).run(input.name, existing.id);
-      return { ...existing, name: input.name };
-    }
-    return existing;
-  }
-  const id = input.id ?? `usr_${randomBytes(8).toString('hex')}`;
-  const now = Date.now();
-  getDb()
-    .prepare(
-      `INSERT INTO users (id, email, name, default_recipient, created_at) VALUES (?, ?, ?, NULL, ?)`
-    )
-    .run(id, input.email, input.name ?? null, now);
-  return getUserById(id)!;
 }
 
 export function setUserDefaultRecipient(userId: string, recipient: string | null) {
@@ -426,8 +406,4 @@ export function deleteGmailTokens(userId: string) {
 
 function cryptoRandom(bytes: number): string {
   return randomBytes(bytes).toString('hex');
-}
-// Backwards-compat alias used by routes-auth.ts
-export function upsertUserByEmail(email: string, name?: string | null): UserRow {
-  return upsertUser({ email, name });
 }

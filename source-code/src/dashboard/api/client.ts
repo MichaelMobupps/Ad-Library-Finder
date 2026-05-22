@@ -1,6 +1,5 @@
 export type ProductType = 'mobile' | 'cps';
 export type JobStatus = 'pending' | 'running' | 'completed' | 'failed';
-export type JobSource = 'meta' | 'affplus';
 
 export interface Job {
   id: string;
@@ -17,7 +16,6 @@ export interface Job {
   recipient_email: string | null;
   notification_status: string | null;
   created_by_user_id: string | null;
-  source: JobSource;
 }
 
 export interface JobLog {
@@ -78,12 +76,11 @@ export const api = {
   createJobs: (
     countries: string[],
     productTypes: ProductType[],
-    recipientEmail?: string | null,
-    source?: JobSource
+    recipientEmail?: string | null
   ) =>
     fetchJson<{ jobs: Job[] }>('/api/jobs', {
       method: 'POST',
-      body: JSON.stringify({ countries, productTypes, recipientEmail, source }),
+      body: JSON.stringify({ countries, productTypes, recipientEmail }),
     }),
 
   csvUrl: (id: string) => `/api/jobs/${id}/csv`,
