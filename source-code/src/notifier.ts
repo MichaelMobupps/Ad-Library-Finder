@@ -1,12 +1,13 @@
-import path from 'node:path';
 import { existsSync } from 'node:fs';
-import { JobRow, setJobNotificationStatus } from './db.js';
-import { sendEmail } from './gmail.js';
-import { getDefaultRecipient, isGmailConnected } from './settings.js';
+import { JobRow, setJobNotificationStatus, getUserById, getGmailTokensForUser } from './db.js';
+import { sendEmailFromUser } from './gmail.js';
+import { getDefaultRecipientForUser } from './settings.js';
 import { log } from './logger.js';
 
 function resolveRecipient(job: JobRow): string | null {
-  return job.recipient_email || getDefaultRecipient();
+  if (job.recipient_email) return job.recipient_email;
+  if (job.created_by_user_id) return getDefaultRecipientForUser(job.created_by_user_id);
+  return null;
 }
 
 function publicJobUrl(jobId: string): string {
@@ -37,14 +38,38 @@ function fmtDuration(startMs: number | null, endMs: number | null): string {
   return `${m}m ${rs}s`;
 }
 
+/**
+ * Resolve the sender for a job: the user who created it. The user's Gmail
+ * must be connected. Returns null with a logged reason if not sendable.
+ */
+function resolveSender(job: JobRow): { userId: string; gmailEmail: string } | null {
+  if (!job.created_by_user_id) {
+    log.warn(`Job ${job.id} has no created_by_user_id — cannot send (legacy job?)`);
+    return null;
+  }
+  const user = getUserById(job.created_by_user_id);
+  if (!user) {
+    log.warn(`Job ${job.id} created_by_user_id=${job.created_by_user_id} does not exist`);
+    return null;
+  }
+  const tokens = getGmailTokensForUser(user.id);
+  if (!tokens || !tokens.refresh_token) {
+    log.warn(`Job ${job.id} owner ${user.email} has no Gmail connected — cannot send`);
+    return null;
+  }
+  return { userId: user.id, gmailEmail: tokens.gmail_email ?? user.email };
+}
+
 export async function notifyJobCompleted(job: JobRow) {
-  if (!isGmailConnected()) {
-    log.info(`Job ${job.id} done but Gmail not connected — skipping email`);
+  const sender = resolveSender(job);
+  if (!sender) {
+    setJobNotificationStatus(job.id, 'failed');
     return;
   }
   const to = resolveRecipient(job);
   if (!to) {
-    log.info(`Job ${job.id} done but no recipient configured — skipping email`);
+    log.info(`Job ${job.id} done but no recipient resolved — skipping email`);
+    setJobNotificationStatus(job.id, 'failed');
     return;
   }
 
@@ -66,6 +91,7 @@ export async function notifyJobCompleted(job: JobRow) {
     <tr><td style="padding: 6px 16px 6px 0; color: #6b7280; font-size: 13px;">Advertisers in CSV</td><td style="padding: 6px 0;"><strong>${job.total_advertisers}</strong></td></tr>
     <tr><td style="padding: 6px 16px 6px 0; color: #6b7280; font-size: 13px;">Ads scraped</td><td style="padding: 6px 0;">${job.total_ads_scraped}</td></tr>
     <tr><td style="padding: 6px 16px 6px 0; color: #6b7280; font-size: 13px;">Duration</td><td style="padding: 6px 0;">${duration}</td></tr>
+    <tr><td style="padding: 6px 16px 6px 0; color: #6b7280; font-size: 13px;">Sent by</td><td style="padding: 6px 0;"><code>${escapeHtml(sender.gmailEmail)}</code></td></tr>
   </table>
 
   <p>
@@ -80,7 +106,7 @@ export async function notifyJobCompleted(job: JobRow) {
 </body></html>`;
 
   try {
-    await sendEmail({
+    await sendEmailFromUser(sender.userId, {
       to,
       subject,
       htmlBody: html,
@@ -94,9 +120,16 @@ export async function notifyJobCompleted(job: JobRow) {
 }
 
 export async function notifyJobFailed(job: JobRow) {
-  if (!isGmailConnected()) return;
+  const sender = resolveSender(job);
+  if (!sender) {
+    setJobNotificationStatus(job.id, 'failed');
+    return;
+  }
   const to = resolveRecipient(job);
-  if (!to) return;
+  if (!to) {
+    setJobNotificationStatus(job.id, 'failed');
+    return;
+  }
 
   const countries = (JSON.parse(job.countries) as string[]).join(', ');
   const jobUrl = publicJobUrl(job.id);
@@ -115,7 +148,7 @@ export async function notifyJobFailed(job: JobRow) {
 </body></html>`;
 
   try {
-    await sendEmail({ to, subject, htmlBody: html });
+    await sendEmailFromUser(sender.userId, { to, subject, htmlBody: html });
     setJobNotificationStatus(job.id, 'sent');
   } catch (err) {
     log.error(`notify failed-job email failed for ${job.id}`, (err as Error).message);

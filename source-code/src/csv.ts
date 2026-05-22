@@ -29,13 +29,20 @@ export function buildCsv(input: BuildCsvInput): { path: string; rowsWritten: num
   let rows: string[];
 
   if (productType === 'mobile') {
-    // Only include results that have a store_url (Google Play or App Store)
+    // Only include results that have a store_url (Google Play or App Store).
     const mobile = results.filter(
       (r) =>
         (r.classification === 'mobile_google_play' || r.classification === 'mobile_app_store') &&
         r.store_url
     );
-    header = 'advertiser_name,country,preview_url,store,ad_text';
+
+    // Header MUST use "store_url" — Email Prospector's CSV ingest auto-detects
+    // the store-URL column by header name. Its accepted aliases are:
+    //   store_link, store link, market_url, store_url, play_store,
+    //   app_store_link, itunes_link, google_play_link, app_url.
+    // "preview_url" is NOT in that list. Both the Affplus pipeline and the
+    // Meta scraper feed EP through this same writer, so both benefit.
+    header = 'advertiser_name,country,store_url,store,ad_text';
     rows = mobile.map((r) =>
       [
         escapeCsv(r.advertiser_name),
@@ -46,7 +53,7 @@ export function buildCsv(input: BuildCsvInput): { path: string; rowsWritten: num
       ].join(',')
     );
   } else {
-    // CPS: web destinations only
+    // CPS: web destinations only.
     const cps = results.filter((r) => r.classification === 'cps_web' && r.landing_url);
     header = 'advertiser_name,country,website_url,ad_text';
     rows = cps.map((r) =>

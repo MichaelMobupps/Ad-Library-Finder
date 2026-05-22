@@ -14,6 +14,7 @@ import { classify } from './classifier.js';
 import { buildCsv } from './csv.js';
 import { keywordsFor } from './keywords.js';
 import { notifyJobCompleted, notifyJobFailed } from './notifier.js';
+import { runAffplusJob } from './affplusPipeline.js';
 import { log } from './logger.js';
 
 const POLL_INTERVAL_MS = 2000;
@@ -31,7 +32,11 @@ async function tick() {
     try {
       const job = getNextPendingJob();
       if (job) {
-        await runJob(job);
+        if (job.source === 'affplus') {
+          await runAffplusJob(job);
+        } else {
+          await runMetaJob(job);
+        }
       } else {
         await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
       }
@@ -42,7 +47,7 @@ async function tick() {
   }
 }
 
-async function runJob(job: JobRow) {
+async function runMetaJob(job: JobRow) {
   markJobRunning(job.id);
   const onLog = (level: 'info' | 'warn' | 'error' | 'debug', msg: string) => {
     appendLog(job.id, level, msg);
