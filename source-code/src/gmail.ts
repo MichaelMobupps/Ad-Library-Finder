@@ -1,7 +1,7 @@
 import { google } from 'googleapis';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
-import { getAuthorizedClient } from './oauth.js';
+import { getAuthorizedClientForUser } from './oauth.js';
 import { log } from './logger.js';
 
 export interface SendEmailInput {
@@ -11,8 +11,12 @@ export interface SendEmailInput {
   attachments?: Array<{ path: string; filename?: string; mimeType?: string }>;
 }
 
-export async function sendEmail(input: SendEmailInput): Promise<void> {
-  const client = await getAuthorizedClient();
+/**
+ * Send an email FROM the given user's connected Gmail account.
+ * Throws if that user has not connected Gmail.
+ */
+export async function sendEmailFromUser(userId: string, input: SendEmailInput): Promise<void> {
+  const client = await getAuthorizedClientForUser(userId);
   const gmail = google.gmail({ version: 'v1', auth: client });
 
   const raw = buildMimeMessage(input);
@@ -22,7 +26,7 @@ export async function sendEmail(input: SendEmailInput): Promise<void> {
     userId: 'me',
     requestBody: { raw: encoded },
   });
-  log.info(`Email sent to ${input.to}`);
+  log.info(`Email sent to ${input.to} (from user=${userId})`);
 }
 
 // ---------- MIME construction ----------
@@ -41,11 +45,9 @@ function buildMimeMessage(input: SendEmailInput): string {
   ];
 
   if (attachments.length === 0) {
-    // Simple HTML email
     return [...headers, 'Content-Transfer-Encoding: 7bit', '', htmlBody].join('\r\n');
   }
 
-  // Multipart message
   const parts: string[] = [];
   parts.push(`--${boundary}`);
   parts.push('Content-Type: text/html; charset="UTF-8"');
@@ -62,7 +64,6 @@ function buildMimeMessage(input: SendEmailInput): string {
     parts.push('Content-Transfer-Encoding: base64');
     parts.push(`Content-Disposition: attachment; filename="${filename}"`);
     parts.push('');
-    // Standard base64 (Gmail accepts in MIME body); wrap at 76 chars
     parts.push(chunk(data.toString('base64'), 76));
   }
 
@@ -71,7 +72,6 @@ function buildMimeMessage(input: SendEmailInput): string {
 }
 
 function encodeHeader(s: string): string {
-  // If only ASCII, return as-is. Otherwise RFC 2047 encoded-word.
   if (/^[\x20-\x7E]*$/.test(s)) return s;
   return `=?UTF-8?B?${Buffer.from(s, 'utf8').toString('base64')}?=`;
 }
