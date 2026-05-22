@@ -1,4 +1,11 @@
-import { getDb } from './db.js';
+import { getDb, getGmailTokensForUser, getUserById, setUserDefaultRecipient } from './db.js';
+
+/**
+ * Generic settings table — retained for legacy / future use. The Gmail
+ * connection and per-user default recipient have moved to user-scoped
+ * storage (gmail_tokens and users.default_recipient respectively); the
+ * helpers below operate on the per-user model.
+ */
 
 export function getSetting(key: string): string | null {
   const row = getDb().prepare(`SELECT value FROM settings WHERE key = ?`).get(key) as { value: string } | undefined;
@@ -18,31 +25,22 @@ export function deleteSetting(key: string) {
   getDb().prepare(`DELETE FROM settings WHERE key = ?`).run(key);
 }
 
-// Convenience typed accessors for the settings we use
+// ---------- per-user accessors ----------
 
-export const SETTING_KEYS = {
-  OAUTH_ACCESS_TOKEN: 'oauth_access_token',
-  OAUTH_REFRESH_TOKEN: 'oauth_refresh_token',
-  OAUTH_EXPIRES_AT: 'oauth_expires_at',
-  OAUTH_EMAIL: 'oauth_email',
-  DEFAULT_RECIPIENT: 'default_recipient',
-} as const;
-
-export function getDefaultRecipient(): string | null {
-  return getSetting(SETTING_KEYS.DEFAULT_RECIPIENT);
+export function getDefaultRecipientForUser(userId: string): string | null {
+  const user = getUserById(userId);
+  return user?.default_recipient ?? null;
 }
 
-export function getConnectedGmailEmail(): string | null {
-  return getSetting(SETTING_KEYS.OAUTH_EMAIL);
+export function setDefaultRecipientForUser(userId: string, recipient: string | null) {
+  setUserDefaultRecipient(userId, recipient);
 }
 
-export function isGmailConnected(): boolean {
-  return !!getSetting(SETTING_KEYS.OAUTH_REFRESH_TOKEN);
+export function getConnectedGmailEmailForUser(userId: string): string | null {
+  return getGmailTokensForUser(userId)?.gmail_email ?? null;
 }
 
-export function disconnectGmail() {
-  deleteSetting(SETTING_KEYS.OAUTH_ACCESS_TOKEN);
-  deleteSetting(SETTING_KEYS.OAUTH_REFRESH_TOKEN);
-  deleteSetting(SETTING_KEYS.OAUTH_EXPIRES_AT);
-  deleteSetting(SETTING_KEYS.OAUTH_EMAIL);
+export function isGmailConnectedForUser(userId: string): boolean {
+  const t = getGmailTokensForUser(userId);
+  return !!(t && t.refresh_token);
 }
