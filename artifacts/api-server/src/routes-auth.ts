@@ -1,6 +1,6 @@
 import { Router, Request, Response } from 'express';
 import { nanoid } from 'nanoid';
-import { getAuthUrl, exchangeCodeForTokens } from './oauth.js';
+import { getAuthUrl, exchangeCodeForTokens, getRedirectUriFromReq } from './oauth.js';
 import { log } from './logger.js';
 
 export const authRouter: Router = Router();
@@ -17,16 +17,34 @@ function reapStates() {
 }
 
 // GET /api/auth/google — initiate OAuth flow
-authRouter.get('/google', (_req: Request, res: Response) => {
+authRouter.get('/google', (req: Request, res: Response) => {
   try {
     reapStates();
     const state = nanoid(24);
     stateStore.set(state, Date.now());
-    const url = getAuthUrl(state);
+    const url = getAuthUrl(state, req);
     res.redirect(url);
   } catch (err) {
     log.error('auth init failed', err);
     res.status(500).send(`Failed to start OAuth: ${(err as Error).message}`);
+  }
+});
+
+// GET /api/auth/google/debug — diagnostic, shows the exact redirect URI we'd send to Google
+authRouter.get('/google/debug', (req: Request, res: Response) => {
+  try {
+    const redirectUri = getRedirectUriFromReq(req);
+    res.json({
+      redirectUri,
+      clientIdPresent: !!process.env.GOOGLE_CLIENT_ID,
+      clientSecretPresent: !!process.env.GOOGLE_CLIENT_SECRET,
+      publicBaseUrlEnv: process.env.PUBLIC_BASE_URL || null,
+      forwardedProto: req.headers['x-forwarded-proto'] || null,
+      forwardedHost: req.headers['x-forwarded-host'] || null,
+      hostHeader: req.get('host') || null,
+    });
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message });
   }
 });
 
@@ -46,7 +64,7 @@ authRouter.get('/google/callback', async (req: Request, res: Response) => {
   stateStore.delete(state);
 
   try {
-    const { email } = await exchangeCodeForTokens(code);
+    const { email } = await exchangeCodeForTokens(code, req);
     log.info(`Gmail connected: ${email}`);
     // Bounce back to the UI settings page
     res.redirect('/?gmail_connected=1#/settings');

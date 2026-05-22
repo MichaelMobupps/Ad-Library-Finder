@@ -1,5 +1,6 @@
 import { google, oauth2_v2 } from 'googleapis';
 import { OAuth2Client, Credentials } from 'google-auth-library';
+import type { Request } from 'express';
 import { getSetting, setSetting, SETTING_KEYS } from './settings.js';
 import { log } from './logger.js';
 
@@ -14,21 +15,54 @@ function requireEnv(name: string): string {
   return v;
 }
 
-function getRedirectUri(): string {
-  const base = requireEnv('PUBLIC_BASE_URL').replace(/\/$/, '');
+/**
+ * Derive the redirect URI to register with Google.
+ *
+ * Priority:
+ *   1. The actual deployed host as seen by Replit's edge proxy
+ *      (x-forwarded-proto + x-forwarded-host). This guarantees the URI
+ *      matches the origin the user is on, even if PUBLIC_BASE_URL is
+ *      misconfigured.
+ *   2. Host header on the incoming request (covers direct-hit local dev).
+ *   3. PUBLIC_BASE_URL environment variable (legacy fallback).
+ *
+ * The authorize-step and token-exchange step MUST produce the same string;
+ * because both /api/auth/google and /api/auth/google/callback are hit on
+ * the same host, header-derivation is stable across the two calls.
+ */
+export function getRedirectUriFromReq(req: Request): string {
+  const xfProto = (req.headers['x-forwarded-proto'] as string | undefined)?.split(',')[0]?.trim();
+  const xfHost = (req.headers['x-forwarded-host'] as string | undefined)?.split(',')[0]?.trim();
+  const hostHeader = req.get('host');
+
+  const proto = xfProto || (req.secure ? 'https' : 'http');
+  const host = xfHost || hostHeader;
+
+  if (host) {
+    return `${proto}://${host}/api/auth/google/callback`;
+  }
+
+  const base = (process.env.PUBLIC_BASE_URL || '').replace(/\/$/, '');
+  if (!base) {
+    throw new Error(
+      'Cannot determine OAuth redirect URI: no x-forwarded-host / host header and PUBLIC_BASE_URL is not set'
+    );
+  }
   return `${base}/api/auth/google/callback`;
 }
 
-export function createOAuthClient(): OAuth2Client {
+export function createOAuthClient(redirectUri?: string): OAuth2Client {
   return new google.auth.OAuth2(
     requireEnv('GOOGLE_CLIENT_ID'),
     requireEnv('GOOGLE_CLIENT_SECRET'),
-    getRedirectUri()
+    redirectUri
   );
 }
 
-export function getAuthUrl(state: string): string {
-  const client = createOAuthClient();
+export function getAuthUrl(state: string, req: Request): string {
+  const redirectUri = getRedirectUriFromReq(req);
+  log.info(`OAuth authorize: using redirect_uri=${redirectUri}`);
+  const client = createOAuthClient(redirectUri);
   return client.generateAuthUrl({
     access_type: 'offline',     // Get refresh token
     prompt: 'consent',          // Force refresh-token return even if previously granted
@@ -37,8 +71,10 @@ export function getAuthUrl(state: string): string {
   });
 }
 
-export async function exchangeCodeForTokens(code: string): Promise<{ email: string }> {
-  const client = createOAuthClient();
+export async function exchangeCodeForTokens(code: string, req: Request): Promise<{ email: string }> {
+  const redirectUri = getRedirectUriFromReq(req);
+  log.info(`OAuth callback: using redirect_uri=${redirectUri}`);
+  const client = createOAuthClient(redirectUri);
   const { tokens } = await client.getToken(code);
 
   if (!tokens.access_token) throw new Error('No access_token in OAuth response');
@@ -68,6 +104,9 @@ export async function exchangeCodeForTokens(code: string): Promise<{ email: stri
 /**
  * Returns an OAuth2Client with valid credentials, refreshing if needed.
  * Throws if Gmail is not connected.
+ *
+ * Note: redirect URI is NOT needed for the refresh-token flow, so we
+ * construct the client without one.
  */
 export async function getAuthorizedClient(): Promise<OAuth2Client> {
   const refreshToken = getSetting(SETTING_KEYS.OAUTH_REFRESH_TOKEN);
