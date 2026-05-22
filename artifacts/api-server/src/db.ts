@@ -1,5 +1,6 @@
 import Database from 'better-sqlite3';
 import { existsSync, mkdirSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
 import path from 'node:path';
 
 export type ProductType = 'mobile' | 'cps';
@@ -404,9 +405,5 @@ export function deleteGmailTokens(userId: string) {
 // ---------- internal ----------
 
 function cryptoRandom(bytes: number): string {
-  // Use node:crypto without importing top-level (keep this file synchronous-init friendly).
-  // We do an explicit require so initDb itself doesn't depend on ESM-only crypto.
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const { randomBytes } = require('node:crypto') as typeof import('node:crypto');
   return randomBytes(bytes).toString('hex');
 }
