@@ -8,7 +8,6 @@ import {
   listJobsForUser,
   getLogs,
   ProductType,
-  JobSource,
 } from './db.js';
 import { RequestWithUser } from './auth.js';
 
@@ -18,13 +17,12 @@ interface CreateJobBody {
   countries: string[];
   productTypes: ProductType[];
   recipientEmail?: string | null;
-  source?: JobSource;
 }
 
 // POST /api/jobs
 jobsRouter.post('/', (req: Request<{}, {}, CreateJobBody>, res: Response) => {
   const user = (req as RequestWithUser).user!;
-  const { countries, productTypes, recipientEmail, source } = req.body;
+  const { countries, productTypes, recipientEmail } = req.body;
 
   if (!Array.isArray(countries) || countries.length === 0) {
     return res.status(400).json({ error: 'countries[] required' });
@@ -40,20 +38,6 @@ jobsRouter.post('/', (req: Request<{}, {}, CreateJobBody>, res: Response) => {
   const normCountries = countries.map((c) => c.trim().toUpperCase()).filter(Boolean);
   if (normCountries.some((c) => c.length !== 2)) {
     return res.status(400).json({ error: 'country codes must be ISO 2-letter (e.g. US, BR, IN)' });
-  }
-
-  // Source: default to 'meta' to preserve existing behavior.
-  let jobSource: JobSource = 'meta';
-  if (source !== undefined) {
-    if (source !== 'meta' && source !== 'affplus') {
-      return res.status(400).json({ error: `invalid source: ${source}` });
-    }
-    jobSource = source;
-  }
-
-  // Affplus only produces mobile-targeted output today; reject CPS for affplus.
-  if (jobSource === 'affplus' && productTypes.some((pt) => pt !== 'mobile')) {
-    return res.status(400).json({ error: 'affplus source supports productType=mobile only' });
   }
 
   let recipient: string | null = null;
@@ -73,7 +57,6 @@ jobsRouter.post('/', (req: Request<{}, {}, CreateJobBody>, res: Response) => {
       countries: normCountries,
       recipientEmail: recipient,
       createdByUserId: user.id,
-      source: jobSource,
     });
   });
 
