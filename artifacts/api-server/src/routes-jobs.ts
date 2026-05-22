@@ -5,10 +5,11 @@ import path from 'node:path';
 import {
   createJob,
   getJob,
-  listJobs,
+  listJobsForUser,
   getLogs,
   ProductType,
 } from './db.js';
+import { RequestWithUser } from './auth.js';
 
 export const jobsRouter: Router = Router();
 
@@ -20,6 +21,7 @@ interface CreateJobBody {
 
 // POST /api/jobs
 jobsRouter.post('/', (req: Request<{}, {}, CreateJobBody>, res: Response) => {
+  const user = (req as RequestWithUser).user!;
   const { countries, productTypes, recipientEmail } = req.body;
 
   if (!Array.isArray(countries) || countries.length === 0) {
@@ -54,26 +56,36 @@ jobsRouter.post('/', (req: Request<{}, {}, CreateJobBody>, res: Response) => {
       productType: pt,
       countries: normCountries,
       recipientEmail: recipient,
+      createdByUserId: user.id,
     });
   });
 
   res.json({ jobs: created });
 });
 
-jobsRouter.get('/', (_req, res) => {
-  res.json({ jobs: listJobs() });
+jobsRouter.get('/', (req, res) => {
+  const user = (req as RequestWithUser).user!;
+  res.json({ jobs: listJobsForUser(user.id) });
 });
 
 jobsRouter.get('/:id', (req, res) => {
+  const user = (req as RequestWithUser).user!;
   const job = getJob(req.params.id);
   if (!job) return res.status(404).json({ error: 'not found' });
+  if (job.created_by_user_id && job.created_by_user_id !== user.id) {
+    return res.status(404).json({ error: 'not found' });
+  }
   const logs = getLogs(req.params.id);
   res.json({ job, logs });
 });
 
 jobsRouter.get('/:id/csv', (req, res) => {
+  const user = (req as RequestWithUser).user!;
   const job = getJob(req.params.id);
   if (!job) return res.status(404).json({ error: 'not found' });
+  if (job.created_by_user_id && job.created_by_user_id !== user.id) {
+    return res.status(404).json({ error: 'not found' });
+  }
   if (!job.csv_path || !existsSync(job.csv_path)) {
     return res.status(404).json({ error: 'CSV not yet ready' });
   }

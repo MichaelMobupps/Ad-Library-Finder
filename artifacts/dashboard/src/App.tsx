@@ -1,29 +1,90 @@
 import { useEffect, useState, useCallback } from 'react';
-import { api, Job, JobLog, ProductType, Settings } from './api/client';
+import { api, Job, JobLog, ProductType, Settings, Me, AuthRequiredError } from './api/client';
 
 type View = { kind: 'list' } | { kind: 'new' } | { kind: 'detail'; id: string } | { kind: 'settings' };
+type AuthState = { kind: 'loading' } | { kind: 'anon' } | { kind: 'signed-in'; me: Me };
 
 export default function App() {
+  const [auth, setAuth] = useState<AuthState>({ kind: 'loading' });
+
+  const checkAuth = useCallback(async () => {
+    try {
+      const me = await api.getMe();
+      setAuth({ kind: 'signed-in', me });
+    } catch (err) {
+      if (err instanceof AuthRequiredError) {
+        setAuth({ kind: 'anon' });
+      } else {
+        console.error('auth check failed', err);
+        setAuth({ kind: 'anon' });
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    checkAuth();
+  }, [checkAuth]);
+
+  if (auth.kind === 'loading') {
+    return <div className="app"><div className="empty"><p>Loading…</p></div></div>;
+  }
+  if (auth.kind === 'anon') {
+    return <LoginScreen />;
+  }
+  return <AuthedApp me={auth.me} onSignOut={() => setAuth({ kind: 'anon' })} />;
+}
+
+// -------- Login screen --------
+
+function LoginScreen() {
+  return (
+    <div className="app">
+      <div className="empty" style={{ maxWidth: 480, margin: '80px auto', textAlign: 'center' }}>
+        <div className="brand" style={{ justifyContent: 'center', marginBottom: 24 }}>
+          <span className="brand-mark">▰▰</span>
+          <span className="brand-name">AD LIBRARY FINDER</span>
+        </div>
+        <p className="empty-title">Sign in to continue</p>
+        <p className="empty-sub">Access is limited to @mobupps.com Google accounts.</p>
+        <a className="btn primary" href="/api/auth/google" style={{ marginTop: 16, display: 'inline-block' }}>
+          Sign in with Google
+        </a>
+      </div>
+    </div>
+  );
+}
+
+// -------- Authed app shell --------
+
+function AuthedApp({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
   const [view, setView] = useState<View>({ kind: 'list' });
   const [jobs, setJobs] = useState<Job[]>([]);
   const [settings, setSettings] = useState<Settings | null>(null);
+
+  const handleAuthError = useCallback((err: unknown) => {
+    if (err instanceof AuthRequiredError) {
+      onSignOut();
+      return true;
+    }
+    return false;
+  }, [onSignOut]);
 
   const refresh = useCallback(async () => {
     try {
       const list = await api.listJobs();
       setJobs(list);
     } catch (err) {
-      console.error(err);
+      if (!handleAuthError(err)) console.error(err);
     }
-  }, []);
+  }, [handleAuthError]);
 
   const refreshSettings = useCallback(async () => {
     try {
       setSettings(await api.getSettings());
     } catch (err) {
-      console.error(err);
+      if (!handleAuthError(err)) console.error(err);
     }
-  }, []);
+  }, [handleAuthError]);
 
   useEffect(() => {
     refresh();
@@ -36,17 +97,18 @@ export default function App() {
   useEffect(() => {
     if (window.location.hash.startsWith('#/settings')) {
       setView({ kind: 'settings' });
-      // Clean the URL but keep the path
-      const params = new URLSearchParams(window.location.search);
-      const wasConnected = params.get('gmail_connected') === '1';
-      if (wasConnected) {
-        // Refresh settings to reflect the new connection
-        refreshSettings();
-        // Strip the query param without reloading
-        window.history.replaceState(null, '', window.location.pathname + '#/settings');
-      }
+      window.history.replaceState(null, '', window.location.pathname + '#/settings');
     }
-  }, [refreshSettings]);
+  }, []);
+
+  const signOut = async () => {
+    try {
+      await api.logout();
+    } catch {
+      // ignore
+    }
+    onSignOut();
+  };
 
   return (
     <div className="app">
@@ -65,6 +127,10 @@ export default function App() {
           <button className={`nav-btn primary ${view.kind === 'new' ? 'active' : ''}`} onClick={() => setView({ kind: 'new' })}>
             + New Job
           </button>
+          <span className="nav-user" style={{ marginLeft: 16, color: 'var(--muted, #888)', fontSize: 13 }}>
+            {me.email}
+          </span>
+          <button className="nav-btn ghost" onClick={signOut} title="Sign out">Sign out</button>
         </nav>
       </header>
 
@@ -244,7 +310,7 @@ function NewJob({
         <p className="form-hint">
           Email will be sent here when job completes. Effective: <code>{effectiveRecipient}</code>
           {!settings?.gmailConnected && (
-            <> · <span style={{ color: 'var(--warn)' }}>Gmail not connected — no email will be sent. Configure in Settings.</span></>
+            <> · <span style={{ color: 'var(--warn)' }}>Your Gmail is not connected — no email will be sent. Connect in Settings.</span></>
           )}
         </p>
       </div>
@@ -378,7 +444,7 @@ function SettingsView({ settings, onChange }: { settings: Settings | null; onCha
   };
 
   const disconnect = async () => {
-    if (!confirm('Disconnect the Gmail account? You will need to re-authorize to send emails.')) return;
+    if (!confirm('Disconnect your Gmail? You will need to sign in again to reconnect it.')) return;
     await api.disconnectGmail();
     onChange();
   };
@@ -403,7 +469,12 @@ function SettingsView({ settings, onChange }: { settings: Settings | null; onCha
       </div>
 
       <div className="form-row">
-        <label>Gmail Account (sender)</label>
+        <label>Signed in as</label>
+        <div><code>{settings.userEmail}</code>{settings.userName ? <span className="muted" style={{ marginLeft: 8 }}>({settings.userName})</span> : null}</div>
+      </div>
+
+      <div className="form-row">
+        <label>My Gmail (sender for my jobs)</label>
         {settings.gmailConnected ? (
           <div className="settings-connected">
             <div>
@@ -414,30 +485,30 @@ function SettingsView({ settings, onChange }: { settings: Settings | null; onCha
           </div>
         ) : (
           <div>
-            <a href={api.startGmailAuthUrl()} className="btn primary">Connect Gmail Account</a>
+            <a href="/api/auth/google" className="btn primary">Connect my Gmail</a>
             <p className="form-hint" style={{ marginTop: 10 }}>
-              One-time GCP setup required. See <code>SETUP_GOOGLE_OAUTH.md</code> in the repo.
+              Re-authorize Google to grant Gmail-send permission. Job completion emails will be sent from your Gmail.
             </p>
           </div>
         )}
       </div>
 
       <div className="form-row">
-        <label>Default Recipient</label>
+        <label>My Default Recipient</label>
         <div className="settings-recipient">
           <input
             className="input"
             type="email"
             value={recipient}
             onChange={(e) => setRecipient(e.target.value)}
-            placeholder="leads@mobupps.com"
+            placeholder="leads@example.com"
           />
           <button className="btn primary" onClick={saveRecipient} disabled={saving}>
             {saving ? 'Saving…' : 'Save'}
           </button>
         </div>
         {savedMsg && <p className="form-hint" style={{ color: 'var(--accent)' }}>{savedMsg}</p>}
-        <p className="form-hint">Default destination for job-completion emails. Per-job override is available on the New Job form.</p>
+        <p className="form-hint">Default destination for your job-completion emails. Per-job override is available on the New Job form.</p>
       </div>
 
       {settings.gmailConnected && settings.defaultRecipient && (

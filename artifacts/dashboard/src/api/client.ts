@@ -15,6 +15,7 @@ export interface Job {
   total_advertisers: number;
   recipient_email: string | null;
   notification_status: string | null;
+  created_by_user_id: string | null;
 }
 
 export interface JobLog {
@@ -25,17 +26,33 @@ export interface JobLog {
   ts: number;
 }
 
+export interface Me {
+  id: string;
+  email: string;
+  name: string | null;
+}
+
 export interface Settings {
+  userEmail: string;
+  userName: string | null;
   gmailConnected: boolean;
   gmailEmail: string | null;
   defaultRecipient: string | null;
 }
 
+export class AuthRequiredError extends Error {
+  constructor() { super('authentication required'); this.name = 'AuthRequiredError'; }
+}
+
 async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, {
     ...init,
+    credentials: 'same-origin',
     headers: { 'Content-Type': 'application/json', ...(init?.headers || {}) },
   });
+  if (res.status === 401) {
+    throw new AuthRequiredError();
+  }
   if (!res.ok) {
     const body = await res.text();
     throw new Error(`${res.status}: ${body}`);
@@ -46,6 +63,12 @@ async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   health: () => fetchJson<{ ok: boolean }>('/api/health'),
 
+  // ---- auth / me ----
+  getMe: () => fetchJson<Me>('/api/me'),
+  logout: () => fetchJson<{ ok: boolean }>('/api/auth/logout', { method: 'POST' }),
+  startGoogleSignInUrl: () => '/api/auth/google',
+
+  // ---- jobs ----
   listJobs: () => fetchJson<{ jobs: Job[] }>('/api/jobs').then((r) => r.jobs),
 
   getJob: (id: string) => fetchJson<{ job: Job; logs: JobLog[] }>(`/api/jobs/${id}`),
@@ -66,7 +89,7 @@ export const api = {
   getSettings: () => fetchJson<Settings>('/api/settings'),
 
   setRecipient: (email: string) =>
-    fetchJson<{ defaultRecipient: string }>('/api/settings/recipient', {
+    fetchJson<{ defaultRecipient: string | null }>('/api/settings/recipient', {
       method: 'PUT',
       body: JSON.stringify({ email }),
     }),
@@ -76,7 +99,4 @@ export const api = {
 
   sendTestEmail: () =>
     fetchJson<{ ok: boolean }>('/api/settings/test-email', { method: 'POST' }),
-
-  // ---- auth ----
-  startGmailAuthUrl: () => '/api/auth/google',
 };
