@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { initDb } from './db.js';
 import { jobsRouter } from './routes-jobs.js';
-import { healthRouter } from './routes-health.js';
+import { healthRouter, versionRouter } from './routes-health.js';
 import { authRouter } from './routes-auth.js';
 import { settingsRouter } from './routes-settings.js';
 import { prepareStableLibraryClosure } from './browserSetup.js';
@@ -21,6 +21,12 @@ async function main() {
   prepareStableLibraryClosure();
 
   const app = express();
+
+  // Trust the Replit edge proxy so req.secure / req.ip / req.protocol reflect
+  // the real client connection. Required for forwarded-header-derived OAuth
+  // redirect URIs to be correct.
+  app.set('trust proxy', true);
+
   app.use(express.json({ limit: '1mb' }));
 
   app.use((req, _res, next) => {
@@ -29,6 +35,7 @@ async function main() {
   });
 
   app.use('/api/health', healthRouter);
+  app.use('/version', versionRouter);
   app.use('/api/jobs', jobsRouter);
   app.use('/api/auth', authRouter);
   app.use('/api/settings', settingsRouter);
