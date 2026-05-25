@@ -8,6 +8,7 @@ import {
   JobPhase,
   Settings,
   Me,
+  AppgoblinCategory,
   AuthRequiredError,
   derivePhase,
   phaseLabel,
@@ -179,7 +180,7 @@ function JobsList({ jobs, onSelect, onNew }: { jobs: Job[]; onSelect: (id: strin
     return (
       <div className="empty">
         <p className="empty-title">No jobs yet</p>
-        <p className="empty-sub">Submit a scrape to find advertisers from Meta Ad Library or Affplus.</p>
+        <p className="empty-sub">Submit a scrape from Meta Ad Library, Affplus, or AppGoblin.</p>
         <button className="btn primary" onClick={onNew}>+ New Job</button>
       </div>
     );
@@ -240,9 +241,6 @@ function StatusBadge({ status }: { status: Job['status'] }) {
 }
 
 function RowPhaseCell({ job }: { job: Job }) {
-  // Compact phase indicator for the jobs table row. For terminal jobs
-  // (completed/failed) we omit the row indicator — status already tells
-  // the story; phase belongs to the in-flight rows.
   if (job.status === 'completed' || job.status === 'failed') {
     return <span className="muted">—</span>;
   }
@@ -273,14 +271,40 @@ function NewJob({
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // AppGoblin discovery state
+  const [appgoblinCategory, setAppgoblinCategory] = useState<string>('');
+  const [appgoblinAdNetwork, setAppgoblinAdNetwork] = useState<string>('');
+  const [agCategories, setAgCategories] = useState<AppgoblinCategory[] | null>(null);
+  const [agCategoriesError, setAgCategoriesError] = useState<string | null>(null);
+  const [agCategoriesLoading, setAgCategoriesLoading] = useState(false);
+
+  // Lazy-load AppGoblin category list when user picks AppGoblin source.
+  useEffect(() => {
+    if (source !== 'appgoblin') return;
+    if (agCategories !== null) return; // already loaded
+    setAgCategoriesLoading(true);
+    setAgCategoriesError(null);
+    api.appgoblinCategories()
+      .then((cats) => {
+        setAgCategories(cats);
+        // Default to game_casino if present (the recon-confirmed slug); else first.
+        if (cats.length > 0 && !appgoblinCategory) {
+          const def = cats.find((c) => c.id === 'game_casino') || cats[0];
+          setAppgoblinCategory(def.id);
+        }
+      })
+      .catch((err) => setAgCategoriesError((err as Error).message))
+      .finally(() => setAgCategoriesLoading(false));
+  }, [source, agCategories, appgoblinCategory]);
+
   const toggleType = (pt: ProductType) => {
     setProductTypes((prev) => (prev.includes(pt) ? prev.filter((x) => x !== pt) : [...prev, pt]));
   };
 
-  // When switching to Affplus, force productType to mobile (Affplus supports mobile only).
+  // When switching to a mobile-only source, force productType to mobile.
   const handleSourceChange = (s: JobSource) => {
     setSource(s);
-    if (s === 'affplus') setProductTypes(['mobile']);
+    if (s === 'affplus' || s === 'appgoblin') setProductTypes(['mobile']);
   };
 
   const submit = async () => {
@@ -298,9 +322,32 @@ function NewJob({
       setError('Affplus source supports Mobile only');
       return;
     }
+    if (source === 'appgoblin') {
+      if (productTypes.some((pt) => pt !== 'mobile')) {
+        setError('AppGoblin source supports Mobile only');
+        return;
+      }
+      const cat = appgoblinCategory.trim();
+      const adn = appgoblinAdNetwork.trim();
+      if (!cat && !adn) {
+        setError('AppGoblin: pick a category and/or enter an ad-network domain');
+        return;
+      }
+      if (adn && !/^[a-z0-9.-]+\.[a-z]{2,}$/i.test(adn)) {
+        setError('AppGoblin ad-network must be a domain like "appsflyer.com"');
+        return;
+      }
+    }
     setSubmitting(true);
     try {
-      await api.createJobs(countries, productTypes, recipientEmail.trim() || null, source);
+      await api.createJobs({
+        countries,
+        productTypes,
+        recipientEmail: recipientEmail.trim() || null,
+        source,
+        appgoblinCategory: source === 'appgoblin' ? (appgoblinCategory.trim() || null) : undefined,
+        appgoblinAdNetwork: source === 'appgoblin' ? (appgoblinAdNetwork.trim() || null) : undefined,
+      });
       onCreated();
     } catch (err) {
       setError((err as Error).message);
@@ -339,12 +386,62 @@ function NewJob({
             />
             <span>Affplus <span className="muted">(affiliate offer directory; Mobile only)</span></span>
           </label>
+          <label className="checkbox">
+            <input
+              type="radio"
+              name="source"
+              checked={source === 'appgoblin'}
+              onChange={() => handleSourceChange('appgoblin')}
+            />
+            <span>AppGoblin <span className="muted">(apps by category / ad-network; Mobile only)</span></span>
+          </label>
         </div>
         <p className="form-hint">
           Meta scrapes the Facebook Ad Library and classifies landing pages. Affplus lists CPA/CPI mobile
-          offers and verifies each against the Google Play / App Store.
+          offers and verifies each against the Google Play / App Store. AppGoblin discovers real apps by
+          category or by which ad-network/MMP SDK they integrate — store URLs come straight from the source.
         </p>
       </div>
+
+      {source === 'appgoblin' && (
+        <div className="form-row">
+          <label>AppGoblin discovery</label>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+            <div>
+              <div className="muted small" style={{ marginBottom: 4 }}>Category</div>
+              {agCategoriesLoading && <div className="muted small">Loading categories…</div>}
+              {agCategoriesError && <div className="error" style={{ marginBottom: 6 }}>Category list failed to load: {agCategoriesError}</div>}
+              <select
+                className="input"
+                value={appgoblinCategory}
+                onChange={(e) => setAppgoblinCategory(e.target.value)}
+                disabled={agCategoriesLoading}
+              >
+                <option value="">(no category filter)</option>
+                {(agCategories || []).map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.name} ({c.id}) · {c.total_apps.toLocaleString()} apps
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <div className="muted small" style={{ marginBottom: 4 }}>Ad-network / MMP domain (optional)</div>
+              <input
+                className="input"
+                value={appgoblinAdNetwork}
+                onChange={(e) => setAppgoblinAdNetwork(e.target.value)}
+                placeholder="e.g. appsflyer.com, adjust.com"
+              />
+            </div>
+          </div>
+          <p className="form-hint">
+            Pick a <strong>category</strong> to discover top ad-network companies in that vertical and pull their top apps.
+            Optionally narrow by an <strong>ad-network domain</strong> (e.g. <code>appsflyer.com</code>) to get apps integrating that
+            specific SDK. If you set the ad-network domain alone, the job returns that company's top iOS+Android apps directly.
+          </p>
+        </div>
+      )}
 
       <div className="form-row">
         <label>Countries (ISO 2-letter, comma-separated)</label>
@@ -354,7 +451,11 @@ function NewJob({
           onChange={(e) => setCountriesText(e.target.value)}
           placeholder="US, BR, IN, ID, MX"
         />
-        <p className="form-hint">Each country is searched independently. More countries = longer job.</p>
+        <p className="form-hint">
+          {source === 'appgoblin'
+            ? 'AppGoblin returns the same apps regardless of country — the country list here is informational metadata on the CSV rows.'
+            : 'Each country is searched independently. More countries = longer job.'}
+        </p>
       </div>
 
       <div className="form-row">
@@ -373,14 +474,14 @@ function NewJob({
               type="checkbox"
               checked={productTypes.includes('cps')}
               onChange={() => toggleType('cps')}
-              disabled={source === 'affplus'}
+              disabled={source === 'affplus' || source === 'appgoblin'}
             />
             <span>CPS <span className="muted">(web product, website URLs)</span></span>
           </label>
         </div>
         <p className="form-hint">
-          {source === 'affplus'
-            ? 'Affplus supports Mobile only.'
+          {source === 'affplus' || source === 'appgoblin'
+            ? `${source === 'affplus' ? 'Affplus' : 'AppGoblin'} supports Mobile only.`
             : 'Selecting both creates two separate jobs (one CSV per type).'}
         </p>
       </div>
@@ -448,6 +549,18 @@ function JobDetail({ id, onBack }: { id: string; onBack: () => void }) {
   const isActive = job.status === 'pending' || job.status === 'running';
   const latestLog = logs.length > 0 ? logs[logs.length - 1] : null;
 
+  // Pretty-print source params when present (AppGoblin only today).
+  let sourceParamsDisplay: string | null = null;
+  if (job.source_params) {
+    try {
+      const p = JSON.parse(job.source_params) as Record<string, unknown>;
+      const parts: string[] = [];
+      if (p.category) parts.push(`category=${p.category}`);
+      if (p.adNetworkDomain) parts.push(`ad-network=${p.adNetworkDomain}`);
+      if (parts.length > 0) sourceParamsDisplay = parts.join(', ');
+    } catch { /* ignore */ }
+  }
+
   return (
     <div className="panel">
       <div className="panel-head">
@@ -462,6 +575,7 @@ function JobDetail({ id, onBack }: { id: string; onBack: () => void }) {
         <Field label="Source"><span className={`tag tag-${job.source || 'meta'}`}>{(job.source || 'meta').toUpperCase()}</span></Field>
         <Field label="Product Type"><span className={`tag tag-${job.product_type}`}>{job.product_type.toUpperCase()}</span></Field>
         <Field label="Countries"><code>{countries.join(', ')}</code></Field>
+        {sourceParamsDisplay && <Field label="Discovery"><code>{sourceParamsDisplay}</code></Field>}
         <Field label="Recipient">{job.recipient_email || <span className="muted">(default)</span>}</Field>
         <Field label="Email">{job.notification_status === 'sent' ? '✓ sent' : job.notification_status === 'failed' ? '✗ failed' : '—'}</Field>
         <Field label="Created">{new Date(job.created_at).toLocaleString()}</Field>
@@ -474,6 +588,9 @@ function JobDetail({ id, onBack }: { id: string; onBack: () => void }) {
       {job.status === 'completed' && (
         <div className="cta-row">
           <a href={api.csvUrl(job.id)} className="btn primary">⬇ Download CSV</a>
+          {job.product_type === 'mobile' && (
+            <a href={api.hqZipUrl(job.id)} className="btn" style={{ marginLeft: 8 }}>⬇ HQ-Split ZIP</a>
+          )}
         </div>
       )}
       {job.status === 'failed' && job.error && (
@@ -509,9 +626,6 @@ function PhaseProgress({
   const isFailed = currentPhase === 'failed';
   const currentIdx = isFailed ? -1 : PHASE_STEPS.indexOf(currentPhase);
 
-  // Description preference: server-supplied phase_detail > latest log line >
-  // phase label. Keeps a coherent description even right after pickup when
-  // no log lines have been written yet.
   const description =
     job.phase_detail ||
     (latestLog ? latestLog.message : phaseLabel(currentPhase));

@@ -1,12 +1,13 @@
 export type ProductType = 'mobile' | 'cps';
 export type JobStatus = 'pending' | 'running' | 'completed' | 'failed';
-export type JobSource = 'meta' | 'affplus';
+export type JobSource = 'meta' | 'affplus' | 'appgoblin';
 export type JobPhase =
   | 'queued'
   | 'starting'
   | 'scraping'
   | 'classifying'
   | 'building_csv'
+  | 'hq_splitting'
   | 'done'
   | 'failed';
 
@@ -26,6 +27,7 @@ export interface Job {
   notification_status: string | null;
   created_by_user_id: string | null;
   source: JobSource;
+  source_params: string | null;
   // Coarse pipeline phase (additive). May be null for old jobs created
   // before this column existed; UI derives a sensible default from status.
   phase: JobPhase | null;
@@ -53,6 +55,24 @@ export interface Settings {
   gmailConnected: boolean;
   gmailEmail: string | null;
   defaultRecipient: string | null;
+}
+
+export interface AppgoblinCategory {
+  id: string;
+  name: string;
+  type: string;
+  android: number;
+  ios: number;
+  total_apps: number;
+}
+
+export interface CreateJobOptions {
+  countries: string[];
+  productTypes: ProductType[];
+  recipientEmail?: string | null;
+  source?: JobSource;
+  appgoblinCategory?: string | null;
+  appgoblinAdNetwork?: string | null;
 }
 
 export class AuthRequiredError extends Error {
@@ -88,18 +108,18 @@ export const api = {
 
   getJob: (id: string) => fetchJson<{ job: Job; logs: JobLog[] }>(`/api/jobs/${id}`),
 
-  createJobs: (
-    countries: string[],
-    productTypes: ProductType[],
-    recipientEmail?: string | null,
-    source?: JobSource
-  ) =>
+  createJobs: (opts: CreateJobOptions) =>
     fetchJson<{ jobs: Job[] }>('/api/jobs', {
       method: 'POST',
-      body: JSON.stringify({ countries, productTypes, recipientEmail, source }),
+      body: JSON.stringify(opts),
     }),
 
   csvUrl: (id: string) => `/api/jobs/${id}/csv`,
+  hqZipUrl: (id: string) => `/api/jobs/${id}/hq-zip`,
+
+  // ---- appgoblin ----
+  appgoblinCategories: () =>
+    fetchJson<{ categories: AppgoblinCategory[] }>('/api/jobs/appgoblin-categories').then((r) => r.categories),
 
   // ---- settings ----
   getSettings: () => fetchJson<Settings>('/api/settings'),
@@ -130,10 +150,11 @@ const PHASE_ORDER: JobPhase[] = [
 
 const PHASE_LABEL: Record<JobPhase, string> = {
   queued: 'Queued',
-  starting: 'Starting browser',
+  starting: 'Starting',
   scraping: 'Scraping',
   classifying: 'Classifying',
   building_csv: 'Building CSV',
+  hq_splitting: 'HQ split',
   done: 'Done',
   failed: 'Failed',
 };

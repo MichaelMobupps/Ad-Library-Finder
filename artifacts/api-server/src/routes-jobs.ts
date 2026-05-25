@@ -11,6 +11,7 @@ import {
   JobSource,
 } from './db.js';
 import { RequestWithUser } from './auth.js';
+import { fetchAppgoblinCategoryList } from './appgoblinScraper.js';
 
 export const jobsRouter: Router = Router();
 
@@ -19,12 +20,15 @@ interface CreateJobBody {
   productTypes: ProductType[];
   recipientEmail?: string | null;
   source?: JobSource;
+  /** AppGoblin discovery params (only used when source='appgoblin'). */
+  appgoblinCategory?: string | null;
+  appgoblinAdNetwork?: string | null;
 }
 
 // POST /api/jobs
 jobsRouter.post('/', (req: Request<{}, {}, CreateJobBody>, res: Response) => {
   const user = (req as RequestWithUser).user!;
-  const { countries, productTypes, recipientEmail, source } = req.body;
+  const { countries, productTypes, recipientEmail, source, appgoblinCategory, appgoblinAdNetwork } = req.body;
 
   if (!Array.isArray(countries) || countries.length === 0) {
     return res.status(400).json({ error: 'countries[] required' });
@@ -45,15 +49,39 @@ jobsRouter.post('/', (req: Request<{}, {}, CreateJobBody>, res: Response) => {
   // Source: default to 'meta' to preserve existing behavior.
   let jobSource: JobSource = 'meta';
   if (source !== undefined) {
-    if (source !== 'meta' && source !== 'affplus') {
+    if (source !== 'meta' && source !== 'affplus' && source !== 'appgoblin') {
       return res.status(400).json({ error: `invalid source: ${source}` });
     }
     jobSource = source;
   }
 
-  // Affplus only produces mobile-targeted output today; reject CPS for affplus.
-  if (jobSource === 'affplus' && productTypes.some((pt) => pt !== 'mobile')) {
-    return res.status(400).json({ error: 'affplus source supports productType=mobile only' });
+  // Mobile-only sources reject CPS.
+  if ((jobSource === 'affplus' || jobSource === 'appgoblin') && productTypes.some((pt) => pt !== 'mobile')) {
+    return res.status(400).json({ error: `${jobSource} source supports productType=mobile only` });
+  }
+
+  // AppGoblin needs at least one discovery axis.
+  let sourceParams: Record<string, unknown> | null = null;
+  if (jobSource === 'appgoblin') {
+    const cat = (appgoblinCategory || '').trim() || null;
+    const adn = (appgoblinAdNetwork || '').trim() || null;
+    if (!cat && !adn) {
+      return res.status(400).json({
+        error: 'appgoblin jobs require appgoblinCategory and/or appgoblinAdNetwork',
+      });
+    }
+    // Validate slug shapes loosely — AppGoblin slugs are [a-z0-9_], domains are
+    // lower-case dotted hosts.
+    if (cat && !/^[a-z0-9_]+$/.test(cat)) {
+      return res.status(400).json({ error: 'appgoblinCategory must be lowercase letters/digits/underscores' });
+    }
+    if (adn && !/^[a-z0-9.-]+\.[a-z]{2,}$/.test(adn.toLowerCase())) {
+      return res.status(400).json({ error: 'appgoblinAdNetwork must be a domain like "appsflyer.com"' });
+    }
+    sourceParams = {
+      category: cat,
+      adNetworkDomain: adn ? adn.toLowerCase() : null,
+    };
   }
 
   let recipient: string | null = null;
@@ -74,6 +102,7 @@ jobsRouter.post('/', (req: Request<{}, {}, CreateJobBody>, res: Response) => {
       recipientEmail: recipient,
       createdByUserId: user.id,
       source: jobSource,
+      sourceParams,
     });
   });
 
@@ -83,6 +112,18 @@ jobsRouter.post('/', (req: Request<{}, {}, CreateJobBody>, res: Response) => {
 jobsRouter.get('/', (req, res) => {
   const user = (req as RequestWithUser).user!;
   res.json({ jobs: listJobsForUser(user.id) });
+});
+
+// GET /api/jobs/appgoblin-categories — list the real AppGoblin category slugs.
+// Cached for 1h in the scraper module. Returns [{id,name,android,ios,total_apps}].
+// Defined BEFORE /:id so Express does not match "appgoblin-categories" as an id.
+jobsRouter.get('/appgoblin-categories', async (_req: Request, res: Response) => {
+  try {
+    const cats = await fetchAppgoblinCategoryList();
+    res.json({ categories: cats });
+  } catch (err) {
+    res.status(502).json({ error: `appgoblin category fetch failed: ${(err as Error).message}` });
+  }
 });
 
 jobsRouter.get('/:id', (req, res) => {
