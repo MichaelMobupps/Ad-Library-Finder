@@ -111,3 +111,21 @@ jobsRouter.get('/:id/csv', (req, res) => {
   res.setHeader('Content-Disposition', `attachment; filename="${fname}"`);
   createReadStream(job.csv_path).pipe(res);
 });
+
+// Per-HQ-country .xlsx bundle (mobile jobs only). The orchestrator sets
+// hq_zip_path after the CSV has been written and HQ resolution succeeded.
+jobsRouter.get('/:id/hq-zip', (req, res) => {
+  const user = (req as RequestWithUser).user!;
+  const job = getJob(req.params.id);
+  if (!job) return res.status(404).json({ error: 'not found' });
+  if (job.created_by_user_id && job.created_by_user_id !== user.id) {
+    return res.status(404).json({ error: 'not found' });
+  }
+  if (!job.hq_zip_path || !existsSync(job.hq_zip_path)) {
+    return res.status(404).json({ error: 'HQ-split zip not yet ready' });
+  }
+  const fname = path.basename(job.hq_zip_path);
+  res.setHeader('Content-Type', 'application/zip');
+  res.setHeader('Content-Disposition', `attachment; filename="${fname}"`);
+  createReadStream(job.hq_zip_path).pipe(res);
+});

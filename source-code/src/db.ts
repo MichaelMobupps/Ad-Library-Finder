@@ -12,6 +12,7 @@ export type JobPhase =
   | 'scraping'
   | 'classifying'
   | 'building_csv'
+  | 'hq_splitting'
   | 'done'
   | 'failed';
 
@@ -34,6 +35,7 @@ export interface JobRow {
   phase: JobPhase | null; // coarse pipeline phase; null for old jobs (derived from status)
   phase_detail: string | null; // free-form descriptor, e.g. "scraping US / game" or "classifying 25/200"
   phase_updated_at: number | null;
+  hq_zip_path: string | null; // mobile-only: path to per-HQ-country .zip bundle
 }
 
 export interface JobLogRow {
@@ -193,6 +195,9 @@ export async function initDb() {
   if (!colNames.has('phase_updated_at')) {
     db.exec(`ALTER TABLE jobs ADD COLUMN phase_updated_at INTEGER`);
   }
+  if (!colNames.has('hq_zip_path')) {
+    db.exec(`ALTER TABLE jobs ADD COLUMN hq_zip_path TEXT`);
+  }
 
   db.exec(`CREATE INDEX IF NOT EXISTS idx_jobs_user ON jobs(created_by_user_id)`);
 
@@ -295,6 +300,10 @@ export function setJobPhase(id: string, phase: JobPhase, detail?: string | null)
 
 export function setJobNotificationStatus(id: string, status: 'sent' | 'failed') {
   getDb().prepare(`UPDATE jobs SET notification_status=? WHERE id = ?`).run(status, id);
+}
+
+export function setJobHqZipPath(id: string, zipPath: string | null) {
+  getDb().prepare(`UPDATE jobs SET hq_zip_path=? WHERE id = ?`).run(zipPath, id);
 }
 
 // ---------- Log helpers ----------

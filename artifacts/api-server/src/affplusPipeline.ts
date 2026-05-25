@@ -28,6 +28,7 @@
  *   5. buildCsv produces the mobile CSV. The header is "store_url" (NOT
  *      "preview_url"): Email Prospector auto-detects the store-URL column by
  *      header name, and its alias list includes store_url but not preview_url.
+ *   6. After CSV: runHqSplit produces an HQ-bucketed .zip (mobile only).
  *
  * Operator-visible job log records: pages fetched, skip-list count,
  * unresolved/dropped count, dating-name-skip count, low-score-drop count,
@@ -42,6 +43,7 @@ import {
   markJobCompleted,
   markJobFailed,
   setJobPhase,
+  setJobHqZipPath,
   getJob,
   JobRow,
 } from './db.js';
@@ -50,6 +52,7 @@ import { cleanOfferName } from './nameCleaner.js';
 import { resolveAndVerify, Platform as ResolvePlatform, ResolvedStore } from './storeResolver.js';
 import { buildCsv } from './csv.js';
 import { notifyJobCompleted, notifyJobFailed } from './notifier.js';
+import { runHqSplit } from './hqSplit.js';
 import { log } from './logger.js';
 
 const PAGES_PER_PLATFORM = Number(process.env.AFFPLUS_PAGES_PER_PLATFORM) || 3;
@@ -371,6 +374,27 @@ export async function runAffplusJob(job: JobRow): Promise<void> {
       results: allResults,
     });
     onLog('info', `affplus: CSV written: ${csvPath} (${rowsWritten} rows)`);
+
+    // 6. HQ split. Mobile-only, non-fatal on failure.
+    if (job.product_type === 'mobile') {
+      setJobPhase(job.id, 'hq_splitting', `resolving HQ for ${rowsWritten} apps`);
+      try {
+        const outcome = await runHqSplit({ jobId: job.id, results: allResults, onLog });
+        if (outcome.zipPath) {
+          setJobHqZipPath(job.id, outcome.zipPath);
+          const summary = Object.entries(outcome.perCountryCounts)
+            .sort(([, a], [, b]) => b - a)
+            .map(([c, n]) => `${c}=${n}`)
+            .join(', ');
+          onLog('info', `affplus hq-split: zip ready (${summary})`);
+        }
+        if (outcome.playBlocked) {
+          onLog('warn', `affplus hq-split: Play page-fetch was blocked/rate-limited — Android resolution may be degraded`);
+        }
+      } catch (err) {
+        onLog('warn', `affplus hq-split failed (non-fatal): ${(err as Error).message}`);
+      }
+    }
 
     // markJobCompleted sets phase='done'.
     markJobCompleted(job.id, csvPath, { ads: tagged.length, advertisers: rowsWritten });
