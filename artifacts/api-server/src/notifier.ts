@@ -1,4 +1,5 @@
 import { existsSync } from 'node:fs';
+import path from 'node:path';
 import { JobRow, setJobNotificationStatus, getUserById, getGmailTokensForUser } from './db.js';
 import { sendEmailFromUser } from './gmail.js';
 import { getDefaultRecipientForUser } from './settings.js';
@@ -18,6 +19,11 @@ function publicJobUrl(jobId: string): string {
 function publicCsvUrl(jobId: string): string {
   const base = (process.env.PUBLIC_BASE_URL || '').replace(/\/$/, '');
   return `${base}/api/jobs/${jobId}/csv`;
+}
+
+function publicHqZipUrl(jobId: string): string {
+  const base = (process.env.PUBLIC_BASE_URL || '').replace(/\/$/, '');
+  return `${base}/api/jobs/${jobId}/hq-zip`;
 }
 
 function escapeHtml(s: string): string {
@@ -79,6 +85,10 @@ export async function notifyJobCompleted(job: JobRow) {
   const jobUrl = publicJobUrl(job.id);
   const csvExists = !!job.csv_path && existsSync(job.csv_path);
 
+  // HQ-split zip: mobile jobs only; present iff resolution succeeded.
+  const hqZipExists = !!job.hq_zip_path && existsSync(job.hq_zip_path);
+  const hqZipUrl = publicHqZipUrl(job.id);
+
   const subject = `Ad Library Finder: ${job.product_type.toUpperCase()} job complete — ${job.total_advertisers} advertisers (${countries})`;
   const html = `<!DOCTYPE html>
 <html><body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; color: #1a1a1a; max-width: 640px;">
@@ -96,21 +106,37 @@ export async function notifyJobCompleted(job: JobRow) {
 
   <p>
     <a href="${csvUrl}" style="display: inline-block; padding: 10px 18px; background: #0a1410; color: #5cf2a8; text-decoration: none; border-radius: 4px; font-weight: 600;">⬇ Download CSV</a>
+    ${hqZipExists ? `&nbsp;&nbsp;<a href="${hqZipUrl}" style="display: inline-block; padding: 10px 18px; background: #1a1a1a; color: #ffd166; text-decoration: none; border-radius: 4px; font-weight: 600;">⬇ Download HQ split (.zip)</a>` : ''}
   </p>
 
-  ${csvExists ? `<p style="color: #6b7280; font-size: 13px;">The CSV is also attached to this email for convenience.</p>` : ''}
+  ${hqZipExists ? `<p style="color: #6b7280; font-size: 13px;">The HQ-split bundle contains one .xlsx per HQ country (US.xlsx, BR.xlsx, JP.xlsx, …) plus Unknown.xlsx for apps where the HQ could not be resolved. Both the CSV and the zip are attached to this email for convenience.</p>` : ''}
+  ${csvExists && !hqZipExists ? `<p style="color: #6b7280; font-size: 13px;">The CSV is also attached to this email for convenience.</p>` : ''}
 
   <p style="color: #6b7280; font-size: 13px;">
     View full job log: <a href="${jobUrl}">${jobUrl}</a>
   </p>
 </body></html>`;
 
+  // Compose attachments: CSV (if exists) + HQ zip (if exists). Mobile jobs
+  // with HQ resolution succeed get both; CPS jobs get just CSV.
+  const attachments: Array<{ path: string; mimeType: string; filename?: string }> = [];
+  if (csvExists) {
+    attachments.push({ path: job.csv_path!, mimeType: 'text/csv' });
+  }
+  if (hqZipExists) {
+    attachments.push({
+      path: job.hq_zip_path!,
+      mimeType: 'application/zip',
+      filename: path.basename(job.hq_zip_path!),
+    });
+  }
+
   try {
     await sendEmailFromUser(sender.userId, {
       to,
       subject,
       htmlBody: html,
-      attachments: csvExists ? [{ path: job.csv_path!, mimeType: 'text/csv' }] : [],
+      attachments,
     });
     setJobNotificationStatus(job.id, 'sent');
   } catch (err) {

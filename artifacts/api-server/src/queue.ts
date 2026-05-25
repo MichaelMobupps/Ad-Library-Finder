@@ -4,6 +4,7 @@ import {
   markJobCompleted,
   markJobFailed,
   setJobPhase,
+  setJobHqZipPath,
   appendLog,
   insertResult,
   getResults,
@@ -16,6 +17,7 @@ import { buildCsv } from './csv.js';
 import { keywordsFor } from './keywords.js';
 import { notifyJobCompleted, notifyJobFailed } from './notifier.js';
 import { runAffplusJob } from './affplusPipeline.js';
+import { runHqSplit } from './hqSplit.js';
 import { log } from './logger.js';
 
 const POLL_INTERVAL_MS = 2000;
@@ -139,6 +141,28 @@ async function runMetaJob(job: JobRow) {
       results: allResults,
     });
     onLog('info', `CSV written: ${csvPath} (${rowsWritten} rows)`);
+
+    // HQ split (mobile only). Fire-and-forget for failures inside the split:
+    // we don't want a downstream HQ-resolution issue to fail the whole job.
+    if (job.product_type === 'mobile') {
+      setJobPhase(job.id, 'hq_splitting', `resolving HQ for ${rowsWritten} apps`);
+      try {
+        const outcome = await runHqSplit({ jobId: job.id, results: allResults, onLog });
+        if (outcome.zipPath) {
+          setJobHqZipPath(job.id, outcome.zipPath);
+          const summary = Object.entries(outcome.perCountryCounts)
+            .sort(([, a], [, b]) => b - a)
+            .map(([c, n]) => `${c}=${n}`)
+            .join(', ');
+          onLog('info', `hq-split: zip ready (${summary})`);
+        }
+        if (outcome.playBlocked) {
+          onLog('warn', `hq-split: Play page-fetch was blocked/rate-limited — Android resolution may be degraded`);
+        }
+      } catch (err) {
+        onLog('warn', `hq-split failed (non-fatal): ${(err as Error).message}`);
+      }
+    }
 
     // markJobCompleted sets phase='done'.
     markJobCompleted(job.id, csvPath, { ads: collected.length, advertisers: rowsWritten });
