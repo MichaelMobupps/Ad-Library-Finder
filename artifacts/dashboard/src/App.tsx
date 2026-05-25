@@ -140,7 +140,7 @@ function AuthedApp({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
           <button className={`nav-btn primary ${view.kind === 'new' ? 'active' : ''}`} onClick={() => setView({ kind: 'new' })}>
             + New Job
           </button>
-          <span className="nav-user" style={{ marginLeft: 16, color: 'var(--muted, #888)', fontSize: 13 }}>
+          <span className="nav-user" style={{ marginLeft: 16, color: 'var(--text-mute)', fontSize: 13 }}>
             {me.email}
           </span>
           <button className="nav-btn ghost" onClick={signOut} title="Sign out">Sign out</button>
@@ -397,7 +397,7 @@ function NewJob({
         <p className="form-hint">
           Email will be sent here when job completes. Effective: <code>{effectiveRecipient}</code>
           {!settings?.gmailConnected && (
-            <> · <span style={{ color: 'var(--warn)' }}>Your Gmail is not connected — no email will be sent. Connect in Settings.</span></>
+            <> · <span style={{ color: '#d97706' }}>Your Gmail is not connected — no email will be sent. Connect in Settings.</span></>
           )}
         </p>
       </div>
@@ -655,7 +655,7 @@ function SettingsView({ settings, onChange }: { settings: Settings | null; onCha
             {saving ? 'Saving…' : 'Save'}
           </button>
         </div>
-        {savedMsg && <p className="form-hint" style={{ color: 'var(--accent)' }}>{savedMsg}</p>}
+        {savedMsg && <p className="form-hint" style={{ color: 'var(--accent-strong)' }}>{savedMsg}</p>}
         <p className="form-hint">Default destination for your job-completion emails. Per-job override is available on the New Job form.</p>
       </div>
 
