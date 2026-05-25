@@ -17,6 +17,7 @@ import { buildCsv } from './csv.js';
 import { keywordsFor } from './keywords.js';
 import { notifyJobCompleted, notifyJobFailed } from './notifier.js';
 import { runAffplusJob } from './affplusPipeline.js';
+import { runAppgoblinJob } from './appgoblinPipeline.js';
 import { runHqSplit } from './hqSplit.js';
 import { log } from './logger.js';
 
@@ -37,6 +38,8 @@ async function tick() {
       if (job) {
         if (job.source === 'affplus') {
           await runAffplusJob(job);
+        } else if (job.source === 'appgoblin') {
+          await runAppgoblinJob(job);
         } else {
           await runMetaJob(job);
         }

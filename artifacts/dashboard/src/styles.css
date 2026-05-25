@@ -897,3 +897,16 @@ input[type="text"].input {
   .field { padding: 14px 18px; }
   .jobs-table th, .jobs-table td { padding: 12px 14px; }
 }
+/* ============================================================
+   AppGoblin tag (added for the AppGoblin lead source)
+   ============================================================ */
+:root {
+  --tag-appgoblin-text: #7c3aed;
+  --tag-appgoblin-bg: rgba(124, 58, 237, 0.10);
+  --tag-appgoblin-border: rgba(124, 58, 237, 0.28);
+}
+.tag-appgoblin {
+  background: var(--tag-appgoblin-bg);
+  color: var(--tag-appgoblin-text);
+  border-color: var(--tag-appgoblin-border);
+}

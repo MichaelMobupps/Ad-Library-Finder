@@ -5,7 +5,7 @@ import path from 'node:path';
 
 export type ProductType = 'mobile' | 'cps';
 export type JobStatus = 'pending' | 'running' | 'completed' | 'failed';
-export type JobSource = 'meta' | 'affplus';
+export type JobSource = 'meta' | 'affplus' | 'appgoblin';
 export type JobPhase =
   | 'queued'
   | 'starting'
@@ -31,7 +31,13 @@ export interface JobRow {
   recipient_email: string | null;
   notification_status: string | null; // 'sent' | 'failed' | null
   created_by_user_id: string | null;
-  source: JobSource; // 'meta' (default) | 'affplus'
+  source: JobSource; // 'meta' (default) | 'affplus' | 'appgoblin'
+  /**
+   * Optional JSON blob of source-specific parameters. Currently:
+   *   - appgoblin: {"category":"game_casino","adNetworkDomain":"appsflyer.com"}
+   * Meta and Affplus do not use this field.
+   */
+  source_params: string | null;
   phase: JobPhase | null; // coarse pipeline phase; null for old jobs (derived from status)
   phase_detail: string | null; // free-form descriptor, e.g. "scraping US / game" or "classifying 25/200"
   phase_updated_at: number | null;
@@ -186,6 +192,9 @@ export async function initDb() {
   if (!colNames.has('source')) {
     db.exec(`ALTER TABLE jobs ADD COLUMN source TEXT NOT NULL DEFAULT 'meta'`);
   }
+  if (!colNames.has('source_params')) {
+    db.exec(`ALTER TABLE jobs ADD COLUMN source_params TEXT`);
+  }
   if (!colNames.has('phase')) {
     db.exec(`ALTER TABLE jobs ADD COLUMN phase TEXT`);
   }
@@ -224,12 +233,13 @@ export function createJob(input: {
   recipientEmail?: string | null;
   createdByUserId: string;
   source?: JobSource;
+  sourceParams?: Record<string, unknown> | null;
 }): JobRow {
   const now = Date.now();
   getDb()
     .prepare(
-      `INSERT INTO jobs (id, product_type, countries, status, created_at, total_ads_scraped, total_advertisers, recipient_email, created_by_user_id, source, phase, phase_detail, phase_updated_at)
-       VALUES (?, ?, ?, 'pending', ?, 0, 0, ?, ?, ?, 'queued', 'waiting for worker', ?)`
+      `INSERT INTO jobs (id, product_type, countries, status, created_at, total_ads_scraped, total_advertisers, recipient_email, created_by_user_id, source, source_params, phase, phase_detail, phase_updated_at)
+       VALUES (?, ?, ?, 'pending', ?, 0, 0, ?, ?, ?, ?, 'queued', 'waiting for worker', ?)`
     )
     .run(
       input.id,
@@ -239,6 +249,7 @@ export function createJob(input: {
       input.recipientEmail ?? null,
       input.createdByUserId,
       input.source ?? 'meta',
+      input.sourceParams ? JSON.stringify(input.sourceParams) : null,
       now
     );
   return getJob(input.id)!;
