@@ -41,6 +41,7 @@ import {
   markJobRunning,
   markJobCompleted,
   markJobFailed,
+  setJobPhase,
   getJob,
   JobRow,
 } from './db.js';
@@ -135,6 +136,7 @@ function platformsFor(offer: AffplusOffer, sourcePlatform: AffPlatform): Resolve
 }
 
 export async function runAffplusJob(job: JobRow): Promise<void> {
+  // markJobRunning sets phase='starting' / detail='launching browser'.
   markJobRunning(job.id);
   const onLog = (level: 'info' | 'warn' | 'error' | 'debug', msg: string) => {
     appendLog(job.id, level, msg);
@@ -154,9 +156,17 @@ export async function runAffplusJob(job: JobRow): Promise<void> {
     let totalPages = 0;
 
     const platforms: AffPlatform[] = ['Android', 'iOS'];
+    const totalLists = countries.length * platforms.length;
+    let listIdx = 0;
 
     for (const country of countries) {
       for (const platform of platforms) {
+        listIdx++;
+        setJobPhase(
+          job.id,
+          'scraping',
+          `Affplus ${platform} / ${country} (${listIdx}/${totalLists})`
+        );
         onLog('info', `affplus: listing ${platform} / geo=${country}`);
         const { offers, skippedCount, pagesFetched } = await listOffers({
           platform,
@@ -181,6 +191,8 @@ export async function runAffplusJob(job: JobRow): Promise<void> {
     onLog('info', `affplus: listing phase done — ${tagged.length} unique offers, ${totalSkipped} skipped, ${totalPages} total pages`);
 
     // 4. Resolve + verify each offer; emit ONE row per offer (best candidate).
+    setJobPhase(job.id, 'classifying', `verifying 0/${tagged.length} offers against stores`);
+
     let resolvedCount = 0;
     let droppedCount = 0;
     let datingNameSkipped = 0;
@@ -321,6 +333,14 @@ export async function runAffplusJob(job: JobRow): Promise<void> {
       });
       resolvedCount++;
 
+      if (processed % 5 === 0 || processed === tagged.length) {
+        setJobPhase(
+          job.id,
+          'classifying',
+          `verifying ${processed}/${tagged.length} offers (${resolvedCount} matched)`
+        );
+      }
+
       if (processed % 10 === 0) {
         onLog(
           'info',
@@ -341,6 +361,8 @@ export async function runAffplusJob(job: JobRow): Promise<void> {
     }
     onLog('info', `affplus: skip-list filtered ${totalSkipped} adult/dating/cam/nutra/sweep offers`);
 
+    setJobPhase(job.id, 'building_csv', `writing CSV (${resolvedCount} verified rows)`);
+
     // 5. Build CSV using existing mobile schema (header is now "store_url").
     const allResults = getResults(job.id);
     const { path: csvPath, rowsWritten } = buildCsv({
@@ -350,6 +372,7 @@ export async function runAffplusJob(job: JobRow): Promise<void> {
     });
     onLog('info', `affplus: CSV written: ${csvPath} (${rowsWritten} rows)`);
 
+    // markJobCompleted sets phase='done'.
     markJobCompleted(job.id, csvPath, { ads: tagged.length, advertisers: rowsWritten });
     onLog('info', `affplus job completed`);
 

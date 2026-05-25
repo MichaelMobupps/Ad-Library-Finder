@@ -6,6 +6,14 @@ import path from 'node:path';
 export type ProductType = 'mobile' | 'cps';
 export type JobStatus = 'pending' | 'running' | 'completed' | 'failed';
 export type JobSource = 'meta' | 'affplus';
+export type JobPhase =
+  | 'queued'
+  | 'starting'
+  | 'scraping'
+  | 'classifying'
+  | 'building_csv'
+  | 'done'
+  | 'failed';
 
 export interface JobRow {
   id: string;
@@ -23,6 +31,9 @@ export interface JobRow {
   notification_status: string | null; // 'sent' | 'failed' | null
   created_by_user_id: string | null;
   source: JobSource; // 'meta' (default) | 'affplus'
+  phase: JobPhase | null; // coarse pipeline phase; null for old jobs (derived from status)
+  phase_detail: string | null; // free-form descriptor, e.g. "scraping US / game" or "classifying 25/200"
+  phase_updated_at: number | null;
 }
 
 export interface JobLogRow {
@@ -173,6 +184,15 @@ export async function initDb() {
   if (!colNames.has('source')) {
     db.exec(`ALTER TABLE jobs ADD COLUMN source TEXT NOT NULL DEFAULT 'meta'`);
   }
+  if (!colNames.has('phase')) {
+    db.exec(`ALTER TABLE jobs ADD COLUMN phase TEXT`);
+  }
+  if (!colNames.has('phase_detail')) {
+    db.exec(`ALTER TABLE jobs ADD COLUMN phase_detail TEXT`);
+  }
+  if (!colNames.has('phase_updated_at')) {
+    db.exec(`ALTER TABLE jobs ADD COLUMN phase_updated_at INTEGER`);
+  }
 
   db.exec(`CREATE INDEX IF NOT EXISTS idx_jobs_user ON jobs(created_by_user_id)`);
 
@@ -181,7 +201,7 @@ export async function initDb() {
 
   // On startup, mark any 'running' jobs as failed (process restarted mid-job).
   db.prepare(
-    `UPDATE jobs SET status='failed', error='process restarted mid-job', completed_at=? WHERE status='running'`
+    `UPDATE jobs SET status='failed', phase='failed', error='process restarted mid-job', completed_at=? WHERE status='running'`
   ).run(Date.now());
 }
 
@@ -203,8 +223,8 @@ export function createJob(input: {
   const now = Date.now();
   getDb()
     .prepare(
-      `INSERT INTO jobs (id, product_type, countries, status, created_at, total_ads_scraped, total_advertisers, recipient_email, created_by_user_id, source)
-       VALUES (?, ?, ?, 'pending', ?, 0, 0, ?, ?, ?)`
+      `INSERT INTO jobs (id, product_type, countries, status, created_at, total_ads_scraped, total_advertisers, recipient_email, created_by_user_id, source, phase, phase_detail, phase_updated_at)
+       VALUES (?, ?, ?, 'pending', ?, 0, 0, ?, ?, ?, 'queued', 'waiting for worker', ?)`
     )
     .run(
       input.id,
@@ -213,7 +233,8 @@ export function createJob(input: {
       now,
       input.recipientEmail ?? null,
       input.createdByUserId,
-      input.source ?? 'meta'
+      input.source ?? 'meta',
+      now
     );
   return getJob(input.id)!;
 }
@@ -239,23 +260,37 @@ export function getNextPendingJob(): JobRow | null {
 }
 
 export function markJobRunning(id: string) {
+  const now = Date.now();
   getDb()
-    .prepare(`UPDATE jobs SET status='running', started_at=? WHERE id = ?`)
-    .run(Date.now(), id);
+    .prepare(
+      `UPDATE jobs SET status='running', started_at=?, phase='starting', phase_detail='launching browser', phase_updated_at=? WHERE id = ?`
+    )
+    .run(now, now, id);
 }
 
 export function markJobCompleted(id: string, csvPath: string, counts: { ads: number; advertisers: number }) {
+  const now = Date.now();
   getDb()
     .prepare(
-      `UPDATE jobs SET status='completed', csv_path=?, completed_at=?, total_ads_scraped=?, total_advertisers=? WHERE id = ?`
+      `UPDATE jobs SET status='completed', csv_path=?, completed_at=?, total_ads_scraped=?, total_advertisers=?, phase='done', phase_detail='complete', phase_updated_at=? WHERE id = ?`
     )
-    .run(csvPath, Date.now(), counts.ads, counts.advertisers, id);
+    .run(csvPath, now, counts.ads, counts.advertisers, now, id);
 }
 
 export function markJobFailed(id: string, error: string) {
+  const now = Date.now();
   getDb()
-    .prepare(`UPDATE jobs SET status='failed', error=?, completed_at=? WHERE id = ?`)
-    .run(error, Date.now(), id);
+    .prepare(
+      `UPDATE jobs SET status='failed', error=?, completed_at=?, phase='failed', phase_detail=?, phase_updated_at=? WHERE id = ?`
+    )
+    .run(error, now, error.slice(0, 200), now, id);
+}
+
+export function setJobPhase(id: string, phase: JobPhase, detail?: string | null) {
+  const now = Date.now();
+  getDb()
+    .prepare(`UPDATE jobs SET phase=?, phase_detail=?, phase_updated_at=? WHERE id = ?`)
+    .run(phase, detail ?? null, now, id);
 }
 
 export function setJobNotificationStatus(id: string, status: 'sent' | 'failed') {
