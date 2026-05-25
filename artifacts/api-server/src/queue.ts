@@ -3,6 +3,7 @@ import {
   markJobRunning,
   markJobCompleted,
   markJobFailed,
+  setJobPhase,
   appendLog,
   insertResult,
   getResults,
@@ -48,6 +49,7 @@ async function tick() {
 }
 
 async function runMetaJob(job: JobRow) {
+  // markJobRunning sets phase='starting' / detail='launching browser'.
   markJobRunning(job.id);
   const onLog = (level: 'info' | 'warn' | 'error' | 'debug', msg: string) => {
     appendLog(job.id, level, msg);
@@ -64,8 +66,17 @@ async function runMetaJob(job: JobRow) {
     const seenAdvertisers = new Set<string>();
     const collected: RawAd[] = [];
 
+    const totalQueries = countries.length * keywords.length;
+    let queryIdx = 0;
+
     for (const country of countries) {
       for (const keyword of keywords) {
+        queryIdx++;
+        setJobPhase(
+          job.id,
+          'scraping',
+          `${country} / "${keyword}" (${queryIdx}/${totalQueries})`
+        );
         onLog('info', `scrape ${country} / "${keyword}"`);
         const ads = await scrapeQuery(country, keyword, (m) => onLog('debug', m));
         let newCount = 0;
@@ -82,6 +93,7 @@ async function runMetaJob(job: JobRow) {
 
     onLog('info', `scraping done: ${collected.length} unique advertisers`);
     onLog('info', `classifying landing URLs...`);
+    setJobPhase(job.id, 'classifying', `0/${collected.length} advertisers`);
 
     let classified = 0;
     let matched = 0;
@@ -105,12 +117,20 @@ async function runMetaJob(job: JobRow) {
 
       classified++;
       if (isMatch) matched++;
+      if (classified % 10 === 0 || classified === collected.length) {
+        setJobPhase(
+          job.id,
+          'classifying',
+          `${classified}/${collected.length} advertisers (${matched} matched)`
+        );
+      }
       if (classified % 25 === 0) {
         onLog('info', `  classified ${classified}/${collected.length} (matched product type: ${matched})`);
       }
     }
 
     onLog('info', `classification done: ${matched} matched ${job.product_type}`);
+    setJobPhase(job.id, 'building_csv', `writing CSV (${matched} matched rows)`);
 
     const allResults = getResults(job.id);
     const { path: csvPath, rowsWritten } = buildCsv({
@@ -120,6 +140,7 @@ async function runMetaJob(job: JobRow) {
     });
     onLog('info', `CSV written: ${csvPath} (${rowsWritten} rows)`);
 
+    // markJobCompleted sets phase='done'.
     markJobCompleted(job.id, csvPath, { ads: collected.length, advertisers: rowsWritten });
     onLog('info', `job completed`);
 

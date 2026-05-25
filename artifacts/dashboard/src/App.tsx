@@ -1,5 +1,18 @@
 import { useEffect, useState, useCallback } from 'react';
-import { api, Job, JobLog, ProductType, JobSource, Settings, Me, AuthRequiredError } from './api/client';
+import {
+  api,
+  Job,
+  JobLog,
+  ProductType,
+  JobSource,
+  JobPhase,
+  Settings,
+  Me,
+  AuthRequiredError,
+  derivePhase,
+  phaseLabel,
+  PHASE_STEPS,
+} from './api/client';
 
 type View = { kind: 'list' } | { kind: 'new' } | { kind: 'detail'; id: string } | { kind: 'settings' };
 type AuthState = { kind: 'loading' } | { kind: 'anon' } | { kind: 'signed-in'; me: Me };
@@ -186,6 +199,7 @@ function JobsList({ jobs, onSelect, onNew }: { jobs: Job[]; onSelect: (id: strin
             <th>Type</th>
             <th>Countries</th>
             <th>Status</th>
+            <th>Phase</th>
             <th>Found</th>
             <th>Recipient</th>
             <th>Created</th>
@@ -200,6 +214,9 @@ function JobsList({ jobs, onSelect, onNew }: { jobs: Job[]; onSelect: (id: strin
               <td><span className={`tag tag-${j.product_type}`}>{j.product_type.toUpperCase()}</span></td>
               <td className="mono small">{(JSON.parse(j.countries) as string[]).join(', ')}</td>
               <td><StatusBadge status={j.status} /></td>
+              <td className="small">
+                <RowPhaseCell job={j} />
+              </td>
               <td className="mono">{j.total_advertisers || '—'}</td>
               <td className="small muted">{j.recipient_email || '(default)'}</td>
               <td className="small">{new Date(j.created_at).toLocaleString()}</td>
@@ -220,6 +237,22 @@ function JobsList({ jobs, onSelect, onNew }: { jobs: Job[]; onSelect: (id: strin
 
 function StatusBadge({ status }: { status: Job['status'] }) {
   return <span className={`status status-${status}`}>{status}</span>;
+}
+
+function RowPhaseCell({ job }: { job: Job }) {
+  // Compact phase indicator for the jobs table row. For terminal jobs
+  // (completed/failed) we omit the row indicator — status already tells
+  // the story; phase belongs to the in-flight rows.
+  if (job.status === 'completed' || job.status === 'failed') {
+    return <span className="muted">—</span>;
+  }
+  const phase = derivePhase(job);
+  return (
+    <span className="phase-pill" title={job.phase_detail || ''}>
+      <span className="phase-pill-dot" />
+      <span className="phase-pill-label">{phaseLabel(phase)}</span>
+    </span>
+  );
 }
 
 // -------- New Job --------
@@ -412,6 +445,8 @@ function JobDetail({ id, onBack }: { id: string; onBack: () => void }) {
   if (!job) return <div className="empty"><p>Loading…</p></div>;
 
   const countries = JSON.parse(job.countries) as string[];
+  const isActive = job.status === 'pending' || job.status === 'running';
+  const latestLog = logs.length > 0 ? logs[logs.length - 1] : null;
 
   return (
     <div className="panel">
@@ -420,6 +455,8 @@ function JobDetail({ id, onBack }: { id: string; onBack: () => void }) {
         <h2 className="mono">{job.id}</h2>
         <StatusBadge status={job.status} />
       </div>
+
+      <PhaseProgress job={job} latestLog={latestLog} isActive={isActive} />
 
       <div className="detail-grid">
         <Field label="Source"><span className={`tag tag-${job.source || 'meta'}`}>{(job.source || 'meta').toUpperCase()}</span></Field>
@@ -455,6 +492,62 @@ function JobDetail({ id, onBack }: { id: string; onBack: () => void }) {
           ))}
         </pre>
       </details>
+    </div>
+  );
+}
+
+function PhaseProgress({
+  job,
+  latestLog,
+  isActive,
+}: {
+  job: Job;
+  latestLog: JobLog | null;
+  isActive: boolean;
+}) {
+  const currentPhase: JobPhase = derivePhase(job);
+  const isFailed = currentPhase === 'failed';
+  const currentIdx = isFailed ? -1 : PHASE_STEPS.indexOf(currentPhase);
+
+  // Description preference: server-supplied phase_detail > latest log line >
+  // phase label. Keeps a coherent description even right after pickup when
+  // no log lines have been written yet.
+  const description =
+    job.phase_detail ||
+    (latestLog ? latestLog.message : phaseLabel(currentPhase));
+
+  return (
+    <div className={`phase-progress ${isActive ? 'phase-active' : ''} ${isFailed ? 'phase-failed' : ''}`}>
+      <div className="phase-stepper">
+        {PHASE_STEPS.map((step, idx) => {
+          const state =
+            isFailed
+              ? 'pending'
+              : idx < currentIdx
+                ? 'complete'
+                : idx === currentIdx
+                  ? 'current'
+                  : 'pending';
+          return (
+            <div key={step} className={`phase-step phase-step-${state}`}>
+              <div className="phase-step-dot">
+                {state === 'complete' ? '✓' : idx + 1}
+              </div>
+              <div className="phase-step-label">{phaseLabel(step)}</div>
+              {idx < PHASE_STEPS.length - 1 && (
+                <div className={`phase-step-bar phase-step-bar-${idx < currentIdx ? 'complete' : 'pending'}`} />
+              )}
+            </div>
+          );
+        })}
+      </div>
+      <div className="phase-description">
+        {isActive && <span className="phase-spinner" aria-hidden="true" />}
+        <span className="phase-description-label">
+          {isFailed ? 'Failed' : phaseLabel(currentPhase)}:
+        </span>
+        <span className="phase-description-detail">{description}</span>
+      </div>
     </div>
   );
 }
