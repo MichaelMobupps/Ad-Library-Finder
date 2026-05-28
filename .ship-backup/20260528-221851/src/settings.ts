@@ -29,12 +29,7 @@ export function deleteSetting(key: string) {
 
 export function getDefaultRecipientForUser(userId: string): string | null {
   const user = getUserById(userId);
-  // Zero-config default: if the user has not set an explicit default recipient,
-  // fall back to the email they sign in with. Every user therefore receives
-  // job-completion emails at their own address with no setup. An explicit
-  // default (set below) and a per-job recipient on the New Job form both still
-  // take precedence over this fallback.
-  return user?.default_recipient || user?.email || null;
+  return user?.default_recipient ?? null;
 }
 
 export function setDefaultRecipientForUser(userId: string, recipient: string | null) {

@@ -1,6 +1,6 @@
 import { existsSync } from 'node:fs';
 import path from 'node:path';
-import { JobRow, setJobNotificationStatus, getUserById, getGmailTokensForUser } from './db.js';
+import { JobRow, setJobNotificationStatus, getUserById, getGmailTokensForUser, appendLog } from './db.js';
 import { sendEmailFromUser } from './gmail.js';
 import { getDefaultRecipientForUser } from './settings.js';
 import { log } from './logger.js';
@@ -69,11 +69,13 @@ function resolveSender(job: JobRow): { userId: string; gmailEmail: string } | nu
 export async function notifyJobCompleted(job: JobRow) {
   const sender = resolveSender(job);
   if (!sender) {
+    appendLog(job.id, 'warn', 'completion email skipped: sender Gmail not connected — connect Gmail in Settings');
     setJobNotificationStatus(job.id, 'failed');
     return;
   }
   const to = resolveRecipient(job);
   if (!to) {
+    appendLog(job.id, 'warn', 'completion email skipped: no recipient resolved — set a default recipient in Settings');
     log.info(`Job ${job.id} done but no recipient resolved — skipping email`);
     setJobNotificationStatus(job.id, 'failed');
     return;
@@ -138,8 +140,10 @@ export async function notifyJobCompleted(job: JobRow) {
       htmlBody: html,
       attachments,
     });
+    appendLog(job.id, 'info', `completion email sent to ${to}${attachments.length ? ` with ${attachments.length} attachment(s)` : ''}`);
     setJobNotificationStatus(job.id, 'sent');
   } catch (err) {
+    appendLog(job.id, 'error', `completion email failed: ${(err as Error).message}`);
     log.error(`notify completed failed for ${job.id}`, (err as Error).message);
     setJobNotificationStatus(job.id, 'failed');
   }
@@ -148,11 +152,13 @@ export async function notifyJobCompleted(job: JobRow) {
 export async function notifyJobFailed(job: JobRow) {
   const sender = resolveSender(job);
   if (!sender) {
+    appendLog(job.id, 'warn', 'failure email skipped: sender Gmail not connected');
     setJobNotificationStatus(job.id, 'failed');
     return;
   }
   const to = resolveRecipient(job);
   if (!to) {
+    appendLog(job.id, 'warn', 'failure email skipped: no recipient resolved');
     setJobNotificationStatus(job.id, 'failed');
     return;
   }
@@ -175,8 +181,10 @@ export async function notifyJobFailed(job: JobRow) {
 
   try {
     await sendEmailFromUser(sender.userId, { to, subject, htmlBody: html });
+    appendLog(job.id, 'info', `failure email sent to ${to}`);
     setJobNotificationStatus(job.id, 'sent');
   } catch (err) {
+    appendLog(job.id, 'error', `failure email send failed: ${(err as Error).message}`);
     log.error(`notify failed-job email failed for ${job.id}`, (err as Error).message);
     setJobNotificationStatus(job.id, 'failed');
   }
