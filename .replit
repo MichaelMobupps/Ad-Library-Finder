@@ -1,4 +1,4 @@
-modules = ["nodejs-20", "web"]
+modules = ["nodejs-20", "web", "python-3.11"]
 run = "pnpm start"
 hidden = [".pnpm-store", "node_modules", ".cache", "dist"]
 

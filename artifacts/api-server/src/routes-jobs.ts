@@ -55,8 +55,8 @@ jobsRouter.post('/', (req: Request<{}, {}, CreateJobBody>, res: Response) => {
     jobSource = source;
   }
 
-  // Mobile-only sources reject CPS.
-  if ((jobSource === 'affplus' || jobSource === 'appgoblin') && productTypes.some((pt) => pt !== 'mobile')) {
+  // AppGoblin is mobile-only. Affplus now supports cps (web) as well as mobile.
+  if (jobSource === 'appgoblin' && productTypes.some((pt) => pt !== 'mobile')) {
     return res.status(400).json({ error: `${jobSource} source supports productType=mobile only` });
   }
 
