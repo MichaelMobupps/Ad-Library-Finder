@@ -14,9 +14,7 @@ export interface ClassifyResult {
 
 // Known MMP tracker domains. Any landing URL on these is mobile.
 // Add new ones here when you encounter them.
-// Exported: the web/CPS resolver uses this to drop a "web" offer whose
-// destination actually resolves onto a mobile attribution tracker.
-export const MMP_TRACKER_DOMAINS = [
+const MMP_TRACKER_DOMAINS = [
   'onelink.me',          // AppsFlyer
   'app.link',            // Branch
   'app.appsflyer.com',   // AppsFlyer
@@ -110,7 +108,6 @@ function canonicalAppStoreUrl(url: string): string {
   }
 }
 
-// Follow redirects with a GET and return the final URL (no body / no status).
 async function resolveRedirects(url: string): Promise<string | null> {
   try {
     const res = await fetch(url, {

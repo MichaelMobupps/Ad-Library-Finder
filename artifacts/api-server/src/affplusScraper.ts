@@ -39,7 +39,18 @@ export interface AffplusOffer {
   geo: string | null;
 }
 
-export type Platform = 'Android' | 'iOS';
+export type Platform = 'Android' | 'iOS' | 'Web';
+
+/**
+ * Affplus has no "Web" platform tag. Its desktop/web inventory is filtered with
+ * `platforms=Desktop` (the device axis), so the web/CPS path maps the internal
+ * 'Web' platform to this wire value. Recon note: the Desktop slice is narrow
+ * (~1.8k offers); the broader web-CPS inventory is vertical-tagged
+ * (CPS / Insurance / Finance / Ecommerce) and device-agnostic, so Desktop alone
+ * under-collects. Vertical-seeded listing is the documented next step if volume
+ * is short — see the handoff. One named constant keeps that swap to one line.
+ */
+const WEB_PLATFORM = 'Desktop';
 
 const FETCH_HEADERS = {
   'User-Agent':
@@ -66,7 +77,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 function buildSearchUrl(platform: Platform, page: number, geo?: string | null): string {
   const params = new URLSearchParams();
-  params.set('platforms', platform);
+  params.set('platforms', platform === 'Web' ? WEB_PLATFORM : platform);
   if (geo) params.set('geos', geo.toUpperCase());
   if (page > 1) params.set('page', String(page));
   return `https://www.affplus.com/search?${params.toString()}`;
@@ -186,6 +197,11 @@ export async function listOffers(opts: {
   const maxPages = opts.maxPages ?? 3;
   const log_ = opts.onLog ?? (() => {});
 
+  // The mobile skip-list drops exactly the verticals the web/CPS path wants
+  // (crypto, forex, finance, ecommerce, leadgen, survey, cps, ...). In Web mode
+  // it is bypassed; webPolicy.verticalDecision + the resolver are the filters.
+  const isWeb = platform === 'Web';
+
   const allOffers: AffplusOffer[] = [];
   let skippedCount = 0;
   let pagesFetched = 0;
@@ -207,7 +223,7 @@ export async function listOffers(opts: {
     for (const c of cards) {
       const offer = parseCard(c);
       if (!offer) continue;
-      if (shouldSkip(offer)) {
+      if (!isWeb && shouldSkip(offer)) {
         skippedCount++;
         skippedOnPage++;
         continue;

@@ -1,0 +1,69 @@
+set -euo pipefail
+ROOT="$PWD"
+
+# ── set this to where you uploaded the bundle; everything else auto-detects ──
+ZIP="affplus-cps-web-batch.zip"
+# ─────────────────────────────────────────────────────────────────────────────
+
+ARTIFACT_DIR="artifacts/api-server"   # from the code: ../../dashboard/dist => api-server is the live tree
+FILES="src/webPolicy.ts src/webResolver.ts src/affplusScraper.ts src/affplusPipeline.ts src/classifier.ts src/routes-jobs.ts"
+STAMP="$(date +%Y%m%d-%H%M%S)"
+BACKUP="$ROOT/.ship-backup/$STAMP"
+
+[ -f "$ZIP" ] || { echo "ABORT: bundle not found at $ZIP (set ZIP to the uploaded path)"; exit 1; }
+[ -d "$ARTIFACT_DIR/src" ] || { echo "ABORT: $ARTIFACT_DIR/src not found (set ARTIFACT_DIR to the api-server tree)"; exit 1; }
+
+# 1. unzip (no unzip binary in the container -> Python zipfile)
+TMP="$(mktemp -d)"
+python3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$ZIP" "$TMP"
+for f in $FILES; do [ -f "$TMP/$f" ] || { echo "ABORT: $f missing from bundle"; exit 1; }; done
+
+# 2. backup the files we replace (rollback source; the mirror is never touched)
+mkdir -p "$BACKUP/src"
+for f in $FILES; do [ -f "$ARTIFACT_DIR/$f" ] && cp "$ARTIFACT_DIR/$f" "$BACKUP/$f" || true; done
+echo "backup -> $BACKUP"
+
+# 3. stage new files into the live tree
+for f in $FILES; do cp "$TMP/$f" "$ARTIFACT_DIR/$f"; done
+
+rollback() {
+  echo ">> GATE FAILED — rolling back from $BACKUP (mirror untouched)"
+  cd "$ROOT"
+  for f in $FILES; do
+    if [ -f "$BACKUP/$f" ]; then cp "$BACKUP/$f" "$ARTIFACT_DIR/$f"; else rm -f "$ARTIFACT_DIR/$f"; fi
+  done
+  exit 1
+}
+
+# 4. typecheck gate
+echo "== typecheck =="
+( cd "$ARTIFACT_DIR" && npx tsc --noEmit ) 2>&1 | tail -20 || rollback
+
+# 5. self-test gate (full output; tail -20, never -3)
+echo "== self-tests =="
+for m in webPolicy webResolver storeResolver nameCleaner; do
+  echo "[$m]"
+  ( cd "$ARTIFACT_DIR" && npx tsx "src/$m.ts" ) 2>&1 | tail -20 || rollback
+done
+
+# 6. build — only if api-server defines a build script (else it runs via tsx)
+if node -e "const p=require('$ROOT/$ARTIFACT_DIR/package.json'); process.exit(p.scripts&&p.scripts.build?0:1)" 2>/dev/null; then
+  echo "== build (pnpm --filter api-server build) =="
+  pnpm --filter api-server build 2>&1 | tail -20 || rollback
+else
+  echo "== no api-server build script — skipping (tsx run model) =="
+fi
+
+# 7. mirror (ONLY after gates pass; auto-detect the source-code layout)
+MIRROR=""
+if   [ -d "source-code/src" ]; then MIRROR="source-code"
+elif [ -d "source-code/api-server/src" ]; then MIRROR="source-code/api-server"
+fi
+if [ -n "$MIRROR" ]; then
+  for f in $FILES; do cp "$ARTIFACT_DIR/$f" "$MIRROR/$f"; done
+  echo "mirrored -> $MIRROR/src"
+else
+  echo "mirror skipped (no source-code/src or source-code/api-server/src found)"
+fi
+
+echo "SHIP OK ($STAMP): 6 backend files staged, typecheck + self-tests + build green"

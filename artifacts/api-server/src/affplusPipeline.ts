@@ -53,10 +53,19 @@ import { resolveAndVerify, Platform as ResolvePlatform, ResolvedStore } from './
 import { buildCsv } from './csv.js';
 import { notifyJobCompleted, notifyJobFailed } from './notifier.js';
 import { runHqSplit } from './hqSplit.js';
+import { verticalDecision, looksScammy } from './webPolicy.js';
+import { resolveWebDestination, makeSearchBudget, normalizeWebOffer } from './webResolver.js';
 import { log } from './logger.js';
 
 const PAGES_PER_PLATFORM = Number(process.env.AFFPLUS_PAGES_PER_PLATFORM) || 3;
 const RESOLVER_DELAY_MS = Number(process.env.AFFPLUS_RESOLVER_DELAY_MS) || 400;
+
+/** Web/CPS path: pages of Desktop listing per country. */
+const WEB_PAGES_PER_COUNTRY = Number(process.env.AFFPLUS_WEB_PAGES_PER_COUNTRY) || PAGES_PER_PLATFORM;
+/** Web/CPS path: per-job cap on PAID name searches across all offers. */
+const WEB_MAX_SEARCHES = Number(process.env.AFFPLUS_WEB_MAX_SEARCHES) || 40;
+/** Web/CPS path: polite delay between per-offer destination resolutions. */
+const WEB_RESOLVE_DELAY_MS = Number(process.env.AFFPLUS_WEB_RESOLVE_DELAY_MS) || RESOLVER_DELAY_MS;
 
 /**
  * Minimum Jaccard score for a resolved candidate to be accepted into the CSV.
@@ -150,6 +159,14 @@ export async function runAffplusJob(job: JobRow): Promise<void> {
 
   try {
     const countries: string[] = JSON.parse(job.countries);
+
+    // Web/CPS path is a separate flow: it resolves to advertiser websites, not
+    // app stores, and skips store-resolution + HQ-split entirely. The mobile
+    // flow below is unchanged; the shared catch / notifier wraps both.
+    if (job.product_type === 'cps') {
+      await runAffplusWebJob(job, countries, onLog);
+      return;
+    }
 
     // 1+2+3. Gather offers across (country × platform), dedup by slug.
     type Tagged = { offer: AffplusOffer; sourcePlatform: AffPlatform; country: string };
@@ -416,5 +433,168 @@ export async function runAffplusJob(job: JobRow): Promise<void> {
     if (fresh) {
       void notifyJobFailed(fresh).catch((e) => onLog('warn', `failure notification error: ${(e as Error).message}`));
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Web / CPS flow (productType=cps). Resolves advertiser websites, not stores.
+// Errors propagate to runAffplusJob's shared catch / failure notifier.
+// ---------------------------------------------------------------------------
+
+type WebLogFn = (level: 'info' | 'warn' | 'error' | 'debug', msg: string) => void;
+
+async function runAffplusWebJob(job: JobRow, countries: string[], onLog: WebLogFn): Promise<void> {
+  onLog('info', `affplus web/CPS job started: countries=${countries.join(', ')}`);
+
+  // 1. Gather the Desktop listing across countries, dedup by slug. The mobile
+  //    skip-list is bypassed in Web mode (it drops the web targets); webPolicy
+  //    is the filter instead.
+  type Tagged = { offer: AffplusOffer; country: string };
+  const seen = new Set<string>();
+  const tagged: Tagged[] = [];
+  let totalPages = 0;
+  let totalGeoMatch = 0;
+  let totalListed = 0;
+  let idx = 0;
+
+  for (const country of countries) {
+    idx++;
+    setJobPhase(job.id, 'scraping', `Affplus Web / ${country} (${idx}/${countries.length})`);
+    onLog('info', `affplus-web: listing Desktop / geo=${country}`);
+    const { offers, pagesFetched } = await listOffers({
+      platform: 'Web',
+      geo: country,
+      maxPages: WEB_PAGES_PER_COUNTRY,
+      onLog: (m) => onLog('debug', m),
+    });
+    totalPages += pagesFetched;
+    let added = 0;
+    let geoMatch = 0;
+    for (const offer of offers) {
+      if ((offer.geo || '').toUpperCase() === country.toUpperCase()) geoMatch++;
+      if (seen.has(offer.slug)) continue;
+      seen.add(offer.slug);
+      tagged.push({ offer, country });
+      added++;
+    }
+    totalGeoMatch += geoMatch;
+    totalListed += offers.length;
+    onLog('info', `affplus-web: Desktop/${country} → ${offers.length} offers (${added} new, ${geoMatch} geo-match), ${pagesFetched} pages`);
+  }
+  // Geo binding is unverified for platforms=Desktop and recon saw params get
+  // normalized away. If nothing came back tagged with a requested country, the
+  // geos filter is probably not binding and every row's country is suspect.
+  if (totalListed > 0 && totalGeoMatch === 0) {
+    onLog('warn', `affplus-web: ZERO offers matched the requested geo across ${totalListed} listed — affplus geos filter may not be binding for Desktop; verify country targeting before trusting the CSV`);
+  }
+  onLog('info', `affplus-web: listing phase done — ${tagged.length} unique offers, ${totalPages} total pages, ${totalGeoMatch}/${totalListed} geo-match`);
+
+  // 2. Cheap free gates first (vertical + scam on name/verticals), then resolve
+  //    survivors to a real advertiser destination. The paid name search inside
+  //    the resolver is capped per-job by this shared budget.
+  setJobPhase(job.id, 'classifying', `resolving 0/${tagged.length} web offers`);
+  const budget = makeSearchBudget(WEB_MAX_SEARCHES);
+
+  let resolved = 0;
+  let verticalBlocked = 0;
+  let scamBlocked = 0;
+  let unresolved = 0; // detail / intermediary / search dead-ends
+  let brandTagged = 0;
+  let dupHostSkipped = 0;
+  const insertedHosts = new Set<string>();
+  let processed = 0;
+
+  for (const { offer, country } of tagged) {
+    processed++;
+    const advertiserName = normalizeWebOffer(offer.name).name;
+
+    // Cheap gate A: vertical decision on tags alone (category not yet known).
+    if (verticalDecision(offer.verticals) === 'block') {
+      verticalBlocked++;
+      continue;
+    }
+    // Cheap gate B: scam screen over name + verticals (free, pre-fetch).
+    if (looksScammy(`${offer.name} ${offer.verticals.join(' ')}`)) {
+      scamBlocked++;
+      continue;
+    }
+
+    const dest = await resolveWebDestination({
+      slug: offer.slug,
+      offerName: offer.name,
+      network: offer.network,
+      verticals: offer.verticals,
+      onLog,
+      searchBudget: budget,
+    });
+
+    if (!dest) {
+      unresolved++;
+    } else if (insertedHosts.has(dest.finalHost)) {
+      // One row per advertiser host: the operator dedups brands, not campaigns.
+      dupHostSkipped++;
+    } else {
+      insertedHosts.add(dest.finalHost);
+      if (dest.brandMismatch) brandTagged++;
+      const mismatchNote = dest.brandMismatch ? ' · brand-mismatch: verify advertiser' : '';
+      insertResult({
+        job_id: job.id,
+        advertiser_name: advertiserName,
+        page_url: `https://www.affplus.com/o/${offer.slug}`,
+        landing_url: dest.websiteUrl, // CPS CSV writes landing_url into website_url
+        classification: 'cps_web',
+        store_url: null,
+        ad_text: `Network: ${offer.network} · Verticals: ${offer.verticals.join(', ')}${dest.category ? ` · Category: ${dest.category}` : ''} · Resolved via ${dest.reason}${mismatchNote}`,
+        country: offer.geo || country,
+      });
+      resolved++;
+    }
+
+    if (processed % 5 === 0 || processed === tagged.length) {
+      setJobPhase(job.id, 'classifying', `resolving ${processed}/${tagged.length} web offers (${resolved} kept)`);
+    }
+    if (processed % 10 === 0) {
+      onLog(
+        'info',
+        `affplus-web: resolved ${resolved}, vertical-blocked ${verticalBlocked}, scam-blocked ${scamBlocked}, unresolved ${unresolved} (processed ${processed}/${tagged.length}, searches left ${budget.remaining()})`
+      );
+    }
+    if (processed < tagged.length && WEB_RESOLVE_DELAY_MS > 0) {
+      await new Promise((r) => setTimeout(r, WEB_RESOLVE_DELAY_MS));
+    }
+  }
+
+  onLog(
+    'info',
+    `affplus-web: resolve phase done — ${resolved} advertiser rows (${brandTagged} brand-mismatch tagged), vertical-blocked ${verticalBlocked}, scam-blocked ${scamBlocked}, unresolved ${unresolved}, host-dup ${dupHostSkipped}; name-searches used ${WEB_MAX_SEARCHES - budget.remaining()}/${WEB_MAX_SEARCHES}`
+  );
+  // The name search is the primary resolution path (the preview link is JS-bound),
+  // so an exhausted budget silently caps yield. Make that visible.
+  if (budget.remaining() === 0 && unresolved > 0) {
+    onLog('warn', `affplus-web: name-search budget (${WEB_MAX_SEARCHES}) fully consumed with ${unresolved} offers unresolved — raise AFFPLUS_WEB_MAX_SEARCHES to resolve more (cost rises with it)`);
+  }
+
+  // 3. CSV using the existing CPS schema: advertiser_name,country,website_url,ad_text.
+  setJobPhase(job.id, 'building_csv', `writing CPS CSV (${resolved} rows)`);
+  const allResults = getResults(job.id);
+  const { path: csvPath, rowsWritten } = buildCsv({
+    jobId: job.id,
+    productType: job.product_type,
+    results: allResults,
+  });
+  onLog('info', `affplus-web: CSV written: ${csvPath} (${rowsWritten} rows)`);
+  if (rowsWritten === 0) {
+    onLog('warn', `affplus-web: CSV is empty — 0 advertiser destinations resolved. Check the warnings above (geo binding, detail parse, search budget) before concluding affplus has no inventory`);
+  }
+
+  // No HQ-split for web/CPS (mobile-only feature).
+  markJobCompleted(job.id, csvPath, { ads: tagged.length, advertisers: rowsWritten });
+  onLog('info', `affplus web/CPS job completed`);
+
+  const fresh = getJob(job.id);
+  if (fresh) {
+    void notifyJobCompleted(fresh)
+      .then(() => onLog('info', 'notification dispatched'))
+      .catch((e) => onLog('warn', `notification error: ${(e as Error).message}`));
   }
 }
