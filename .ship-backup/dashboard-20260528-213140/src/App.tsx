@@ -301,10 +301,10 @@ function NewJob({
     setProductTypes((prev) => (prev.includes(pt) ? prev.filter((x) => x !== pt) : [...prev, pt]));
   };
 
-  // AppGoblin is mobile-only; force productType to mobile when it is selected.
+  // When switching to a mobile-only source, force productType to mobile.
   const handleSourceChange = (s: JobSource) => {
     setSource(s);
-    if (s === 'appgoblin') setProductTypes(['mobile']);
+    if (s === 'affplus' || s === 'appgoblin') setProductTypes(['mobile']);
   };
 
   const submit = async () => {
@@ -316,6 +316,10 @@ function NewJob({
     }
     if (productTypes.length === 0) {
       setError('Pick at least one product type');
+      return;
+    }
+    if (source === 'affplus' && productTypes.some((pt) => pt !== 'mobile')) {
+      setError('Affplus source supports Mobile only');
       return;
     }
     if (source === 'appgoblin') {
@@ -380,7 +384,7 @@ function NewJob({
               checked={source === 'affplus'}
               onChange={() => handleSourceChange('affplus')}
             />
-            <span>Affplus <span className="muted">(affiliate offer directory)</span></span>
+            <span>Affplus <span className="muted">(affiliate offer directory; Mobile only)</span></span>
           </label>
           <label className="checkbox">
             <input
@@ -470,14 +474,14 @@ function NewJob({
               type="checkbox"
               checked={productTypes.includes('cps')}
               onChange={() => toggleType('cps')}
-              disabled={source === 'appgoblin'}
+              disabled={source === 'affplus' || source === 'appgoblin'}
             />
             <span>CPS <span className="muted">(web product, website URLs)</span></span>
           </label>
         </div>
         <p className="form-hint">
-          {source === 'appgoblin'
-            ? 'AppGoblin supports Mobile only.'
+          {source === 'affplus' || source === 'appgoblin'
+            ? `${source === 'affplus' ? 'Affplus' : 'AppGoblin'} supports Mobile only.`
             : 'Selecting both creates two separate jobs (one CSV per type).'}
         </p>
       </div>
