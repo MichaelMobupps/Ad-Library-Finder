@@ -9,15 +9,8 @@ import {
   insertResult,
   getResults,
   getJob,
-  deferJob,
   JobRow,
 } from './db.js';
-import {
-  BudgetExceededError,
-  nextJerusalemMidnightMs,
-  spentTodayUsd,
-  DAILY_CAP_USD,
-} from './llmBudget.js';
 import { scrapeQuery, RawAd, closeBrowser } from './scraper.js';
 import { classify } from './classifier.js';
 import { buildCsv } from './csv.js';
@@ -43,14 +36,6 @@ async function tick() {
     try {
       const job = getNextPendingJob();
       if (job) {
-        // Already at/over the daily cap: do not start the next job. Starting it
-        // would scrape (non-LLM) and then defer at the first LLM call, churning
-        // the whole queue. Leave jobs untouched and wait for the Jerusalem-day
-        // reset, at which point spend resets and dispatch resumes.
-        if (spentTodayUsd() >= DAILY_CAP_USD) {
-          await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
-          continue;
-        }
         if (job.source === 'affplus') {
           await runAffplusJob(job);
         } else if (job.source === 'appgoblin') {
@@ -117,20 +102,7 @@ async function runMetaJob(job: JobRow) {
 
     let classified = 0;
     let matched = 0;
-    // Resume guard: if this job was deferred earlier today for the cap and is
-    // now replaying, skip landing URLs already classified on the prior run so
-    // their LLM calls are not paid for twice (and no duplicate rows are written).
-    // Empty on a fresh job, so first runs are unaffected.
-    const alreadyDone = new Set(
-      getResults(job.id)
-        .map((r) => r.landing_url)
-        .filter((u): u is string => !!u),
-    );
     for (const ad of collected) {
-      if (ad.landing_url && alreadyDone.has(ad.landing_url)) {
-        classified++;
-        continue;
-      }
       const cls = await classify(ad.landing_url, ad.ad_text);
       const isMatch =
         (job.product_type === 'mobile' &&
@@ -191,7 +163,6 @@ async function runMetaJob(job: JobRow) {
           onLog('warn', `hq-split: Play page-fetch was blocked/rate-limited — Android resolution may be degraded`);
         }
       } catch (err) {
-        if (err instanceof BudgetExceededError) throw err;
         onLog('warn', `hq-split failed (non-fatal): ${(err as Error).message}`);
       }
     }
@@ -208,13 +179,6 @@ async function runMetaJob(job: JobRow) {
       });
     }
   } catch (err) {
-    if (err instanceof BudgetExceededError) {
-      const runAfter = nextJerusalemMidnightMs();
-      const when = new Date(runAfter).toISOString();
-      deferJob(job.id, runAfter, `LLM daily cap ($${DAILY_CAP_USD}) reached; resumes after ${when}`);
-      onLog('warn', `job deferred: LLM daily cap reached; resumes after ${when} (Jerusalem midnight)`);
-      return;
-    }
     const msg = (err as Error).message || 'unknown error';
     log.error(`job ${job.id} failed`, err);
     onLog('error', `job failed: ${msg}`);

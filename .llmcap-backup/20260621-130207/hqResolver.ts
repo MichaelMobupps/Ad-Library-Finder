@@ -31,7 +31,6 @@ import Anthropic from '@anthropic-ai/sdk';
 import { log } from './logger.js';
 import { StorePageInfo } from './storePageFetcher.js';
 import { fenceFields, INJECTION_SYSTEM_RULE, clampContent } from './promptSafety.js';
-import { assertBudget, recordSpend, BudgetExceededError } from './llmBudget.js';
 
 export interface ResolvedHq {
   company_name: string;
@@ -271,7 +270,6 @@ ${fenceFields([
       system: SYSTEM_PROMPT,
       messages: [{ role: 'user', content: userContent }],
     });
-    recordSpend('hq-resolver', 'claude-sonnet-4-5', res.usage);
     const textBlock = res.content.find((b) => b.type === 'text');
     if (!textBlock || textBlock.type !== 'text') return null;
     const cleaned = textBlock.text.replace(/```json|```/g, '').trim();
@@ -287,7 +285,6 @@ ${fenceFields([
       reasoning: clampContent(parsed.reasoning, 400),
     };
   } catch (err) {
-    if (err instanceof BudgetExceededError) throw err;
     log.warn(`HQ resolver LLM call failed: ${(err as Error).message}`);
     return null;
   }
@@ -299,10 +296,7 @@ ${fenceFields([
 // ─────────────────────────────────────────────────────────────
 
 export async function resolveHq(page: StorePageInfo): Promise<ResolvedHq> {
-  // LAYER 1: ask the LLM. Gate first — this point is only reached on a cache
-  // miss (hqSplit checks the cache before calling), so the gate never blocks a
-  // free cache hit, only a paid resolution.
-  assertBudget('hq-resolver');
+  // LAYER 1: ask the LLM.
   const llmOut = await callLlmForCompany({
     appName: page.appName || '',
     publisherName: page.publisherName || '',

@@ -1,7 +1,6 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { log } from './logger.js';
 import { fenceUntrusted, INJECTION_SYSTEM_RULE } from './promptSafety.js';
-import { assertBudget, recordSpend, BudgetExceededError } from './llmBudget.js';
 
 export type Classification =
   | 'mobile_google_play'
@@ -168,7 +167,6 @@ Respond ONLY with this JSON shape, no preamble, no markdown:
 {"classification": "<one of the four>", "store_url": "<url or null>"}`;
 
   try {
-    assertBudget('classifier');
     const res = await getClient().messages.create({
       model: 'claude-sonnet-4-5',
       max_tokens: 8000,
@@ -176,7 +174,6 @@ Respond ONLY with this JSON shape, no preamble, no markdown:
       thinking: { type: 'enabled', budget_tokens: 3000 },
       messages: [{ role: 'user', content: prompt }],
     });
-    recordSpend('classifier', 'claude-sonnet-4-5', res.usage);
 
     const textBlock = res.content.find((b) => b.type === 'text');
     if (!textBlock || textBlock.type !== 'text') {
@@ -198,7 +195,6 @@ Respond ONLY with this JSON shape, no preamble, no markdown:
     // (or MMP-tracker) URL, canonicalized; otherwise drop it to null.
     return { classification: parsed.classification, store_url: sanitizeStoreUrl(parsed.store_url) };
   } catch (err) {
-    if (err instanceof BudgetExceededError) throw err;
     log.error(`LLM classify failed for ${landingUrl}`, (err as Error).message);
     return { classification: 'unknown', store_url: null };
   }

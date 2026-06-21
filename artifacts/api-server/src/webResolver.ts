@@ -43,6 +43,7 @@ import { log } from './logger.js';
 import { MMP_TRACKER_DOMAINS } from './classifier.js';
 import { verticalDecision, looksScammy, isIntermediaryHost } from './webPolicy.js';
 import { verifyMatch } from './storeResolver.js';
+import { assertBudget, recordSpend, BudgetExceededError } from './llmBudget.js';
 
 // ---------------------------------------------------------------------------
 // Config (env-overridable; defaults match the operator's stated policy).
@@ -594,12 +595,14 @@ Respond with ONLY this JSON object, no preamble and no markdown fences:
 {"url": "<https url or empty string>", "brand": "<advertiser/brand name or empty>", "confidence": "<high|medium|low>"}`;
 
   try {
+    assertBudget('web-resolver');
     const res = await getClient().messages.create({
       model: SEARCH_MODEL,
       max_tokens: 1500,
       messages: [{ role: 'user', content: prompt }],
       tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: SEARCH_MAX_USES }],
     });
+    recordSpend('web-resolver', SEARCH_MODEL, res.usage);
 
     const text = (res.content || [])
       .filter((b): b is Anthropic.TextBlock => b.type === 'text')
@@ -611,6 +614,7 @@ Respond with ONLY this JSON object, no preamble and no markdown fences:
     if (!/^https?:\/\//i.test(hit.url)) return null;
     return hit;
   } catch (err) {
+    if (err instanceof BudgetExceededError) throw err;
     onLog('warn', `web-resolve: name search failed: ${(err as Error).message}`);
     log.warn('webResolver name search failed', (err as Error).message);
     return null;

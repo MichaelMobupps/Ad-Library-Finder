@@ -28,7 +28,6 @@ import { lookupHqCache, storeHqCache, ensureHqCacheTable } from './hqCache.js';
 import { buildXlsx } from './xlsxWriter.js';
 import { buildZip, type ZipEntry } from './zipWriter.js';
 import { log } from './logger.js';
-import { BudgetExceededError } from './llmBudget.js';
 
 const ZIP_DIR = path.resolve('csv-output', 'hq-zips');
 
@@ -180,7 +179,6 @@ export async function runHqSplit(opts: SplitOptions): Promise<HqSplitOutcome> {
           `hq-split: resolved ${storeUrl} → company="${hq.company_name}" market="${hq.primary_market}" via ${hq.override_source}`
         );
       } catch (err) {
-        if (err instanceof BudgetExceededError) throw err;
         opts.onLog('error', `hq-split: resolveHq threw for ${storeUrl} — ${(err as Error).message}`);
         hq = null;
       }
