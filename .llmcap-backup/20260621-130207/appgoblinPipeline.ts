@@ -29,17 +29,14 @@ import {
   appendLog,
   insertResult,
   getResults,
-  clearJobResults,
   markJobRunning,
   markJobCompleted,
   markJobFailed,
   setJobPhase,
   setJobHqZipPath,
   getJob,
-  deferJob,
   type JobRow,
 } from './db.js';
-import { BudgetExceededError, nextJerusalemMidnightMs, DAILY_CAP_USD } from './llmBudget.js';
 import { scrapeAppgoblin, type AppgoblinApp } from './appgoblinScraper.js';
 import { buildCsv } from './csv.js';
 import { notifyJobCompleted, notifyJobFailed } from './notifier.js';
@@ -90,11 +87,6 @@ export async function runAppgoblinJob(job: JobRow): Promise<void> {
   onLog('info', `appgoblin job started: countries=${job.countries}`);
 
   try {
-    // Resume-safety: a job deferred for the daily cap replays from the top.
-    // Drop any rows it inserted on the prior run so the deliverable is not
-    // duplicated. No-op on a fresh job.
-    clearJobResults(job.id);
-
     // Read discovery params from the job's source_params JSON column.
     let params: AppgoblinSourceParams = {};
     if (job.source_params) {
@@ -187,7 +179,6 @@ export async function runAppgoblinJob(job: JobRow): Promise<void> {
           onLog('warn', `appgoblin hq-split: Play page-fetch was blocked/rate-limited — Android resolution may be degraded`);
         }
       } catch (err) {
-        if (err instanceof BudgetExceededError) throw err;
         onLog('warn', `appgoblin hq-split failed (non-fatal): ${(err as Error).message}`);
       }
     }
@@ -202,13 +193,6 @@ export async function runAppgoblinJob(job: JobRow): Promise<void> {
         .catch((e) => onLog('warn', `notification error: ${(e as Error).message}`));
     }
   } catch (err) {
-    if (err instanceof BudgetExceededError) {
-      const runAfter = nextJerusalemMidnightMs();
-      const when = new Date(runAfter).toISOString();
-      deferJob(job.id, runAfter, `LLM daily cap ($${DAILY_CAP_USD}) reached; resumes after ${when}`);
-      onLog('warn', `appgoblin job deferred: LLM daily cap reached; resumes after ${when} (Jerusalem midnight)`);
-      return;
-    }
     const msg = (err as Error).message || 'unknown error';
     log.error(`appgoblin job ${job.id} failed`, err);
     onLog('error', `appgoblin job failed: ${msg}`);

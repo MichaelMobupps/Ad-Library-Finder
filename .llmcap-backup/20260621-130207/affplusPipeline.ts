@@ -39,17 +39,14 @@ import {
   appendLog,
   insertResult,
   getResults,
-  clearJobResults,
   markJobRunning,
   markJobCompleted,
   markJobFailed,
   setJobPhase,
   setJobHqZipPath,
   getJob,
-  deferJob,
   JobRow,
 } from './db.js';
-import { BudgetExceededError, nextJerusalemMidnightMs, DAILY_CAP_USD } from './llmBudget.js';
 import { listOffers, AffplusOffer, Platform as AffPlatform } from './affplusScraper.js';
 import { cleanOfferName } from './nameCleaner.js';
 import { resolveAndVerify, Platform as ResolvePlatform, ResolvedStore } from './storeResolver.js';
@@ -161,12 +158,6 @@ export async function runAffplusJob(job: JobRow): Promise<void> {
   onLog('info', `affplus job started: countries=${job.countries}`);
 
   try {
-    // Resume-safety: a job deferred for the daily cap replays from the top.
-    // Drop any rows it inserted on the prior run so the deliverable is not
-    // duplicated. Runs before the cps/mobile branch, so it covers both paths.
-    // No-op on a fresh job.
-    clearJobResults(job.id);
-
     const countries: string[] = JSON.parse(job.countries);
 
     // Web/CPS path is a separate flow: it resolves to advertiser websites, not
@@ -418,7 +409,6 @@ export async function runAffplusJob(job: JobRow): Promise<void> {
           onLog('warn', `affplus hq-split: Play page-fetch was blocked/rate-limited — Android resolution may be degraded`);
         }
       } catch (err) {
-        if (err instanceof BudgetExceededError) throw err;
         onLog('warn', `affplus hq-split failed (non-fatal): ${(err as Error).message}`);
       }
     }
@@ -434,13 +424,6 @@ export async function runAffplusJob(job: JobRow): Promise<void> {
         .catch((e) => onLog('warn', `notification error: ${(e as Error).message}`));
     }
   } catch (err) {
-    if (err instanceof BudgetExceededError) {
-      const runAfter = nextJerusalemMidnightMs();
-      const when = new Date(runAfter).toISOString();
-      deferJob(job.id, runAfter, `LLM daily cap ($${DAILY_CAP_USD}) reached; resumes after ${when}`);
-      onLog('warn', `affplus job deferred: LLM daily cap reached; resumes after ${when} (Jerusalem midnight)`);
-      return;
-    }
     const msg = (err as Error).message || 'unknown error';
     log.error(`affplus job ${job.id} failed`, err);
     onLog('error', `affplus job failed: ${msg}`);

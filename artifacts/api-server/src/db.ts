@@ -4,7 +4,7 @@ import { randomBytes } from 'node:crypto';
 import path from 'node:path';
 
 export type ProductType = 'mobile' | 'cps';
-export type JobStatus = 'pending' | 'running' | 'completed' | 'failed';
+export type JobStatus = 'pending' | 'running' | 'completed' | 'failed' | 'deferred';
 export type JobSource = 'meta' | 'affplus' | 'appgoblin';
 export type JobPhase =
   | 'queued'
@@ -14,7 +14,8 @@ export type JobPhase =
   | 'building_csv'
   | 'hq_splitting'
   | 'done'
-  | 'failed';
+  | 'failed'
+  | 'deferred';
 
 export interface JobRow {
   id: string;
@@ -42,6 +43,12 @@ export interface JobRow {
   phase_detail: string | null; // free-form descriptor, e.g. "scraping US / game" or "classifying 25/200"
   phase_updated_at: number | null;
   hq_zip_path: string | null; // mobile-only: path to per-HQ-country .zip bundle
+  /**
+   * Epoch ms before which the job must not run. Set when a job is deferred for
+   * hitting the LLM daily cap; equals the next Asia/Jerusalem midnight. NULL for
+   * jobs that have never been deferred.
+   */
+  run_after: number | null;
 }
 
 export interface JobLogRow {
@@ -175,6 +182,22 @@ export async function initDb() {
       updated_at INTEGER NOT NULL,
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     );
+
+    CREATE TABLE IF NOT EXISTS llm_spend (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts INTEGER NOT NULL,
+      spend_day TEXT NOT NULL,        -- Asia/Jerusalem calendar day 'YYYY-MM-DD'
+      source TEXT NOT NULL,           -- which call site spent (classifier | hq-resolver | web-resolver)
+      model TEXT NOT NULL,
+      input_tokens INTEGER NOT NULL DEFAULT 0,
+      output_tokens INTEGER NOT NULL DEFAULT 0,
+      cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+      cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+      web_searches INTEGER NOT NULL DEFAULT 0,
+      usd REAL NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_llm_spend_day ON llm_spend(spend_day);
   `);
 
   // Idempotent additive migrations on jobs
@@ -206,6 +229,9 @@ export async function initDb() {
   }
   if (!colNames.has('hq_zip_path')) {
     db.exec(`ALTER TABLE jobs ADD COLUMN hq_zip_path TEXT`);
+  }
+  if (!colNames.has('run_after')) {
+    db.exec(`ALTER TABLE jobs ADD COLUMN run_after INTEGER`);
   }
 
   db.exec(`CREATE INDEX IF NOT EXISTS idx_jobs_user ON jobs(created_by_user_id)`);
@@ -270,9 +296,19 @@ export function listAllJobs(): JobRow[] {
 }
 
 export function getNextPendingJob(): JobRow | null {
+  // A job is runnable when it is freshly pending, or it was deferred for the LLM
+  // daily cap and its run_after (next Asia/Jerusalem midnight) has passed. The
+  // deferred job becomes eligible on its own once the clock crosses midnight, so
+  // no scheduler process is needed. Oldest first across both states.
   return (getDb()
-    .prepare(`SELECT * FROM jobs WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1`)
-    .get() as JobRow) ?? null;
+    .prepare(
+      `SELECT * FROM jobs
+        WHERE status = 'pending'
+           OR (status = 'deferred' AND (run_after IS NULL OR run_after <= ?))
+        ORDER BY created_at ASC
+        LIMIT 1`,
+    )
+    .get(Date.now()) as JobRow) ?? null;
 }
 
 export function markJobRunning(id: string) {
@@ -300,6 +336,21 @@ export function markJobFailed(id: string, error: string) {
       `UPDATE jobs SET status='failed', error=?, completed_at=?, phase='failed', phase_detail=?, phase_updated_at=? WHERE id = ?`
     )
     .run(error, now, error.slice(0, 200), now, id);
+}
+
+/**
+ * Defer a job that hit the LLM daily cap mid-run. The job keeps its partial
+ * results in job_results and becomes runnable again once `runAfter` (the next
+ * Asia/Jerusalem midnight) passes. This is distinct from markJobFailed: a
+ * deferred job is not terminal and is not emailed as a failure.
+ */
+export function deferJob(id: string, runAfter: number, detail: string) {
+  const now = Date.now();
+  getDb()
+    .prepare(
+      `UPDATE jobs SET status='deferred', run_after=?, phase='deferred', phase_detail=?, phase_updated_at=? WHERE id = ?`
+    )
+    .run(runAfter, detail.slice(0, 200), now, id);
 }
 
 export function setJobPhase(id: string, phase: JobPhase, detail?: string | null) {
@@ -363,6 +414,18 @@ export function getResults(jobId: string): JobResultRow[] {
   return getDb()
     .prepare(`SELECT * FROM job_results WHERE job_id = ? ORDER BY id ASC`)
     .all(jobId) as JobResultRow[];
+}
+
+/**
+ * Delete all result rows for a job. Called at the start of the AppGoblin and
+ * Affplus pipeline runs so that a job which was deferred for the LLM daily cap
+ * and is now replaying does not duplicate rows it inserted on the prior run.
+ * No-op on a fresh job (it has no rows yet). Meta does not use this: it keeps
+ * prior rows and skips them via a landing_url guard, which also avoids paying
+ * for its uncached classify calls a second time.
+ */
+export function clearJobResults(jobId: string) {
+  getDb().prepare(`DELETE FROM job_results WHERE job_id = ?`).run(jobId);
 }
 
 // ---------- User helpers ----------
