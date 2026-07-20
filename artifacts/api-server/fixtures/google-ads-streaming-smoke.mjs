@@ -33,6 +33,7 @@ process.env.GOOGLE_ADS_BACKOFF_MAX_MS = '250';
 process.env.GOOGLE_ADS_BREAKER_AFTER = '3'; // explicit (default is now 1) so scenario A can count trips
 process.env.GOOGLE_ADS_DISCOVERY_ABORT_AFTER = '5'; // explicit (default is now 2) so scenario B's count is stable
 process.env.GOOGLE_ADS_CREATIVE_LOOKUPS_PER_ADV = '2';
+process.env.GOOGLE_ADS_COOLDOWN_MS = '0'; // scenarios A–D must not trip the cooldown gate (E turns it on)
 delete process.env.ANTHROPIC_API_KEY; // name-search must gracefully skip offline
 
 const { initDb, createJob, getJob, getResults, getLogs } = await import('../dist/db.js');
@@ -47,8 +48,9 @@ const check = (name, ok, extra = '') => {
 
 // ── Mock network ──────────────────────────────────────────────────────────
 let advSeq = 0;
-let suggestCalls = 0, creativeCalls = 0, detailCalls = 0;
-let suggestMode = 'ok'; // 'ok' = every keyword returns advertisers; 'first-ok' = only call #1
+let suggestCalls = 0, creativeCalls = 0, detailCalls = 0, fetchCalls = 0;
+let suggestMode = 'ok'; // 'ok' = every keyword answers; 'first-ok' = only call #1; 'blocked' = every call 429
+let warmupStatus = 200; // homepage GET status (429 simulates the penalty box)
 
 function suggestBody(advs) {
   // Flat suggestion shape (parseAdvertiserSuggestions handles it — see the
@@ -65,17 +67,19 @@ function nextAdvertisers(n) {
   return out;
 }
 function installMock() {
-  suggestCalls = 0; creativeCalls = 0; detailCalls = 0;
+  suggestCalls = 0; creativeCalls = 0; detailCalls = 0; fetchCalls = 0;
   global.fetch = async (url) => {
+    fetchCalls++;
     const u = String(url);
     if (u.includes('SearchSuggestions')) {
       suggestCalls++;
+      if (suggestMode === 'blocked') return new Response('', { status: 429 });
       if (suggestMode === 'first-ok' && suggestCalls > 1) return new Response('', { status: 429 });
       return new Response(suggestBody(nextAdvertisers(3)), { status: 200 });
     }
     if (u.includes('SearchCreatives')) { creativeCalls++; return new Response('', { status: 429 }); }
     if (u.includes('GetCreativeById')) { detailCalls++; return new Response('', { status: 429 }); }
-    return new Response('', { status: 200 }); // warm-up / anything else
+    return new Response('', { status: warmupStatus }); // warm-up / anything else
   };
 }
 
@@ -159,6 +163,48 @@ check('D: CPS made ZERO GetCreativeById calls', detailCalls === 0, `${detailCall
 check('D: all 15 leads exported (domain-first)', csvD.rowsWritten === 15, `${csvD.rowsWritten} rows`);
 check('D: CPS-mode log present', /CPS mode — creative lookups OFF/.test(logsFor(jobD)));
 check('D: job completed', getJob(jobD).status === 'completed', getJob(jobD).status);
+
+// ── Scenario E: cooldown latch — after a hard block, jobs send ZERO requests ─
+// Scenario B ended in a blocked discovery abort, which set the hard-block
+// latch. Turning the cooldown window on now must make the next job abort
+// instantly without a single network call.
+console.log('\n=== E. Cooldown latch: instant abort, zero requests ===');
+process.env.GOOGLE_ADS_COOLDOWN_MS = '600000';
+suggestMode = 'ok';
+installMock();
+const jobE = `job_smoke_stream_E_${Date.now()}`;
+createJob({
+  id: jobE, productType: 'cps', countries: ['US'], createdByUserId: 'usr_smoke',
+  source: 'google_ads',
+  sourceParams: { customKeywords: ['k1', 'k2'], region: 'US' },
+});
+await runGoogleAdsJob(getJob(jobE));
+check('E: ZERO network requests during cooldown', fetchCalls === 0, `${fetchCalls} fetches`);
+check('E: cooldown message logged', /COOLDOWN ACTIVE/.test(logsFor(jobE)));
+check('E: job still completes (empty, fast)', getJob(jobE).status === 'completed', getJob(jobE).status);
+process.env.GOOGLE_ADS_COOLDOWN_MS = '0';
+
+// ── Scenario F: penalty-box probe — warm-up 429 ⇒ ONE probe, no retry storm ─
+console.log('\n=== F. Penalty box: warm-up 429 → single probe → instant abort ===');
+process.env.GOOGLE_ADS_WARMUP = '1';
+process.env.GOOGLE_ADS_MAX_RETRIES = '3'; // prove the probe OVERRIDES the ladder
+suggestMode = 'blocked';
+warmupStatus = 429;
+installMock();
+const jobF = `job_smoke_stream_F_${Date.now()}`;
+createJob({
+  id: jobF, productType: 'cps', countries: ['US'], createdByUserId: 'usr_smoke',
+  source: 'google_ads',
+  sourceParams: { customKeywords: ['k1', 'k2', 'k3'], region: 'US' },
+});
+await runGoogleAdsJob(getJob(jobF));
+check('F: exactly ONE suggest attempt (no retry ladder)', suggestCalls === 1, `${suggestCalls} suggest calls`);
+check('F: only 2 requests total (warm-up + probe)', fetchCalls === 2, `${fetchCalls} fetches`);
+check('F: penalty-box abort logged', /PENALTY BOX CONFIRMED/.test(logsFor(jobF)));
+check('F: job completed fast (no grind)', getJob(jobF).status === 'completed', getJob(jobF).status);
+process.env.GOOGLE_ADS_WARMUP = '0';
+process.env.GOOGLE_ADS_MAX_RETRIES = '0';
+warmupStatus = 200;
 
 console.log(`\n=== streaming smoke: ${pass} passed, ${fail} failed ===`);
 process.exit(fail === 0 ? 0 : 1);

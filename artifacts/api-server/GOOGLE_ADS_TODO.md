@@ -309,6 +309,47 @@ B discovery-halt no-loss, C 250→0 repro + ?product=cps rebuild, D CPS zero-cre
 18/18; self-tests all green incl. webResolver 45 (touched) — appgoblinDecoder 3/2 pre-existing.
 `.env.example` knobs documented; mirror synced.
 
+## Round 7 — the smoking gun: stale dev-DB smoke jobs shipped in the deploy + penalty-renewal loop
+Operator's 18:30 deploy log went "straight to 429". Line-by-line analysis found TWO causes:
+1. **Self-inflicted (my fixtures):** at boot the deploy's queue processor ran
+   `job_smoke_ga_web_1784570586744 / …1644283 / …1736638` — pending smoke-test jobs from the
+   LOCAL dev `data/ad-library.sqlite`, which ships inside the deploy image (`.replitignore`
+   didn't exclude `data/`). Three stale jobs hammered the live endpoint through the operator's
+   proxy for ~4 min at boot, re-flagging the IP before the operator's real jobs even started.
+   Verified locally: those exact job IDs sat status=pending in the dev DB (20 total purged).
+2. **Penalty-renewal loop:** the proxy IP (81.181.174.82, single static exit) has been
+   continuously re-flagged since 17:38 because every job — stale or real — sends dozens of
+   requests (warm-up + retry ladders ×2 keywords) into the penalty box, renewing it. The IP
+   never gets a quiet window to recover.
+
+Fixes:
+1. **Ship-hygiene:** `.replitignore` now excludes `data/` and `csv-output/` (both root and
+   api-server) — dev DBs/CSVs never ship again; each deploy starts with a clean DB. Purged all
+   20 `job_smoke_%` rows locally; `google-ads-smoke.mjs` now `markJobCompleted`s its synthetic
+   job so it can never be picked up by a queue processor (proven: 0 stale rows after a run).
+2. **Penalty-box probe (scraper):** `warmUpSession` now reports `blocked`; when the homepage
+   itself 429s, discovery sends ONE probe keyword with NO retry ladder — both blocked ⇒ instant
+   abort ("PENALTY BOX CONFIRMED"), total 2 requests instead of ~25 + minutes of backoffs.
+3. **Cooldown latch (scraper):** a proven hard block (probe-confirmed or consecutive-block
+   abort) starts `GOOGLE_ADS_COOLDOWN_MS` (default 15 min): subsequent google_ads jobs abort
+   INSTANTLY with zero requests and a clear "COOLDOWN ACTIVE — wait ~N min" message. This
+   breaks the renewal loop (the boot sequence in the operator's log would have sent ~2 requests
+   total instead of ~5 jobs × retry storms). Latch is process-local; survives
+   resetGoogleAdsSession (deliberate — it models the IP, not the job).
+4. rpcPost gained a per-call `maxRetries` override (used by the probe).
+
+Verification: build clean; streaming smoke grew to **25/25** (E: cooldown ⇒ 0 network calls;
+F: warm-up 429 ⇒ exactly 1 probe + abort, retry ladder proven bypassed); e2e smoke 18/18 (and
+leaves 0 pending rows); self-tests all green. `.env.example` documents COOLDOWN_MS; mirror synced.
+
+**Operator runbook after republish:** the proxy IP needs a QUIET window to shed the penalty.
+(1) Republish (clean DB ships — no boot-time ghost jobs). (2) Do NOT run any google_ads job for
+45–60 min (the app now enforces 15 min itself after any confirmed block; the IP has been hot for
+hours, so give it longer manually). (3) Then run ONE CPS job. If it opens with "warm-up GET →
+200", it will fill live. If it aborts with PENALTY BOX after one probe, the IP is still hot —
+wait longer or ask the proxy provider for a rotating port / second exit IP. Long-term: a
+rotating residential gateway makes this entire class of problem disappear.
+
 ## Change log
 - 2026-07-20: Investigation complete; root causes A/B/C identified and reproduced. File created.
 - 2026-07-20: Implemented Fix A/B/C + keyword widening. All offline tests green (77 total).

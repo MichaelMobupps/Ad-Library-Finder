@@ -19,7 +19,7 @@
  * Run:  node dist ready →  `node fixtures/google-ads-smoke.mjs`
  */
 
-import { initDb, createJob, insertResult, getResults } from '../dist/db.js';
+import { initDb, createJob, insertResult, getResults, markJobCompleted } from '../dist/db.js';
 import { buildCsv } from '../dist/csv.js';
 import { runHqSplitWeb } from '../dist/hqSplitWeb.js';
 import { keywordsForJob, keywordStats } from '../dist/googleAdsKeywords.js';
@@ -112,6 +112,10 @@ for (const r of webRows) {
 }
 const results = getResults(jobId);
 const { path: csvPath, rowsWritten } = buildCsv({ jobId, productType: 'cps', results });
+// CRITICAL: never leave this synthetic job 'pending'. The dev DB once shipped
+// inside a deploy image and the deployment's queue processor executed stale
+// pending smoke jobs against the LIVE endpoint through the operator's proxy.
+markJobCompleted(jobId, csvPath, { ads: results.length, advertisers: rowsWritten });
 check('CPS CSV written with all rows', rowsWritten === webRows.length, `${rowsWritten} rows @ ${csvPath}`);
 
 const onLog = (lvl, msg) => { if (lvl === 'warn' || lvl === 'error') console.log(`    [${lvl}] ${msg}`); };

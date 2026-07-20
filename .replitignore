@@ -3,3 +3,12 @@
 
 # No need to store the pnpm store twice.
 .local
+
+# NEVER ship local dev state to a deployment. The dev SQLite DB carries dev
+# jobs — the deploy's queue processor runs any 'pending' rows at boot, which
+# once replayed stale smoke-test jobs against the live endpoint through the
+# operator's proxy and got its IP rate-limited before real jobs even started.
+data/
+artifacts/api-server/data/
+csv-output/
+artifacts/api-server/csv-output/

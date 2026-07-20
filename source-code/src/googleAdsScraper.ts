@@ -52,7 +52,8 @@ const BACKOFF_BASE_MS = clampInt(process.env.GOOGLE_ADS_BACKOFF_BASE_MS, 4_000, 
 const BACKOFF_MAX_MS = clampInt(process.env.GOOGLE_ADS_BACKOFF_MAX_MS, 30_000, 1_000, 120_000);
 // Warm a cookie session (GET the homepage once) so RPC calls carry Google's
 // consent/NID cookies like a real visit — raises the flagging threshold.
-const WARMUP = process.env.GOOGLE_ADS_WARMUP !== '0';
+// Read at call time (not import) so tests can toggle it.
+const warmupEnabled = () => process.env.GOOGLE_ADS_WARMUP !== '0';
 
 // ── Outbound proxy (residential / mobile egress) ──────────────────────────────
 // From a datacenter IP Google hard-blocks the Transparency Center (429 on every
@@ -187,11 +188,14 @@ function baseHeaders(withCookie: boolean): Record<string, string> {
  * GET the Transparency Center homepage once to collect consent/NID cookies so
  * subsequent RPC calls look like they came from a real page visit. Best-effort:
  * any failure just means we proceed cookieless (still works from a fresh IP).
+ * Returns { blocked: true } when the homepage itself answered 429/403 — the
+ * strongest possible signal that this egress IP is in Google's penalty box
+ * (discovery uses it to probe once and abort instead of grinding retries).
  */
-export async function warmUpSession(onLog?: LogFn): Promise<void> {
-  if (warmedUp || !WARMUP) {
+export async function warmUpSession(onLog?: LogFn): Promise<{ blocked: boolean }> {
+  if (warmedUp || !warmupEnabled()) {
     warmedUp = true;
-    return;
+    return { blocked: false };
   }
   warmedUp = true;
   try {
@@ -208,16 +212,41 @@ export async function warmUpSession(onLog?: LogFn): Promise<void> {
     // Drain body so the socket is released promptly.
     await res.text().catch(() => '');
     onLog?.('debug', `google-ads: warm-up GET → ${res.status}, ${cookieJar.size} cookie(s)`);
+    return { blocked: res.status === 429 || res.status === 403 };
   } catch (err) {
     onLog?.('debug', `google-ads: warm-up skipped (${(err as Error).message})`);
+    return { blocked: false };
   }
 }
 
-/** Reset session state — used by tests and any caller that wants a clean slate. */
+/** Reset session state — used by tests and any caller that wants a clean slate.
+ *  Deliberately does NOT clear the hard-block cooldown latch: that models the
+ *  EGRESS IP's standing with Google, which survives job boundaries. */
 export function resetGoogleAdsSession(): void {
   cookieJar.clear();
   warmedUp = false;
   throttleFactor = 1;
+}
+
+// ── Hard-block cooldown latch ────────────────────────────────────────────────
+// Once this host/proxy IP is proven hard-blocked (warm-up + probe both 429, or
+// N consecutive hard-blocked keywords), further google_ads scraping within the
+// cooldown window is pointless AND harmful: every request renews Google's
+// penalty. The latch makes subsequent jobs abort INSTANTLY (zero requests)
+// until the window passes. Process-local by design (a redeploy resets it).
+let lastHardBlockAt = 0;
+
+/** Milliseconds of cooldown remaining, 0 when clear. Env read at call time so
+ *  tests can flip GOOGLE_ADS_COOLDOWN_MS; default 15 min, 0 disables. */
+export function googleAdsCooldownRemainingMs(): number {
+  const windowMs = clampInt(process.env.GOOGLE_ADS_COOLDOWN_MS, 900_000, 0, 86_400_000);
+  if (windowMs <= 0 || lastHardBlockAt === 0) return 0;
+  const left = lastHardBlockAt + windowMs - Date.now();
+  return left > 0 ? left : 0;
+}
+
+function noteHardBlock(): void {
+  lastHardBlockAt = Date.now();
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -652,13 +681,15 @@ async function rpcPost(
   payload: Record<string, unknown>,
   label: string,
   onLog?: LogFn,
+  opts?: { maxRetries?: number },
 ): Promise<RpcOutcome> {
   const url = `${BASE}/anji/_/rpc/${method}?authuser=${encodeURIComponent(AUTHUSER)}`;
   const body = new URLSearchParams({ 'f.req': JSON.stringify(payload) }).toString();
   onLog?.('debug', `google-ads rpc ${label} → ${method}`);
+  const maxRetries = opts?.maxRetries ?? MAX_RETRIES;
 
   let last: RpcOutcome = { json: null, status: 0, blocked: false, error: 'no attempt' };
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
     last = await rpcPostOnce(url, body, label, onLog);
     if (last.json) {
       // A clean success gently relaxes the throttle back toward baseline.
@@ -667,23 +698,23 @@ async function rpcPost(
     }
     // Non-block transport errors (DNS/refused/timeout) or 5xx: one quick retry, no ratchet.
     const retriable = last.blocked || last.status === 0 || last.status >= 500;
-    if (!retriable || attempt === MAX_RETRIES) break;
+    if (!retriable || attempt === maxRetries) break;
     if (last.blocked) {
       throttleFactor = Math.min(8, throttleFactor + 1); // slow everything down
       const wait = backoffMs(attempt);
       onLog?.(
         'warn',
-        `google-ads: soft block on ${label} (${last.error}) — backoff ${Math.round(wait / 1000)}s, retry ${attempt + 1}/${MAX_RETRIES}`,
+        `google-ads: soft block on ${label} (${last.error}) — backoff ${Math.round(wait / 1000)}s, retry ${attempt + 1}/${maxRetries}`,
       );
       await sleep(wait);
     } else {
       const wait = Math.min(BACKOFF_MAX_MS, BACKOFF_BASE_MS);
-      onLog?.('debug', `google-ads: transient error on ${label} (${last.error}) — retry ${attempt + 1}/${MAX_RETRIES} in ${Math.round(wait / 1000)}s`);
+      onLog?.('debug', `google-ads: transient error on ${label} (${last.error}) — retry ${attempt + 1}/${maxRetries} in ${Math.round(wait / 1000)}s`);
       await sleep(wait);
     }
   }
   if (last.blocked) {
-    onLog?.('warn', `google-ads: HTTP ${last.status || '—'} on ${label} — blocked/rate-limited after ${MAX_RETRIES} retries (IP flagged, geo, or challenge)`);
+    onLog?.('warn', `google-ads: HTTP ${last.status || '—'} on ${label} — blocked/rate-limited after ${maxRetries} retries (IP flagged, geo, or challenge)`);
   } else if (last.error) {
     onLog?.('warn', `google-ads: request error on ${label}: ${last.error}`);
   }
@@ -744,9 +775,32 @@ export async function discoverAdvertisers(
     onLog?.('info', 'google-ads: no proxy — egressing from the host IP directly (set GOOGLE_ADS_PROXY_URL if this IP is rate-limited)');
   }
 
+  // Cooldown gate: if this egress IP was recently proven hard-blocked, do not
+  // send a single request — every request would renew Google's penalty and
+  // push recovery further away. Abort instantly with a clear operator message.
+  const coolLeft = googleAdsCooldownRemainingMs();
+  if (coolLeft > 0) {
+    const mins = Math.ceil(coolLeft / 60_000);
+    out.blocked = true;
+    out.notes.push(`cooldown active — no requests sent (${mins} min left)`);
+    onLog?.(
+      'warn',
+      `google-ads: COOLDOWN ACTIVE — this egress IP was hard-blocked by Google recently. ` +
+        `Skipping ALL scraping for another ~${mins} min so the penalty can expire. ` +
+        `Re-running sooner only extends the block. (Tune via GOOGLE_ADS_COOLDOWN_MS.)`,
+    );
+    return out;
+  }
+
   // Warm a cookie session first so the very first RPC already carries Google's
-  // consent/NID cookies (best-effort; a fresh IP works without it too).
-  await warmUpSession(onLog);
+  // consent/NID cookies (best-effort; a fresh IP works without it too). A 429
+  // on the homepage itself ⇒ penalty box: switch to probe mode (one cheap
+  // keyword attempt, no retry ladder) instead of grinding backoffs.
+  const warm = await warmUpSession(onLog);
+  const probeMode = warm.blocked;
+  if (probeMode) {
+    onLog?.('warn', 'google-ads: warm-up got 429 — IP looks penalty-boxed; probing ONE keyword without retries before giving up');
+  }
 
   for (let i = 0; i < keywords.length; i++) {
     if (opts.shouldStop?.()) {
@@ -755,9 +809,31 @@ export async function discoverAdvertisers(
     }
     const kw = keywords[i];
     const payload: Record<string, unknown> = { '1': kw, '2': SUGGEST_LIMIT, '3': SUGGEST_LIMIT };
-    const res = await rpcPost('SearchService/SearchSuggestions', payload, `suggest "${kw}"`, onLog);
+    // Probe mode (warm-up already 429'd): first keyword gets ONE attempt, no
+    // retry ladder — if it is blocked too, the IP is definitively in the
+    // penalty box and grinding backoffs would only renew it.
+    const res = await rpcPost(
+      'SearchService/SearchSuggestions',
+      payload,
+      `suggest "${kw}"`,
+      onLog,
+      probeMode && i === 0 ? { maxRetries: 0 } : undefined,
+    );
     out.requestsMade++;
     out.keywordsSearched++;
+
+    if (probeMode && i === 0 && res.blocked) {
+      out.blocked = true;
+      noteHardBlock();
+      out.notes.push('IP penalty-boxed (warm-up AND probe keyword both 429) — aborted with no retry storm; cooldown started');
+      onLog?.(
+        'error',
+        'google-ads: PENALTY BOX CONFIRMED (warm-up 429 + probe keyword 429). Aborting instantly — ' +
+          'no retries, no further requests. Cooldown started: new google_ads jobs will refuse to scrape ' +
+          'until it passes. Wait it out (or switch the proxy exit IP) before re-running.',
+      );
+      break;
+    }
 
     // A "failure" is any request that yielded no parseable result — a block
     // (403/429/challenge), a transport error (DNS/refused/timeout → status 0),
@@ -774,6 +850,7 @@ export async function discoverAdvertisers(
           `aborted after ${consecutiveFailures} consecutive ${kind} at keyword ${i + 1}/${keywords.length}`,
         );
         onLog?.('error', `google-ads: ${consecutiveFailures} consecutive ${kind} — aborting discovery early`);
+        if (res.blocked) noteHardBlock();
         break;
       }
     } else {
