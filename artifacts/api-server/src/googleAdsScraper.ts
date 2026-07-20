@@ -30,6 +30,7 @@
  * (runGoogleAdsScraperTests) so the shape logic is verified without a live call.
  */
 
+import { ProxyAgent, type Dispatcher } from 'undici';
 import { log } from './logger.js';
 
 const BASE = (process.env.GOOGLE_ADS_BASE || 'https://adstransparency.google.com').replace(/\/$/, '');
@@ -52,6 +53,69 @@ const BACKOFF_MAX_MS = clampInt(process.env.GOOGLE_ADS_BACKOFF_MAX_MS, 30_000, 1
 // Warm a cookie session (GET the homepage once) so RPC calls carry Google's
 // consent/NID cookies like a real visit — raises the flagging threshold.
 const WARMUP = process.env.GOOGLE_ADS_WARMUP !== '0';
+
+// ── Outbound proxy (residential / mobile egress) ──────────────────────────────
+// From a datacenter IP Google hard-blocks the Transparency Center (429 on every
+// request, warm-up GET included). The only real remedy is to egress from a
+// less-flagged IP. GOOGLE_ADS_PROXY_URL routes JUST this scraper's requests
+// through an http(s):// proxy (with optional user:pass@) — the rest of
+// the server (OAuth, googleapis, Anthropic) keeps its normal direct egress.
+// For rotating residential pools, point this at the provider's gateway endpoint
+// (it rotates the exit IP per connection / sticky-session TTL on its side).
+const PROXY_URL = (process.env.GOOGLE_ADS_PROXY_URL || '').trim();
+
+/**
+ * A single process-lifetime undici dispatcher bound to the proxy, or undefined
+ * when no proxy is configured (→ normal direct fetch). Built lazily on first use
+ * so a malformed URL degrades to a warning + direct egress instead of crashing
+ * the module at import time.
+ */
+let proxyDispatcher: Dispatcher | null | undefined; // undefined = not yet built
+function getProxyDispatcher(onLog?: LogFn): Dispatcher | undefined {
+  if (!PROXY_URL) return undefined;
+  if (proxyDispatcher !== undefined) return proxyDispatcher ?? undefined;
+  try {
+    // Per-request AbortSignal.timeout(TIMEOUT_MS) bounds the whole fetch (incl.
+    // proxy connect), so no separate proxy timeout is needed here.
+    proxyDispatcher = new ProxyAgent({ uri: PROXY_URL });
+    onLog?.('info', `google-ads: routing via proxy ${redactProxy(PROXY_URL)}`);
+  } catch (err) {
+    proxyDispatcher = null; // don't retry a bad URL every request
+    onLog?.('warn', `google-ads: GOOGLE_ADS_PROXY_URL is invalid (${(err as Error).message}) — using direct egress`);
+  }
+  return proxyDispatcher ?? undefined;
+}
+
+/** Hide credentials in a proxy URL before logging it. */
+function redactProxy(u: string): string {
+  try {
+    const parsed = new URL(u);
+    if (parsed.username || parsed.password) {
+      parsed.username = '***';
+      parsed.password = '';
+    }
+    return parsed.toString();
+  } catch {
+    return u.replace(/\/\/[^@/]+@/, '//***@');
+  }
+}
+
+/**
+ * Attach the proxy dispatcher to a fetch init when one is configured. The DOM
+ * `RequestInit` type has no `dispatcher` field (it's a Node/undici extension),
+ * so the assignment is cast locally — this is the one supported way to proxy the
+ * global fetch on Node 20.
+ */
+function withProxy(init: RequestInit, onLog?: LogFn): RequestInit {
+  const d = getProxyDispatcher(onLog);
+  if (d) (init as { dispatcher?: Dispatcher }).dispatcher = d;
+  return init;
+}
+
+/** True when an outbound proxy is configured for the scraper. */
+export function isProxyConfigured(): boolean {
+  return !!PROXY_URL;
+}
 
 function clampInt(v: string | undefined, def: number, min: number, max: number): number {
   const n = Number(v);
@@ -131,7 +195,7 @@ export async function warmUpSession(onLog?: LogFn): Promise<void> {
   }
   warmedUp = true;
   try {
-    const res = await fetch(`${BASE}/?region=anywhere`, {
+    const res = await fetch(`${BASE}/?region=anywhere`, withProxy({
       method: 'GET',
       headers: {
         'user-agent': FETCH_HEADERS['user-agent'],
@@ -139,7 +203,7 @@ export async function warmUpSession(onLog?: LogFn): Promise<void> {
         'accept-language': FETCH_HEADERS['accept-language'],
       },
       signal: AbortSignal.timeout(TIMEOUT_MS),
-    });
+    }, onLog));
     absorbSetCookie(res);
     // Drain body so the socket is released promptly.
     await res.text().catch(() => '');
@@ -535,12 +599,12 @@ async function rpcPostOnce(
   onLog?: LogFn,
 ): Promise<RpcOutcome> {
   try {
-    const res = await fetch(url, {
+    const res = await fetch(url, withProxy({
       method: 'POST',
       headers: baseHeaders(true),
       body,
       signal: AbortSignal.timeout(TIMEOUT_MS),
-    });
+    }, onLog));
     absorbSetCookie(res);
     if (res.status === 429 || res.status === 403) {
       // Drain so the connection is reusable.
@@ -652,6 +716,12 @@ export async function discoverAdvertisers(
   const seen = new Set<string>();
   let consecutiveFailures = 0;
   const MAX_CONSECUTIVE_FAILURES = 5;
+
+  if (PROXY_URL) {
+    onLog?.('info', `google-ads: outbound proxy configured (${redactProxy(PROXY_URL)})`);
+  } else {
+    onLog?.('info', 'google-ads: no proxy — egressing from the host IP directly (set GOOGLE_ADS_PROXY_URL if this IP is rate-limited)');
+  }
 
   // Warm a cookie session first so the very first RPC already carries Google's
   // consent/NID cookies (best-effort; a fresh IP works without it too).
