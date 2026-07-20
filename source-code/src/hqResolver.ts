@@ -138,7 +138,9 @@ export function resolveTld(domain: string): string {
 /**
  * Layer-3 fallback: detect a country from script/language markers in combined text.
  * Priority: Japanese kana → Chinese (no kana) → Korean Hangul → Cyrillic →
- * Spanish markers. First match wins. Empty string if nothing matches.
+ * Hebrew → Thai → Spanish markers. First match wins. Empty string if nothing
+ * matches. (Hebrew/Thai are unambiguous single-country scripts; Arabic and
+ * Devanagari are intentionally excluded because they span many countries.)
  */
 export function detectCountryFromScript(text: string): string {
   if (!text) return '';
@@ -150,6 +152,15 @@ export function detectCountryFromScript(text: string): string {
   if (hasHangul) return 'South Korea';
   const hasCyrillic = /[\u0400-\u04FF]/.test(text);
   if (hasCyrillic) return 'Russia';
+  // Hebrew (essentially Israel-only) and Thai are unambiguous single-country
+  // scripts \u2014 safe to map directly. Added for the Google Ads web-HQ path where
+  // the advertiser name is often the only HQ signal, but also improves the
+  // app-store path. (Arabic / Devanagari are intentionally NOT mapped here: each
+  // spans many countries, so a script hit would be misleading.)
+  const hasHebrew = /[\u0590-\u05FF]/.test(text);
+  if (hasHebrew) return 'Israel';
+  const hasThai = /[\u0E00-\u0E7F]/.test(text);
+  if (hasThai) return 'Thailand';
   const lower = text.toLowerCase();
   const spanishMarkers = ['españa', 'espana', 'grupo', 'alimentación', 'alimentacion'];
   for (const m of spanishMarkers) {
@@ -407,6 +418,8 @@ const LAYER3_TESTS: ScriptTestCase[] = [
   { name: 'Chinese-only CJK', text: '腾讯', expectedCountry: 'China' },
   { name: 'Korean Hangul', text: '카카오톡', expectedCountry: 'South Korea' },
   { name: 'Cyrillic', text: 'Яндекс', expectedCountry: 'Russia' },
+  { name: 'Hebrew', text: 'קזינו ישראל', expectedCountry: 'Israel' },
+  { name: 'Thai', text: 'คาสิโนออนไลน์', expectedCountry: 'Thailand' },
   { name: 'Spanish marker', text: 'Grupo Dia España', expectedCountry: 'Spain' },
   { name: 'Pure ASCII (no match)', text: 'Random ASCII name', expectedCountry: '' },
 ];

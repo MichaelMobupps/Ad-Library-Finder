@@ -5,7 +5,7 @@ import path from 'node:path';
 
 export type ProductType = 'mobile' | 'cps';
 export type JobStatus = 'pending' | 'running' | 'completed' | 'failed' | 'deferred';
-export type JobSource = 'meta' | 'affplus' | 'appgoblin';
+export type JobSource = 'meta' | 'affplus' | 'appgoblin' | 'google_ads';
 export type JobPhase =
   | 'queued'
   | 'starting'
@@ -32,17 +32,19 @@ export interface JobRow {
   recipient_email: string | null;
   notification_status: string | null; // 'sent' | 'failed' | null
   created_by_user_id: string | null;
-  source: JobSource; // 'meta' (default) | 'affplus' | 'appgoblin'
+  source: JobSource; // 'meta' (default) | 'affplus' | 'appgoblin' | 'google_ads'
   /**
    * Optional JSON blob of source-specific parameters. Currently:
-   *   - appgoblin: {"category":"game_casino","adNetworkDomain":"appsflyer.com"}
+   *   - appgoblin:  {"category":"game_casino","adNetworkDomain":"appsflyer.com"}
+   *   - google_ads: {"verticals":["igaming"],"languages":["en","es"],
+   *                  "maxKeywords":40,"customKeywords":["..."],"region":"US"}
    * Meta and Affplus do not use this field.
    */
   source_params: string | null;
   phase: JobPhase | null; // coarse pipeline phase; null for old jobs (derived from status)
   phase_detail: string | null; // free-form descriptor, e.g. "scraping US / game" or "classifying 25/200"
   phase_updated_at: number | null;
-  hq_zip_path: string | null; // mobile-only: path to per-HQ-country .zip bundle
+  hq_zip_path: string | null; // path to per-HQ-country .zip bundle (mobile jobs + Google Ads web jobs)
   /**
    * Epoch ms before which the job must not run. Set when a job is deferred for
    * hitting the LLM daily cap; equals the next Asia/Jerusalem midnight. NULL for

@@ -25,6 +25,7 @@ import { keywordsFor } from './keywords.js';
 import { notifyJobCompleted, notifyJobFailed } from './notifier.js';
 import { runAffplusJob } from './affplusPipeline.js';
 import { runAppgoblinJob } from './appgoblinPipeline.js';
+import { runGoogleAdsJob } from './googleAdsPipeline.js';
 import { runHqSplit } from './hqSplit.js';
 import { log } from './logger.js';
 
@@ -55,6 +56,8 @@ async function tick() {
           await runAffplusJob(job);
         } else if (job.source === 'appgoblin') {
           await runAppgoblinJob(job);
+        } else if (job.source === 'google_ads') {
+          await runGoogleAdsJob(job);
         } else {
           await runMetaJob(job);
         }

@@ -12,8 +12,21 @@ import {
 } from './db.js';
 import { RequestWithUser } from './auth.js';
 import { fetchAppgoblinCategoryList } from './appgoblinScraper.js';
+import {
+  GOOGLE_ADS_VERTICALS,
+  GOOGLE_ADS_LANGUAGES,
+  keywordStats,
+} from './googleAdsKeywords.js';
 
 export const jobsRouter: Router = Router();
+
+interface GoogleAdsBody {
+  verticals?: string[] | null;
+  languages?: string[] | null;
+  maxKeywords?: number | null;
+  customKeywords?: string[] | null;
+  region?: string | null;
+}
 
 interface CreateJobBody {
   countries: string[];
@@ -23,12 +36,17 @@ interface CreateJobBody {
   /** AppGoblin discovery params (only used when source='appgoblin'). */
   appgoblinCategory?: string | null;
   appgoblinAdNetwork?: string | null;
+  /** Google Ads Transparency discovery params (only used when source='google_ads'). */
+  googleAds?: GoogleAdsBody | null;
 }
+
+const KNOWN_VERTICAL_IDS = new Set(GOOGLE_ADS_VERTICALS.map((v) => v.id));
+const KNOWN_LANG_CODES = new Set(GOOGLE_ADS_LANGUAGES.map((l) => l.code));
 
 // POST /api/jobs
 jobsRouter.post('/', (req: Request<{}, {}, CreateJobBody>, res: Response) => {
   const user = (req as RequestWithUser).user!;
-  const { countries, productTypes, recipientEmail, source, appgoblinCategory, appgoblinAdNetwork } = req.body;
+  const { countries, productTypes, recipientEmail, source, appgoblinCategory, appgoblinAdNetwork, googleAds } = req.body;
 
   if (!Array.isArray(countries) || countries.length === 0) {
     return res.status(400).json({ error: 'countries[] required' });
@@ -49,13 +67,13 @@ jobsRouter.post('/', (req: Request<{}, {}, CreateJobBody>, res: Response) => {
   // Source: default to 'meta' to preserve existing behavior.
   let jobSource: JobSource = 'meta';
   if (source !== undefined) {
-    if (source !== 'meta' && source !== 'affplus' && source !== 'appgoblin') {
+    if (source !== 'meta' && source !== 'affplus' && source !== 'appgoblin' && source !== 'google_ads') {
       return res.status(400).json({ error: `invalid source: ${source}` });
     }
     jobSource = source;
   }
 
-  // AppGoblin is mobile-only. Affplus now supports cps (web) as well as mobile.
+  // AppGoblin is mobile-only. Affplus and Google Ads support cps (web) too.
   if (jobSource === 'appgoblin' && productTypes.some((pt) => pt !== 'mobile')) {
     return res.status(400).json({ error: `${jobSource} source supports productType=mobile only` });
   }
@@ -82,6 +100,58 @@ jobsRouter.post('/', (req: Request<{}, {}, CreateJobBody>, res: Response) => {
       category: cat,
       adNetworkDomain: adn ? adn.toLowerCase() : null,
     };
+  }
+
+  // Google Ads Transparency discovery params. All fields optional — an empty
+  // body runs the default multilingual keyword sample across all verticals.
+  if (jobSource === 'google_ads') {
+    const ga = googleAds || {};
+
+    let verticals: string[] | null = null;
+    if (Array.isArray(ga.verticals) && ga.verticals.length > 0) {
+      verticals = ga.verticals.map((v) => String(v).trim()).filter(Boolean);
+      const bad = verticals.find((v) => !KNOWN_VERTICAL_IDS.has(v));
+      if (bad) return res.status(400).json({ error: `unknown google-ads vertical: ${bad}` });
+    }
+
+    let languages: string[] | null = null;
+    if (Array.isArray(ga.languages) && ga.languages.length > 0) {
+      languages = ga.languages.map((l) => String(l).trim()).filter(Boolean);
+      const bad = languages.find((l) => !KNOWN_LANG_CODES.has(l));
+      if (bad) return res.status(400).json({ error: `unknown google-ads language: ${bad}` });
+    }
+
+    let maxKeywords: number | null = null;
+    if (ga.maxKeywords != null) {
+      const n = Number(ga.maxKeywords);
+      if (!Number.isFinite(n) || n < 1) {
+        return res.status(400).json({ error: 'maxKeywords must be a positive integer' });
+      }
+      maxKeywords = Math.min(500, Math.floor(n)); // hard cap: 500 keywords/job
+    }
+
+    let customKeywords: string[] | null = null;
+    if (Array.isArray(ga.customKeywords) && ga.customKeywords.length > 0) {
+      const seen = new Set<string>();
+      customKeywords = [];
+      for (const raw of ga.customKeywords) {
+        const k = String(raw).trim().slice(0, 100);
+        if (!k) continue;
+        const key = k.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        customKeywords.push(k);
+        if (customKeywords.length >= 500) break; // hard cap
+      }
+      if (customKeywords.length === 0) customKeywords = null;
+    }
+
+    let region: string | null = null;
+    if (ga.region != null && String(ga.region).trim()) {
+      region = String(ga.region).trim().slice(0, 8);
+    }
+
+    sourceParams = { verticals, languages, maxKeywords, customKeywords, region };
   }
 
   let recipient: string | null = null;
@@ -124,6 +194,18 @@ jobsRouter.get('/appgoblin-categories', async (_req: Request, res: Response) => 
   } catch (err) {
     res.status(502).json({ error: `appgoblin category fetch failed: ${(err as Error).message}` });
   }
+});
+
+// GET /api/jobs/google-ads-verticals — vertical + language metadata and the
+// exemplar-bank size for the New Job form. Static (no network). Defined BEFORE
+// /:id so Express does not match it as an id.
+jobsRouter.get('/google-ads-verticals', (_req: Request, res: Response) => {
+  const stats = keywordStats();
+  res.json({
+    verticals: GOOGLE_ADS_VERTICALS,
+    languages: GOOGLE_ADS_LANGUAGES,
+    stats: { total: stats.total, languages: stats.languages, verticals: stats.verticals },
+  });
 });
 
 jobsRouter.get('/:id', (req, res) => {

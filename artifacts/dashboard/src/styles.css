@@ -910,3 +910,16 @@ input[type="text"].input {
   color: var(--tag-appgoblin-text);
   border-color: var(--tag-appgoblin-border);
 }
+/* ============================================================
+   Google Ads Transparency tag (added for the google_ads lead source)
+   ============================================================ */
+:root {
+  --tag-google_ads-text: #dc2626;
+  --tag-google_ads-bg: rgba(220, 38, 38, 0.10);
+  --tag-google_ads-border: rgba(220, 38, 38, 0.28);
+}
+.tag-google_ads {
+  background: var(--tag-google_ads-bg);
+  color: var(--tag-google_ads-text);
+  border-color: var(--tag-google_ads-border);
+}
