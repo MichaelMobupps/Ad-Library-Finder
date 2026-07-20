@@ -370,6 +370,18 @@ export function setJobHqZipPath(id: string, zipPath: string | null) {
   getDb().prepare(`UPDATE jobs SET hq_zip_path=? WHERE id = ?`).run(zipPath, id);
 }
 
+/**
+ * Point job.csv_path at a file BEFORE the job finishes. Pipelines that flush a
+ * partial CSV incrementally call this on the first flush so the download route
+ * (which 404s while csv_path is null) can serve the growing file — and so a job
+ * that is later blocked, interrupted, or marked failed still leaves everything
+ * scraped so far downloadable. markJobCompleted overwrites it with the same
+ * path at the end; markJobFailed leaves it intact.
+ */
+export function setJobCsvPath(id: string, csvPath: string) {
+  getDb().prepare(`UPDATE jobs SET csv_path=? WHERE id = ?`).run(csvPath, id);
+}
+
 // ---------- Log helpers ----------
 
 export function appendLog(jobId: string, level: JobLogRow['level'], message: string) {

@@ -7,9 +7,11 @@ import {
   getJob,
   listJobsForUser,
   getLogs,
+  getResults,
   ProductType,
   JobSource,
 } from './db.js';
+import { buildCsv } from './csv.js';
 import { RequestWithUser } from './auth.js';
 import { fetchAppgoblinCategoryList } from './appgoblinScraper.js';
 import {
@@ -226,6 +228,31 @@ jobsRouter.get('/:id/csv', (req, res) => {
   if (job.created_by_user_id && job.created_by_user_id !== user.id) {
     return res.status(404).json({ error: 'not found' });
   }
+
+  // ?product=cps|mobile — export the job's results under the OTHER product
+  // filter. Recovery path for e.g. a mobile google_ads job that discovered web
+  // (cps_web) leads: those rows are stored in job_results but excluded from the
+  // mobile CSV; this rebuilds a CSV from the stored rows without re-scraping.
+  const override = String(req.query.product || '').toLowerCase();
+  if (override && (override === 'cps' || override === 'mobile') && override !== job.product_type) {
+    const results = getResults(job.id);
+    if (results.length === 0) {
+      return res.status(404).json({ error: 'no stored results to export' });
+    }
+    const { path: p, rowsWritten } = buildCsv({
+      jobId: job.id,
+      productType: override as ProductType,
+      results,
+    });
+    if (rowsWritten === 0) {
+      return res.status(404).json({ error: `no ${override} rows in this job's results` });
+    }
+    const fname = path.basename(p);
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${fname}"`);
+    return createReadStream(p).pipe(res);
+  }
+
   if (!job.csv_path || !existsSync(job.csv_path)) {
     return res.status(404).json({ error: 'CSV not yet ready' });
   }

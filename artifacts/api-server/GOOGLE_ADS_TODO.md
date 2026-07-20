@@ -217,6 +217,98 @@ the pre-restart `job_OWk_6De02k`: 623 advertisers, creative lookups 429'ing for 
 web-domain leads resolved fine). A healthy proxy makes creative lookups succeed, so this is now
 lower-impact; worth tightening the breaker to count creative-endpoint outcomes only.
 
+## Round 5 — real-time streaming CSV + robust pause + "found 250 → got 0" root cause
+Operator ran two live jobs from the (proxy-published) deploy and BOTH emailed "0 advertisers":
+- **CPS `job_1eI77Hfk5-`: Ads scraped = 0** → discovery itself found 0 (SearchSuggestions
+  blocked at that moment). Nothing to resolve → empty CSV. Environmental (needs the proxy IP
+  un-flagged), not a pipeline bug.
+- **MOBILE `job_2vyvE-PPJu`: Ads scraped = 252, Advertisers in CSV = 0.** Root cause: the
+  "insurance" advertisers resolve to WEBSITES (`cps_web`), and the mobile CSV writer
+  (`csv.ts` keeps only `mobile_*` + `store_url`) discards every web lead → 0 rows. The creative
+  429-storm compounded it (store URLs need SearchCreatives, which was blocked). i.e. **the 250
+  leads were real; the product-type filter threw them away.** Fix = run insurance as **CPS**
+  (web leads resolve from the verified domain with NO creative lookup, so they survive the
+  429-storm). Reproduced in the streaming smoke, scenario C.
+
+Operator ask: "fill the excel in real time, concurrently, so a halt loses nothing." Implemented:
+1. **Streaming discover→resolve→write** (`googleAdsScraper.discoverAdvertisers` gained an awaited
+   `onAdvertiser(adv)` hook + `shouldStop()`; pipeline moved its resolve/classify/insert into that
+   callback). Each advertiser is resolved, inserted, and the CSV re-flushed the INSTANT it is
+   discovered — discovery and writing are effectively concurrent. A block/kill mid-scrape keeps
+   everything already found (smoke B: discovery aborts after keyword 1 → the 3 leads from keyword 1
+   are already persisted).
+2. **Real-time flush + downloadable partial**: CSV rebuilt on EVERY insert (was every 25); new
+   `db.setJobCsvPath()` publishes `job.csv_path` on the first flush so "Download CSV" serves the
+   growing file and a blocked/interrupted/FAILED job still exposes everything scraped
+   (`markJobFailed` leaves csv_path intact; the download route already served whatever csv_path
+   points at).
+3. **Robust fast pause-on-block**: circuit breaker now counts CREATIVE-endpoint outcomes only
+   (new `DestinationResult.attemptedCreativeLookup`) — fixes the old under-trip where a
+   domain-resolved advertiser reset the counter. Trips on EITHER N-in-a-row (`GOOGLE_ADS_BREAKER_AFTER`,
+   def 3) OR blocked-rate ≥ `GOOGLE_ADS_BREAKER_RATE` (def 0.6) over ≥ `GOOGLE_ADS_BREAKER_MIN_SAMPLE`
+   (def 6). On trip: stop creative network calls, keep discovering + domain-resolving (instant),
+   flush. Smoke A: exactly 3 SearchCreatives calls then paused; all 15 advertisers still saved.
+
+### Godlike audit / blast radius / smoke (all green)
+- Blast radius = exactly 3 source files (`db.ts` +setJobCsvPath, `googleAdsPipeline.ts` streaming
+  rewrite, `googleAdsScraper.ts` hooks + attemptedCreativeLookup) + 1 new fixture. Whole api-server
+  typecheck clean. `discoverAdvertisers`'s other caller (the e2e smoke) uses the OLD signature —
+  the new hooks are optional, so it still passes 18/18 (backward-compatible).
+- Other pipelines (affplus/appgoblin/meta) share `buildCsv` but not the streaming path and never
+  call setJobCsvPath mid-job → unchanged. HQ split still runs at completion on the DB rows. Email
+  attach still uses the final csv_path.
+- **New behavioural smoke** `fixtures/google-ads-streaming-smoke.mjs` drives the REAL
+  `runGoogleAdsJob` against a mocked network: A (block-storm CPS) 6/6, B (discovery-halt) 3/3,
+  C (mobile-over-web reproduces 250→0) 4/4 → **13/13**.
+- Module self-tests: csv 15, googleAdsKeywords 28, googleAdsScraper 44, googleAdsPipeline 5,
+  hqResolver 27, hqSplit 7, hqSplitWeb 4 — all pass. Pre-existing `appgoblinDecoder` 3/2 still
+  fails (untouched, unrelated — flagged since Round 3).
+- **Auto-fix:** the mobile-vs-web zeroing is now unmissable — the completion logs a NOTE with the
+  web-lead count + "re-run as CPS". (Left product semantics intact: mobile CSV = store URLs, CPS
+  CSV = websites; changing that would break the Email-Prospector per-schema ingest.)
+
+**Operator guidance to actually get leads:** for web verticals (insurance, forex, loans, etc.)
+run **CPS**, not mobile — CPS leads resolve from the verified domain and survive the creative
+429-storm. Keep `GOOGLE_ADS_PROXY_URL` set so discovery isn't blocked. The CSV now fills live and
+a mid-scrape block keeps everything found.
+
+## Round 6 — log-verified root cause + CPS domain-first + name-search + recovery route
+Operator supplied the full deploy log for the two 0-result jobs; theory CONFIRMED line-by-line:
+- Proxy WORKS for discovery: `warm-up GET → 200`, 19/19 suggest calls OK → **252 advertisers**.
+- Mobile job: `inserted 138 rows (mobile 0, web 138)` → **138 real web leads saved in the DB**,
+  then `CSV written … (0 mobile rows)` — the mobile filter discarded them. User's "I saw web
+  leads found" is exactly right.
+- CPS job started at 17:39:40 — the second the mobile job finished — and its FIRST suggest got
+  429. **Causal, not random:** the mobile job's 2-minute creative-endpoint burst (SearchCreatives
+  + GetCreativeById + retry ladders) through the single static proxy IP (81.181.174.82) flagged
+  it; CPS inherited a poisoned IP. The mobile job took down the CPS job.
+
+Operator directives: concurrency (lead → CSV the moment it's found — shipped in Round 5),
+stop-the-scrape when 429 arrives and present what's found, and resolve advertisers like Affplus
+(name → web search, or domain, whichever works). Implemented:
+1. **CPS = domain-first, ZERO creative calls** (`GOOGLE_ADS_CPS_USE_CREATIVES=1` restores old
+   behaviour). The lead for a web vertical is the advertiser's own site; creative lookups added
+   nothing except the burst that flags the IP. A CPS job now costs ~1 request per keyword.
+   Smoke D proves 0 SearchCreatives / 0 GetCreativeById for a CPS job, 15/15 leads exported.
+2. **Affplus-style name→web-search fallback** (CPS, advertisers with NO verified domain — the
+   `unresolved 114` in the log): new `webResolver.searchAdvertiserWebsite(name, hint)` export
+   wraps the same Anthropic web_search engine Affplus uses (LLM-budget-capped, intermediary/
+   tracker hosts rejected). Budget `GOOGLE_ADS_WEB_MAX_SEARCHES` (def 40)/job. A daily-cap hit
+   mid-job disables further searches but lets the job COMPLETE with its saved leads (deliberate:
+   deferJob would replay-from-top and re-scrape). No ANTHROPIC_API_KEY ⇒ graceful skip.
+3. **Stop-on-429 defaults tightened**: breaker `GOOGLE_ADS_BREAKER_AFTER` default 3→**1** (a
+   "blocked" verdict already survived the 4-attempt retry ladder — one is proof); discovery abort
+   hardcoded 5→env `GOOGLE_ADS_DISCOVERY_ABORT_AFTER` default **2**. With Round-5 streaming,
+   stopping early presents everything found so far — nothing is lost.
+4. **Recovery route**: `GET /api/jobs/:id/csv?product=cps` rebuilds a CSV from the STORED
+   job_results under the other product filter — **the mobile job's 138 web leads are downloadable
+   right now, no re-scrape**. Mobile-job NOTE log now prints that exact link.
+
+Verification: build clean; streaming smoke extended to **18/18** (A mobile breaker exactly-N-calls,
+B discovery-halt no-loss, C 250→0 repro + ?product=cps rebuild, D CPS zero-creative); e2e smoke
+18/18; self-tests all green incl. webResolver 45 (touched) — appgoblinDecoder 3/2 pre-existing.
+`.env.example` knobs documented; mirror synced.
+
 ## Change log
 - 2026-07-20: Investigation complete; root causes A/B/C identified and reproduced. File created.
 - 2026-07-20: Implemented Fix A/B/C + keyword widening. All offline tests green (77 total).
@@ -226,3 +318,13 @@ lower-impact; worth tightening the breaker to count creative-endpoint outcomes o
 - 2026-07-20 (Round 4): Deploy IP confirmed hard-blocked at discovery (empty CSVs). Implemented
   scraper-scoped outbound-proxy hook (`GOOGLE_ADS_PROXY_URL`, undici ProxyAgent); build clean,
   routing verified, self-tests green, docs + mirror synced. Operator to set the proxy var + redeploy.
+- 2026-07-20 (Round 5): Proxy published (commit d6a3bce). Two live jobs still 0 — CPS discovery=0
+  (env), MOBILE 252→0 (web advertisers dropped by the mobile filter). Built streaming real-time CSV
+  (write each lead the instant it's found), downloadable partial on halt (setJobCsvPath), and a
+  robust creative-only circuit breaker. Build clean; streaming smoke 13/13; e2e smoke 18/18; mirror
+  synced. Safe to republish. Guidance: run web verticals as CPS.
+- 2026-07-20 (Round 6): Deploy log verified the theory (138 web leads WERE saved; mobile job's
+  creative burst poisoned the proxy IP → CPS discovery 429). CPS now domain-first with ZERO
+  creative calls; Affplus-style name→web-search for no-domain advertisers; breaker default 1 /
+  discovery abort default 2; `?product=cps` recovery download for stored web leads. Streaming
+  smoke 18/18, e2e 18/18, all self-tests green. Safe to republish.

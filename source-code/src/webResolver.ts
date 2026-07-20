@@ -621,6 +621,38 @@ Respond with ONLY this JSON object, no preamble and no markdown fences:
   }
 }
 
+/**
+ * Public name→website search for OTHER pipelines (Google Ads). Same engine as
+ * the Affplus fallback (Anthropic web_search, LLM-budget-capped), but takes a
+ * bare advertiser name + optional hint instead of an Affplus offer. Returns
+ * null when the advertiser can't be confidently identified, when the search
+ * fails, or when ANTHROPIC_API_KEY is unset (graceful skip — callers treat it
+ * as "no destination"). BudgetExceededError propagates so jobs defer properly.
+ */
+export async function searchAdvertiserWebsite(
+  name: string,
+  hint: string,
+  onLog: LogFn = () => {},
+): Promise<{ url: string; brand: string; confidence: string } | null> {
+  const query = (name || '').trim();
+  if (!query) return null;
+  if (!process.env.ANTHROPIC_API_KEY) {
+    onLog('debug', `web-resolve: name search skipped for "${query}" — ANTHROPIC_API_KEY not set`);
+    return null;
+  }
+  const hit = await nameSearchDestination({ query, category: '', description: hint || '' }, onLog);
+  if (!hit) return null;
+  const cleanUrl = cleanDestinationUrl(hit.url);
+  const finalHost = hostOf(cleanUrl);
+  if (!finalHost) return null;
+  // Reject trackers/intermediaries — an advertiser lead must be the brand's own site.
+  if (isMmpTrackerHost(finalHost) || isIntermediaryHost(finalHost, '')) {
+    onLog('debug', `web-resolve: name search for "${query}" returned intermediary host ${finalHost} — dropped`);
+    return null;
+  }
+  return { url: cleanUrl, brand: hit.brand, confidence: hit.confidence };
+}
+
 export function parseSearchJson(text: string): SearchHit | null {
   if (!text) return null;
   const cleaned = text.replace(/```json/gi, '').replace(/```/g, '').trim();
