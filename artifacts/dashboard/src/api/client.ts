@@ -1,6 +1,6 @@
 export type ProductType = 'mobile' | 'cps';
-export type JobStatus = 'pending' | 'running' | 'completed' | 'failed';
-export type JobSource = 'meta' | 'affplus' | 'appgoblin';
+export type JobStatus = 'pending' | 'running' | 'completed' | 'failed' | 'deferred';
+export type JobSource = 'meta' | 'affplus' | 'appgoblin' | 'google_ads';
 export type JobPhase =
   | 'queued'
   | 'starting'
@@ -9,7 +9,8 @@ export type JobPhase =
   | 'building_csv'
   | 'hq_splitting'
   | 'done'
-  | 'failed';
+  | 'failed'
+  | 'deferred';
 
 export interface Job {
   id: string;
@@ -33,6 +34,9 @@ export interface Job {
   phase: JobPhase | null;
   phase_detail: string | null;
   phase_updated_at: number | null;
+  // Per-HQ-country .zip bundle path (mobile jobs, and Google Ads web jobs).
+  // Presence (not just product_type) gates the HQ-split download button.
+  hq_zip_path: string | null;
 }
 
 export interface JobLog {
@@ -66,6 +70,32 @@ export interface AppgoblinCategory {
   total_apps: number;
 }
 
+export interface GoogleAdsVertical {
+  id: string;
+  label: string;
+  hint: string;
+}
+
+export interface GoogleAdsLanguage {
+  code: string;
+  label: string;
+  native: string;
+}
+
+export interface GoogleAdsMeta {
+  verticals: GoogleAdsVertical[];
+  languages: GoogleAdsLanguage[];
+  stats: { total: number; languages: number; verticals: number };
+}
+
+export interface GoogleAdsOptions {
+  verticals?: string[] | null;
+  languages?: string[] | null;
+  maxKeywords?: number | null;
+  customKeywords?: string[] | null;
+  region?: string | null;
+}
+
 export interface CreateJobOptions {
   countries: string[];
   productTypes: ProductType[];
@@ -73,6 +103,7 @@ export interface CreateJobOptions {
   source?: JobSource;
   appgoblinCategory?: string | null;
   appgoblinAdNetwork?: string | null;
+  googleAds?: GoogleAdsOptions | null;
 }
 
 export class AuthRequiredError extends Error {
@@ -121,6 +152,9 @@ export const api = {
   appgoblinCategories: () =>
     fetchJson<{ categories: AppgoblinCategory[] }>('/api/jobs/appgoblin-categories').then((r) => r.categories),
 
+  // ---- google ads ----
+  googleAdsMeta: () => fetchJson<GoogleAdsMeta>('/api/jobs/google-ads-verticals'),
+
   // ---- settings ----
   getSettings: () => fetchJson<Settings>('/api/settings'),
 
@@ -157,6 +191,7 @@ const PHASE_LABEL: Record<JobPhase, string> = {
   hq_splitting: 'HQ split',
   done: 'Done',
   failed: 'Failed',
+  deferred: 'Deferred',
 };
 
 /**
@@ -171,6 +206,7 @@ export function derivePhase(job: Job): JobPhase {
     case 'running': return 'scraping'; // best guess; old running jobs had no finer signal
     case 'completed': return 'done';
     case 'failed': return 'failed';
+    case 'deferred': return 'deferred'; // LLM daily cap; resumes after Jerusalem midnight
   }
 }
 

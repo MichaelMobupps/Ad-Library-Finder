@@ -87,7 +87,8 @@ export async function notifyJobCompleted(job: JobRow) {
   const jobUrl = publicJobUrl(job.id);
   const csvExists = !!job.csv_path && existsSync(job.csv_path);
 
-  // HQ-split zip: mobile jobs only; present iff resolution succeeded.
+  // HQ-split zip: present iff HQ resolution produced one — mobile jobs (any
+  // source) and Google Ads web/CPS jobs. Gated on hq_zip_path, not product_type.
   const hqZipExists = !!job.hq_zip_path && existsSync(job.hq_zip_path);
   const hqZipUrl = publicHqZipUrl(job.id);
 
@@ -119,8 +120,8 @@ export async function notifyJobCompleted(job: JobRow) {
   </p>
 </body></html>`;
 
-  // Compose attachments: CSV (if exists) + HQ zip (if exists). Mobile jobs
-  // with HQ resolution succeed get both; CPS jobs get just CSV.
+  // Compose attachments: CSV (if exists) + HQ zip (if exists). Any job whose HQ
+  // split produced a zip (mobile jobs, and Google Ads web/CPS jobs) gets both.
   const attachments: Array<{ path: string; mimeType: string; filename?: string }> = [];
   if (csvExists) {
     attachments.push({ path: job.csv_path!, mimeType: 'text/csv' });

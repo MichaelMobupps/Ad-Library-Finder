@@ -9,6 +9,8 @@ import {
   Settings,
   Me,
   AppgoblinCategory,
+  GoogleAdsMeta,
+  CreateJobOptions,
   AuthRequiredError,
   derivePhase,
   phaseLabel,
@@ -180,7 +182,7 @@ function JobsList({ jobs, onSelect, onNew }: { jobs: Job[]; onSelect: (id: strin
     return (
       <div className="empty">
         <p className="empty-title">No jobs yet</p>
-        <p className="empty-sub">Submit a scrape from Meta Ad Library, Affplus, or AppGoblin.</p>
+        <p className="empty-sub">Submit a scrape from Meta Ad Library, Affplus, AppGoblin, or Google Ads Transparency.</p>
         <button className="btn primary" onClick={onNew}>+ New Job</button>
       </div>
     );
@@ -278,6 +280,15 @@ function NewJob({
   const [agCategoriesError, setAgCategoriesError] = useState<string | null>(null);
   const [agCategoriesLoading, setAgCategoriesLoading] = useState(false);
 
+  // Google Ads Transparency discovery state
+  const [gaVerticals, setGaVerticals] = useState<string[]>([]);
+  const [gaLanguages, setGaLanguages] = useState<string[]>([]); // empty = all languages
+  const [gaMaxKeywords, setGaMaxKeywords] = useState<number>(40);
+  const [gaCustomKeywords, setGaCustomKeywords] = useState<string>('');
+  const [gaMeta, setGaMeta] = useState<GoogleAdsMeta | null>(null);
+  const [gaMetaError, setGaMetaError] = useState<string | null>(null);
+  const [gaMetaLoading, setGaMetaLoading] = useState(false);
+
   // Lazy-load AppGoblin category list when user picks AppGoblin source.
   useEffect(() => {
     if (source !== 'appgoblin') return;
@@ -297,8 +308,27 @@ function NewJob({
       .finally(() => setAgCategoriesLoading(false));
   }, [source, agCategories, appgoblinCategory]);
 
+  // Lazy-load Google Ads vertical/language metadata when that source is picked.
+  useEffect(() => {
+    if (source !== 'google_ads') return;
+    if (gaMeta !== null) return;
+    setGaMetaLoading(true);
+    setGaMetaError(null);
+    api.googleAdsMeta()
+      .then((m) => setGaMeta(m))
+      .catch((err) => setGaMetaError((err as Error).message))
+      .finally(() => setGaMetaLoading(false));
+  }, [source, gaMeta]);
+
   const toggleType = (pt: ProductType) => {
     setProductTypes((prev) => (prev.includes(pt) ? prev.filter((x) => x !== pt) : [...prev, pt]));
+  };
+
+  const toggleGaVertical = (id: string) => {
+    setGaVerticals((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+  };
+  const toggleGaLanguage = (code: string) => {
+    setGaLanguages((prev) => (prev.includes(code) ? prev.filter((x) => x !== code) : [...prev, code]));
   };
 
   // AppGoblin is mobile-only; force productType to mobile when it is selected.
@@ -334,6 +364,21 @@ function NewJob({
         return;
       }
     }
+    let googleAds: CreateJobOptions['googleAds'] = undefined;
+    if (source === 'google_ads') {
+      const custom = gaCustomKeywords
+        .split(/[\n,]+/)
+        .map((k) => k.trim())
+        .filter(Boolean);
+      googleAds = {
+        verticals: gaVerticals.length ? gaVerticals : null,
+        languages: gaLanguages.length ? gaLanguages : null,
+        maxKeywords: gaMaxKeywords > 0 ? gaMaxKeywords : null,
+        customKeywords: custom.length ? custom : null,
+        region: null,
+      };
+    }
+
     setSubmitting(true);
     try {
       await api.createJobs({
@@ -343,6 +388,7 @@ function NewJob({
         source,
         appgoblinCategory: source === 'appgoblin' ? (appgoblinCategory.trim() || null) : undefined,
         appgoblinAdNetwork: source === 'appgoblin' ? (appgoblinAdNetwork.trim() || null) : undefined,
+        googleAds,
       });
       onCreated();
     } catch (err) {
@@ -391,11 +437,22 @@ function NewJob({
             />
             <span>AppGoblin <span className="muted">(apps by category / ad-network; Mobile only)</span></span>
           </label>
+          <label className="checkbox">
+            <input
+              type="radio"
+              name="source"
+              checked={source === 'google_ads'}
+              onChange={() => handleSourceChange('google_ads')}
+            />
+            <span>Google Ads Transparency <span className="muted">(advertisers by multilingual keyword; Mobile + CPS)</span></span>
+          </label>
         </div>
         <p className="form-hint">
           Meta scrapes the Facebook Ad Library and classifies landing pages. Affplus lists CPA/CPI mobile
           offers and verifies each against the Google Play / App Store. AppGoblin discovers real apps by
-          category or by which ad-network/MMP SDK they integrate — store URLs come straight from the source.
+          category or by which ad-network/MMP SDK they integrate. Google Ads Transparency searches a huge
+          multilingual keyword bank against the Transparency Center, then classifies each advertiser's
+          destination as Mobile (app store) or CPS (website) and splits leads by HQ country.
         </p>
       </div>
 
@@ -439,6 +496,70 @@ function NewJob({
         </div>
       )}
 
+      {source === 'google_ads' && (
+        <div className="form-row">
+          <label>Google Ads discovery</label>
+          {gaMetaLoading && <div className="muted small">Loading keyword bank…</div>}
+          {gaMetaError && <div className="error" style={{ marginBottom: 6 }}>Keyword bank failed to load: {gaMetaError}</div>}
+          {gaMeta && (
+            <p className="form-hint" style={{ marginTop: 0 }}>
+              Exemplar bank: <strong>{gaMeta.stats.total.toLocaleString()}</strong> keywords across{' '}
+              <strong>{gaMeta.stats.languages}</strong> languages and <strong>{gaMeta.stats.verticals}</strong> verticals.
+              A job draws a well-spread sample (default 40). Leave verticals/languages empty to search across everything.
+            </p>
+          )}
+
+          <div className="muted small" style={{ margin: '8px 0 4px' }}>Verticals ({gaVerticals.length ? `${gaVerticals.length} selected` : 'all'})</div>
+          <div className="checkbox-row" style={{ flexWrap: 'wrap', gap: 8 }}>
+            {(gaMeta?.verticals || []).map((v) => (
+              <label key={v.id} className="checkbox" title={v.hint} style={{ marginRight: 10 }}>
+                <input type="checkbox" checked={gaVerticals.includes(v.id)} onChange={() => toggleGaVertical(v.id)} />
+                <span>{v.label}</span>
+              </label>
+            ))}
+          </div>
+
+          <div className="muted small" style={{ margin: '12px 0 4px' }}>Languages ({gaLanguages.length ? `${gaLanguages.length} selected` : 'all'})</div>
+          <div className="checkbox-row" style={{ flexWrap: 'wrap', gap: 6, maxHeight: 120, overflowY: 'auto' }}>
+            {(gaMeta?.languages || []).map((l) => (
+              <label key={l.code} className="checkbox" style={{ marginRight: 8 }}>
+                <input type="checkbox" checked={gaLanguages.includes(l.code)} onChange={() => toggleGaLanguage(l.code)} />
+                <span>{l.label} <span className="muted">{l.native}</span></span>
+              </label>
+            ))}
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: '160px 1fr', gap: 12, marginTop: 12, alignItems: 'start' }}>
+            <div>
+              <div className="muted small" style={{ marginBottom: 4 }}>Max keywords / job</div>
+              <input
+                className="input"
+                type="number"
+                min={1}
+                max={500}
+                value={gaMaxKeywords}
+                onChange={(e) => setGaMaxKeywords(Math.max(1, Math.min(500, Number(e.target.value) || 1)))}
+              />
+            </div>
+            <div>
+              <div className="muted small" style={{ marginBottom: 4 }}>Custom keywords (optional — overrides the bank)</div>
+              <textarea
+                className="input"
+                rows={2}
+                value={gaCustomKeywords}
+                onChange={(e) => setGaCustomKeywords(e.target.value)}
+                placeholder="comma or newline separated, e.g. casino, prestamo rapido, 仮想通貨"
+              />
+            </div>
+          </div>
+          <p className="form-hint">
+            Each keyword is one Transparency Center search that returns matching advertisers. More keywords = more
+            leads but a longer job. A keyword does <strong>not</strong> guarantee Mobile vs CPS — the advertiser's
+            ad destination decides that, and both CSVs are HQ-split by country.
+          </p>
+        </div>
+      )}
+
       <div className="form-row">
         <label>Countries (ISO 2-letter, comma-separated)</label>
         <input
@@ -450,7 +571,9 @@ function NewJob({
         <p className="form-hint">
           {source === 'appgoblin'
             ? 'AppGoblin returns the same apps regardless of country — the country list here is informational metadata on the CSV rows.'
-            : 'Each country is searched independently. More countries = longer job.'}
+            : source === 'google_ads'
+              ? 'Google Ads Transparency treats region as metadata, not a hard filter — the country list here tags CSV rows and seeds the informational region. Leads are split by resolved HQ country, not by this list.'
+              : 'Each country is searched independently. More countries = longer job.'}
         </p>
       </div>
 
@@ -545,14 +668,20 @@ function JobDetail({ id, onBack }: { id: string; onBack: () => void }) {
   const isActive = job.status === 'pending' || job.status === 'running';
   const latestLog = logs.length > 0 ? logs[logs.length - 1] : null;
 
-  // Pretty-print source params when present (AppGoblin only today).
+  // Pretty-print source params when present (AppGoblin + Google Ads).
   let sourceParamsDisplay: string | null = null;
   if (job.source_params) {
     try {
       const p = JSON.parse(job.source_params) as Record<string, unknown>;
       const parts: string[] = [];
+      // AppGoblin
       if (p.category) parts.push(`category=${p.category}`);
       if (p.adNetworkDomain) parts.push(`ad-network=${p.adNetworkDomain}`);
+      // Google Ads Transparency
+      if (Array.isArray(p.verticals) && p.verticals.length) parts.push(`verticals=${(p.verticals as string[]).join('/')}`);
+      if (Array.isArray(p.languages) && p.languages.length) parts.push(`languages=${(p.languages as string[]).join('/')}`);
+      if (Array.isArray(p.customKeywords) && p.customKeywords.length) parts.push(`custom keywords=${(p.customKeywords as string[]).length}`);
+      if (p.maxKeywords) parts.push(`maxKeywords=${p.maxKeywords}`);
       if (parts.length > 0) sourceParamsDisplay = parts.join(', ');
     } catch { /* ignore */ }
   }
@@ -584,7 +713,7 @@ function JobDetail({ id, onBack }: { id: string; onBack: () => void }) {
       {job.status === 'completed' && (
         <div className="cta-row">
           <a href={api.csvUrl(job.id)} className="btn primary">⬇ Download CSV</a>
-          {job.product_type === 'mobile' && (
+          {job.hq_zip_path && (
             <a href={api.hqZipUrl(job.id)} className="btn" style={{ marginLeft: 8 }}>⬇ HQ-Split ZIP</a>
           )}
         </div>

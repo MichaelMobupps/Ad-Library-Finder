@@ -38,8 +38,15 @@ Then add **secrets** in the Replit Secrets panel:
 4. Top nav → **+ New Job** → enter countries (`US, BR, IN`) → tick product type(s) → **Start Job**
 5. Watch logs stream in Job Detail view. When `completed`, download CSV from the UI or wait for the email.
 
+## Lead sources
+Besides Meta, the app also pulls from **Affplus**, **AppGoblin**, and the
+**Google Ads Transparency Center**. The Google Ads source searches a huge
+multilingual keyword bank against the Transparency Center and splits leads by
+Mobile vs CPS **and** HQ country — see `GOOGLE_ADS_INTEGRATION.md`.
+
 ## Editable config
-- `artifacts/api-server/src/keywords.ts` — curated keyword lists per product type
+- `artifacts/api-server/src/keywords.ts` — curated Meta keyword lists per product type
+- `artifacts/api-server/src/googleAdsKeywords.ts` — the multilingual Google Ads keyword exemplar bank (~2,200 keywords, 37 languages, 21 verticals)
 - `artifacts/api-server/src/classifier.ts` — known MMP tracker domains (AppsFlyer, Branch, Adjust, Singular, etc.)
 
 ## Pacing
