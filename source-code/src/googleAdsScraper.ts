@@ -249,6 +249,52 @@ function noteHardBlock(): void {
   lastHardBlockAt = Date.now();
 }
 
+/**
+ * Disambiguate "Google penalty box" from "the proxy itself is throttling" after
+ * a confirmed hard block: fire ONE GET through the same proxy at a neutral
+ * NON-Google URL. It never touches Google, so it cannot renew the penalty.
+ *  - neutral URL → 2xx/3xx  ⇒ proxy egress healthy ⇒ the 429s are GOOGLE's
+ *    penalty on this exit IP (wait it out / rotate the exit IP);
+ *  - neutral URL → 429      ⇒ the PROXY PROVIDER is rate-limiting the account
+ *    (quota/bandwidth) — the "Google" 429s may never have reached Google;
+ *  - request fails           ⇒ proxy became unreachable mid-job.
+ * No-op without a proxy (a direct-egress 429 can only be Google). Best-effort:
+ * never throws.
+ */
+async function probeEgressHealth(onLog?: LogFn): Promise<void> {
+  if (!PROXY_URL) return;
+  const url = (process.env.GOOGLE_ADS_PROXY_HEALTH_URL || 'https://example.com/').trim();
+  try {
+    const res = await fetch(url, withProxy({
+      method: 'GET',
+      headers: { 'user-agent': FETCH_HEADERS['user-agent'], accept: '*/*' },
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    }, onLog));
+    await res.text().catch(() => '');
+    if (res.status >= 200 && res.status < 400) {
+      onLog?.(
+        'warn',
+        `google-ads: egress check ${url} → ${res.status} via proxy — proxy is HEALTHY, so the 429s are GOOGLE's penalty on this exit IP. Remedy: quiet window or a different/rotating exit IP.`,
+      );
+    } else if (res.status === 429) {
+      onLog?.(
+        'error',
+        `google-ads: egress check ${url} → 429 via proxy — the PROXY PROVIDER is rate-limiting this account (quota/bandwidth/connection cap), NOT Google. Check the proxy plan/dashboard.`,
+      );
+    } else {
+      onLog?.(
+        'warn',
+        `google-ads: egress check ${url} → HTTP ${res.status} via proxy — proxy reachable but unhealthy; check the provider.`,
+      );
+    }
+  } catch (err) {
+    onLog?.(
+      'error',
+      `google-ads: egress check through the proxy FAILED (${(err as Error).message}) — the proxy went unreachable mid-job; verify credentials/whitelist/uptime with the provider.`,
+    );
+  }
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // Types
 // ───────────────────────────────────────────────────────────────────────────
@@ -832,6 +878,8 @@ export async function discoverAdvertisers(
           'no retries, no further requests. Cooldown started: new google_ads jobs will refuse to scrape ' +
           'until it passes. Wait it out (or switch the proxy exit IP) before re-running.',
       );
+      // One neutral-URL request (never Google) to tell the operator WHO 429'd.
+      await probeEgressHealth(onLog);
       break;
     }
 
@@ -850,7 +898,11 @@ export async function discoverAdvertisers(
           `aborted after ${consecutiveFailures} consecutive ${kind} at keyword ${i + 1}/${keywords.length}`,
         );
         onLog?.('error', `google-ads: ${consecutiveFailures} consecutive ${kind} — aborting discovery early`);
-        if (res.blocked) noteHardBlock();
+        if (res.blocked) {
+          noteHardBlock();
+          // One neutral-URL request (never Google) to tell the operator WHO 429'd.
+          await probeEgressHealth(onLog);
+        }
         break;
       }
     } else {

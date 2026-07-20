@@ -350,6 +350,36 @@ hours, so give it longer manually). (3) Then run ONE CPS job. If it opens with "
 wait longer or ask the proxy provider for a rotating port / second exit IP. Long-term: a
 rotating residential gateway makes this entire class of problem disappear.
 
+## Round 8 — egress-health disambiguation + LIVE proxy verdict
+Operator's 22:12 job aborted in 4 s with PENALTY BOX CONFIRMED — the Round 7 fast-fail working
+as designed (2 requests, cooldown latched). Open question: is the 429 from GOOGLE (penalty on
+the exit IP) or from the PROXY PROVIDER (account quota)? The operator's home-machine curl test
+returned `000` (no connection — provider likely source-IP-whitelists, so the test can't run
+from home).
+
+**LIVE verdict from this workspace (which has the real `GOOGLE_ADS_PROXY_URL` secret):** two
+neutral non-Google URLs through the proxy → **HTTP 200 in <1 s each**. The proxy is HEALTHY;
+credentials and tunnel work. ⇒ **The 429s are Google's penalty on exit IP 81.181.174.82,
+confirmed.** Remedy unchanged: a genuinely quiet window (8–12 h; every job attempt renews it)
+or — the durable fix — a rotating residential gateway / different exit IP from the provider.
+
+Shipped so the app answers this question by itself next time:
+1. **`probeEgressHealth()`** (`googleAdsScraper.ts`): after any CONFIRMED hard block with a
+   proxy configured, ONE GET to a neutral non-Google URL (`GOOGLE_ADS_PROXY_HEALTH_URL`,
+   default `https://example.com/`) through the same proxy. Logs one of: neutral 2xx/3xx ⇒
+   "proxy is HEALTHY → the 429s are GOOGLE's penalty"; neutral 429 ⇒ "the PROXY PROVIDER is
+   rate-limiting this account"; request fails ⇒ "proxy went unreachable mid-job". Never
+   touches Google (cannot renew the penalty); no-op without a proxy; never throws. Wired into
+   both hard-block paths (penalty-box probe + consecutive-blocks abort).
+2. **Smoke determinism fix:** the streaming smoke inherited the WORKSPACE's real
+   `GOOGLE_ADS_PROXY_URL` secret from the env (scenario F counted 3 fetches, expected 2). The
+   fixture now sets a dummy proxy URL explicitly — deterministic regardless of host env — and
+   asserts BOTH probe branches (B: neutral 200 ⇒ blames Google; F: neutral 429 ⇒ blames the
+   provider). Streaming smoke now **27/27**.
+Verification: build clean; scraper 44, csv 15, pipeline 5, keywords 28, e2e smoke 18/18,
+streaming smoke 27/27; 0 stale pending smoke rows; `.env.example` documents the knob; mirror
+synced.
+
 ## Change log
 - 2026-07-20: Investigation complete; root causes A/B/C identified and reproduced. File created.
 - 2026-07-20: Implemented Fix A/B/C + keyword widening. All offline tests green (77 total).
@@ -369,3 +399,9 @@ rotating residential gateway makes this entire class of problem disappear.
   creative calls; Affplus-style name→web-search for no-domain advertisers; breaker default 1 /
   discovery abort default 2; `?product=cps` recovery download for stored web leads. Streaming
   smoke 18/18, e2e 18/18, all self-tests green. Safe to republish.
+- 2026-07-20 (Round 8): 22:12 job = Round 7 fast-fail working as designed. LIVE proxy test from
+  the workspace (real secret): neutral URLs → 200 via proxy ⇒ proxy HEALTHY, 429s are GOOGLE's
+  penalty on the exit IP — confirmed, not provider quota. Shipped egress-health disambiguation
+  probe (auto-logs Google-vs-provider on every future hard block) + smoke determinism fix.
+  All tests green (streaming 27/27). Safe to republish. Operator: quiet window 8–12 h, then ONE
+  CPS job; durable fix = rotating residential gateway.

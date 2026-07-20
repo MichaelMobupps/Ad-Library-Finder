@@ -18,6 +18,11 @@
  *      the override product) exports the stored web leads.
  *   D. CPS makes ZERO creative-endpoint calls (domain-first mode) — the calls
  *      that flag a proxy IP simply never happen; all leads still export.
+ *   B/F also assert the egress-health disambiguation probe (one neutral-URL
+ *      request after a confirmed hard block): B's mock answers the neutral URL
+ *      200 ⇒ "proxy healthy, Google penalty"; F's answers 429 ⇒ "provider
+ *      throttling". A dummy GOOGLE_ADS_PROXY_URL is set so the probe is armed
+ *      deterministically regardless of the host env.
  *
  * Env is set BEFORE importing dist/ (module-load reads it) and dynamic import()
  * is used so the fast/no-sleep settings take effect.
@@ -34,6 +39,11 @@ process.env.GOOGLE_ADS_BREAKER_AFTER = '3'; // explicit (default is now 1) so sc
 process.env.GOOGLE_ADS_DISCOVERY_ABORT_AFTER = '5'; // explicit (default is now 2) so scenario B's count is stable
 process.env.GOOGLE_ADS_CREATIVE_LOOKUPS_PER_ADV = '2';
 process.env.GOOGLE_ADS_COOLDOWN_MS = '0'; // scenarios A–D must not trip the cooldown gate (E turns it on)
+// Dummy proxy (fetch is mocked, so nothing is ever dispatched through it). Being
+// SET — deterministically, regardless of the host env — enables the egress-health
+// disambiguation probe on hard blocks, asserted in scenarios B (healthy ⇒ Google
+// penalty) and F (429 ⇒ provider throttling).
+process.env.GOOGLE_ADS_PROXY_URL = 'http://smoke:smoke@127.0.0.1:9';
 delete process.env.ANTHROPIC_API_KEY; // name-search must gracefully skip offline
 
 const { initDb, createJob, getJob, getResults, getLogs } = await import('../dist/db.js');
@@ -125,6 +135,8 @@ const jobBRow = getJob(jobB);
 check('B: leads found before the discovery halt are saved (streamed, not lost)', resB.length === 3, `${resB.length} rows`);
 check('B: discovery aborted early (5 consecutive suggestion blocks)', suggestCalls === 6, `${suggestCalls} suggestion calls`);
 check('B: csv_path published for the partial result', !!jobBRow.csv_path, jobBRow.csv_path || '(null)');
+// Hard block + neutral URL answers 200 (the mock catch-all) ⇒ probe must blame Google.
+check('B: egress check ran and blamed GOOGLE (proxy healthy)', /proxy is HEALTHY/.test(logsFor(jobB)));
 
 // ── Scenario C: mobile job over web advertisers — reproduces "250 → 0" ───────
 console.log('\n=== C. Mobile job, web advertisers: the 0-despite-leads case ===');
@@ -199,8 +211,10 @@ createJob({
 });
 await runGoogleAdsJob(getJob(jobF));
 check('F: exactly ONE suggest attempt (no retry ladder)', suggestCalls === 1, `${suggestCalls} suggest calls`);
-check('F: only 2 requests total (warm-up + probe)', fetchCalls === 2, `${fetchCalls} fetches`);
+check('F: only 3 requests total (warm-up + probe + egress check)', fetchCalls === 3, `${fetchCalls} fetches`);
 check('F: penalty-box abort logged', /PENALTY BOX CONFIRMED/.test(logsFor(jobF)));
+// warmupStatus=429 makes the mock 429 the NEUTRAL URL too ⇒ probe must blame the provider.
+check('F: egress check ran and blamed the PROXY PROVIDER (neutral URL 429)', /PROXY PROVIDER is rate-limiting/.test(logsFor(jobF)));
 check('F: job completed fast (no grind)', getJob(jobF).status === 'completed', getJob(jobF).status);
 process.env.GOOGLE_ADS_WARMUP = '0';
 process.env.GOOGLE_ADS_MAX_RETRIES = '0';
