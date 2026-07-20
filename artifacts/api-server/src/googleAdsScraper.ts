@@ -258,6 +258,11 @@ export interface DestinationResult {
    *  challenge). Lets the pipeline trip a circuit breaker instead of grinding
    *  through retries for every remaining advertiser. */
   blocked: boolean;
+  /** True when a SearchCreatives RPC was actually issued for this advertiser
+   *  (i.e. the creative endpoint was probed). The circuit breaker counts blocks
+   *  ONLY over these — an advertiser resolved from its domain without touching
+   *  the creative endpoint is neutral and must not reset the breaker. */
+  attemptedCreativeLookup: boolean;
 }
 
 /** Shared, mutable cap on creative-detail lookups across a whole job. */
@@ -694,6 +699,17 @@ export interface DiscoverOptions {
   onLog?: LogFn;
   /** Called after each keyword so the pipeline can update job phase. */
   onProgress?: (done: number, total: number, foundSoFar: number) => void;
+  /**
+   * Streaming hook: invoked (awaited) for EACH newly-discovered unique advertiser,
+   * the moment it is found — before the next keyword is searched. The pipeline
+   * uses this to resolve + persist + flush each lead in real time, so partial
+   * results are saved continuously and a mid-scrape block/kill loses nothing.
+   * Discovery pacing naturally interleaves with the awaited work here.
+   */
+  onAdvertiser?: (adv: GoogleAdsAdvertiser) => Promise<void>;
+  /** Polled before each keyword; return true to stop discovery early (e.g. the
+   *  pipeline hit its per-job advertiser cap). */
+  shouldStop?: () => boolean;
 }
 
 /**
@@ -715,7 +731,12 @@ export async function discoverAdvertisers(
   };
   const seen = new Set<string>();
   let consecutiveFailures = 0;
-  const MAX_CONSECUTIVE_FAILURES = 5;
+  // Abort discovery after this many consecutive hard-failed keywords. Each
+  // "failure" already survived the full retry/backoff ladder, so 2 in a row
+  // means the endpoint is really refusing this IP — stop fast and let the
+  // pipeline present everything found so far (leads are streamed/saved as
+  // discovered, so an early abort loses nothing).
+  const MAX_CONSECUTIVE_FAILURES = clampInt(process.env.GOOGLE_ADS_DISCOVERY_ABORT_AFTER, 2, 1, 20);
 
   if (PROXY_URL) {
     onLog?.('info', `google-ads: outbound proxy configured (${redactProxy(PROXY_URL)})`);
@@ -728,6 +749,10 @@ export async function discoverAdvertisers(
   await warmUpSession(onLog);
 
   for (let i = 0; i < keywords.length; i++) {
+    if (opts.shouldStop?.()) {
+      onLog?.('info', `google-ads: discovery stopped early by caller at keyword ${i + 1}/${keywords.length}`);
+      break;
+    }
     const kw = keywords[i];
     const payload: Record<string, unknown> = { '1': kw, '2': SUGGEST_LIMIT, '3': SUGGEST_LIMIT };
     const res = await rpcPost('SearchService/SearchSuggestions', payload, `suggest "${kw}"`, onLog);
@@ -763,6 +788,16 @@ export async function discoverAdvertisers(
       seen.add(key);
       out.advertisers.push(adv);
       added++;
+      // Stream each NEW advertiser to the caller immediately so it can resolve +
+      // persist + flush in real time (partial results survive a later block/kill).
+      if (opts.onAdvertiser) {
+        try {
+          await opts.onAdvertiser(adv);
+        } catch (err) {
+          onLog?.('warn', `google-ads: onAdvertiser hook threw for "${adv.name}" (non-fatal): ${(err as Error).message}`);
+        }
+      }
+      if (opts.shouldStop?.()) break;
     }
     if (added > 0) onLog?.('debug', `google-ads: "${kw}" → +${added} advertisers (total ${out.advertisers.length})`);
     opts.onProgress?.(i + 1, keywords.length, out.advertisers.length);
@@ -813,6 +848,7 @@ export async function resolveAdvertiserDestination(
   let creativesSeen = 0;
   let format: DestinationResult['format'] = null;
   let sawBlock = false;
+  let attemptedCreativeLookup = false;
 
   // Only spend a SearchCreatives round-trip while the per-job creative-lookup
   // budget still has room — once it is exhausted every creative would be read
@@ -824,6 +860,7 @@ export async function resolveAdvertiserDestination(
     opts.lookupBudget &&
     opts.lookupBudget.remaining() > 0
   ) {
+    attemptedCreativeLookup = true;
     const creativesPayload: Record<string, unknown> = {
       '2': CREATIVES_LIMIT,
       '3': { '12': { '1': '', '2': true }, '13': { '1': [adv.advertiser_id] } },
@@ -864,7 +901,7 @@ export async function resolveAdvertiserDestination(
         const dest = extractDestinationUrl(dres.json);
         if (dest) {
           format = c.format;
-          return { landingUrl: dest, format, creativesSeen, note: `creative:${c.format || 'unknown'}`, blocked: sawBlock };
+          return { landingUrl: dest, format, creativesSeen, note: `creative:${c.format || 'unknown'}`, blocked: sawBlock, attemptedCreativeLookup };
         }
       }
     }
@@ -872,10 +909,10 @@ export async function resolveAdvertiserDestination(
 
   // Fallback: the verified advertiser domain.
   if (adv.domain && looksLikeDomain(adv.domain)) {
-    return { landingUrl: `https://${adv.domain}`, format, creativesSeen, note: 'advertiser-domain', blocked: sawBlock };
+    return { landingUrl: `https://${adv.domain}`, format, creativesSeen, note: 'advertiser-domain', blocked: sawBlock, attemptedCreativeLookup };
   }
 
-  return { landingUrl: null, format, creativesSeen, note: 'no-destination', blocked: sawBlock };
+  return { landingUrl: null, format, creativesSeen, note: 'no-destination', blocked: sawBlock, attemptedCreativeLookup };
 }
 
 // ───────────────────────────────────────────────────────────────────────────
