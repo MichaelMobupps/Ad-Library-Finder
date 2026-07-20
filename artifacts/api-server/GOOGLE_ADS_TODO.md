@@ -180,9 +180,49 @@ Auto-fixes applied this round:
 - Consolidated pipeline smoke (blocked creatives, 2 back-to-back jobs): both completed in ~4s
   with 24-row CSVs; circuit breaker + incremental flush + per-job warm-up all confirmed.
 
+## Round 4 — proxy egress hook (the actual fix for a hard-blocked deploy IP)
+The operator's deployment (`leadfinder.mobupps.net`) hit the persistently-hostile-IP case
+the log predicted: two live jobs (`job_OCL7hjSZMS` mobile, `job_S810NE4qW1` cps) returned
+empty CSVs because **discovery itself was 429'd** — the warm-up GET got `→ 429, 0 cookie(s)`
+and every SearchSuggestions call blocked, so 0 advertisers were discovered (an earlier run on
+the same IP got 623 when Google briefly allowed it). When discovery yields 0, the parser /
+circuit-breaker / incremental-flush fixes never run — the CSV is empty by construction. No
+in-code change defeats a hard IP block (a real browser from the same IP is blocked too — proven
+in Round 1). The one remaining lever, listed but **never actually implemented** before, was the
+outbound-proxy hook. Implemented now:
+1. **`GOOGLE_ADS_PROXY_URL`** (scraper-scoped): routes ONLY the Transparency Center requests
+   (warm-up GET + all RPCs) through an undici `ProxyAgent` dispatcher, via a `withProxy()`
+   wrapper on both `fetch` call sites. The rest of the server (OAuth, googleapis, Anthropic)
+   keeps direct egress — so the residential/mobile proxy is spent only where it's needed.
+   Supports http(s):// proxies (CONNECT tunnel; SOCKS not supported) with `user:pass@`; credentials are redacted in logs
+   (`routing via proxy http://***@host:port`). Bad URL ⇒ warn + direct egress, never crashes.
+   Unset ⇒ byte-for-byte unchanged behaviour.
+2. Added `undici@^6.21.0` to api-server deps (installed 6.27.0; it's the same library that
+   already backs Node 20's global fetch, so fully compatible). `pnpm install` done.
+3. Discovery now logs proxy status at job start (configured+redacted, or a hint to set the var).
+4. **Verified**: build clean (exit 0); pointing the var at a dead proxy port makes the warm-up
+   fail to reach Google at all (`fetch failed` vs an HTTP status) — proving traffic is routed
+   through the dispatcher, not direct. Offline self-tests still green (scraper 44, pipeline 5,
+   keywords 28). `.env.example` documents the knob; `source-code/` mirror synced.
+
+**Operator step to get leads:** set `GOOGLE_ADS_PROXY_URL` to your residential/mobile proxy
+gateway on the deployment, redeploy/restart so `dist/` reloads, then run a CPS job. For rotating
+pools, point it at the provider's gateway (it rotates the exit IP per connection/session).
+
+**Still-open secondary (NOT the cause of the empty CSVs, deferred):** in a job where discovery
+succeeds but the *creative* endpoint blocks, the resolve-phase circuit breaker's
+`consecutiveBlockedLookups` counter is reset by domain-resolved advertisers interleaved between
+blocked ones, so on a mixed stream it can under-trip and grind longer than intended (observed in
+the pre-restart `job_OWk_6De02k`: 623 advertisers, creative lookups 429'ing for ~13 min while
+web-domain leads resolved fine). A healthy proxy makes creative lookups succeed, so this is now
+lower-impact; worth tightening the breaker to count creative-endpoint outcomes only.
+
 ## Change log
 - 2026-07-20: Investigation complete; root causes A/B/C identified and reproduced. File created.
 - 2026-07-20: Implemented Fix A/B/C + keyword widening. All offline tests green (77 total).
 - 2026-07-20: Offline end-to-end proof (real payload → 3 CPS rows). Godlike audit clean.
 - 2026-07-20: Live smoke test blocked — sandbox IP 429 for 2h straight. Deferred to healthy IP.
   Build + dist current; fix ready to deploy.
+- 2026-07-20 (Round 4): Deploy IP confirmed hard-blocked at discovery (empty CSVs). Implemented
+  scraper-scoped outbound-proxy hook (`GOOGLE_ADS_PROXY_URL`, undici ProxyAgent); build clean,
+  routing verified, self-tests green, docs + mirror synced. Operator to set the proxy var + redeploy.

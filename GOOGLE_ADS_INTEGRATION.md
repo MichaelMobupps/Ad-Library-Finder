@@ -66,6 +66,13 @@ Meta / Affplus / AppGoblin behavior is unchanged.
 
 See `.env.example` for the full list (`GOOGLE_ADS_*`). Nothing is required to run.
 
+**If discovery returns 0 advertisers with `429` on every request (warm-up GET included),
+the host IP is hard-blocked by Google** — a datacenter/deploy IP in Google's penalty box.
+No pacing/backoff/browser defeats this (a real browser from the same IP is blocked too).
+Set **`GOOGLE_ADS_PROXY_URL`** to a residential/mobile proxy gateway to egress the scraper
+(only) from an un-flagged IP; the rest of the server keeps direct egress. Credentials in the
+URL are redacted in logs. For rotating pools, point it at the provider's gateway endpoint.
+
 ## Testing
 
 Every module ships offline self-tests (no network, no LLM key):
