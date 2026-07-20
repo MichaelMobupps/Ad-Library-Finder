@@ -92,6 +92,97 @@ IP the pipeline now yields rows.
 - `GOOGLE_ADS_MAX_RETRIES` (3), `GOOGLE_ADS_BACKOFF_BASE_MS` (4000), `GOOGLE_ADS_BACKOFF_MAX_MS` (30000).
 - `GOOGLE_ADS_WARMUP` (default on; set `0` to disable homepage cookie warm-up).
 
+## Live smoke test — BLOCKED by environment (not by the code)
+Polled this sandbox IP for a cooldown across two windows (~37 min, then a full 2 h:
+12:23→14:19 UTC) — it returned HTTP 429 on **every** probe. The IP is in a persistent
+Google penalty because the diagnosis phase sent many rapid requests from it. A live scrape
+cannot run from this IP right now. This is separate from the production deploy IP.
+
+**Status of the live test:** deferred to a healthy IP. The offline end-to-end proof (real
+captured payload → 3 CPS rows) already exercises the exact same code path end to end, so the
+fix is verified; only the network egress is unavailable here.
+
+## To activate the fix (deploy step for the operator)
+1. Redeploy on Replit (the `.replit` build runs `pnpm install:playwright && pnpm build`), OR
+   locally restart the api-server so it loads the rebuilt `dist/` (current dev server still
+   holds the pre-fix code in memory).
+2. Run a google_ads CPS job from a healthy/less-flagged IP (production egress, not this
+   poisoned sandbox). It will now yield rows.
+3. If a deploy IP is *persistently* 429'd, set a residential/less-flagged egress (proxy) —
+   no in-code change defeats a hard IP block from the same IP (a real browser is blocked too).
+
+## Round 2 (post-live-run) — circuit breaker + incremental CSV
+The operator's live run on the deployment PROVED the discovery fix: **623 unique advertisers
+from 40 keywords** (warm-up cookie → clean 200s for 38 keywords before the IP got flagged).
+But the resolve phase then ground through blocked SearchCreatives calls (~22 s of retries ×
+623 advertisers ≈ hours) writing nothing. Implemented, per operator request:
+1. **Circuit breaker** (`googleAdsPipeline.ts`): after 3 consecutive advertisers whose
+   creative lookups were soft-blocked, stop ALL further creative lookups for the job and
+   resolve the remaining advertisers from their verified domains only (instant, no network).
+   `resolveAdvertiserDestination` now reports `blocked` and accepts `skipCreativeLookups`.
+2. **Incremental CSV flush**: the CSV is (re)written every 25 inserted leads and at the
+   circuit-breaker trip, so the file exists and grows from the first lead — a blocked or
+   killed job still leaves everything found so far in "Download CSV".
+3. Mobile jobs that find only web leads now log an explicit hint (store URLs need creative
+   lookups; re-run as CPS to export the web leads).
+Verified offline by running the real `runGoogleAdsJob` against a temp DB with a mock that
+429s all creative calls: 60 advertisers → breaker tripped after 3 → job completed in 4.4 s
+with a 40-row CSV (previously: hours + empty CSV).
+
+## Round 3 — godlike audit + blast radius + smoke + auto-fix
+Full self-test surface (every module's `run*Tests`): all green EXCEPT `appgoblinDecoder`
+(3 pass / 2 fail) — **pre-existing and unrelated** (file untouched since 14:07, imports
+nothing from the changed modules, different pipeline). Left as-is; flag to operator.
+
+Whole api-server typecheck: clean (exit 0) → no type-level blast-radius breakage; nothing
+constructs `DestinationResult` without the new `blocked` field or misuses changed signatures.
+
+Auto-fixes applied this round:
+1. **Per-job session reset** (`googleAdsPipeline.runGoogleAdsJob` → `resetGoogleAdsSession()`):
+   the `warmedUp` latch previously stayed true for the life of the server, so only the FIRST
+   job warmed cookies and each job inherited the prior job's ratcheted `throttleFactor`. Now
+   every job starts with fresh cookies (re-warmed) and a baseline throttle.
+2. **Atomic CSV write** (`csv.buildCsv`): now that the Google Ads pipeline rebuilds the CSV
+   repeatedly mid-job and the download route may serve it any moment, switched to
+   write-temp-then-rename so a concurrent reader never sees a truncated file. Proven with a
+   race test (600 concurrent reads over 300 rewrites → 0 partial/corrupt, 0 stray temp files).
+   Transparent to all other pipelines that call buildCsv.
+
+## Blast-radius findings (Explore sweep) + dispositions
+1. **[FIXED] Cross-job scraper module state** (`warmedUp`/`cookieJar`/`throttleFactor` persisted
+   process-wide; only job 1 ever warmed up). → `resetGoogleAdsSession()` now called at the top
+   of `runGoogleAdsJob`. Verified: warm-up GET fires for every job (2/2 in a back-to-back test).
+2. **[INTENDED, safe] `job_results.country` now carries advertiser HQ region** for named
+   advertisers → CSVs can contain mixed ISO2 codes. HQ bucketing uses a *separately resolved*
+   HQ (hqSplit/hqSplitWeb), NOT this column, and it stays a valid ISO2, so the Email-Prospector
+   ingest contract holds. No consumer assumes a uniform job country. Documented, no code change.
+3. **[known, harmless] `parseCreativesResponse.nextToken` is dead output** — no creative
+   pagination exists (resolver reads only the first page). Left as-is (used by self-tests);
+   wiring pagination would be a feature, not a fix.
+4. **[FIXED] Doc/env drift** — `.env.example` delay default corrected 600→1500 and the new
+   session/retry knobs documented (WARMUP, MAX_RETRIES, BACKOFF_BASE/MAX, AUTHUSER);
+   GOOGLE_ADS_INTEGRATION.md test count 37→44 and keyword figure ~2,200→~2,650; README figure
+   updated. Synced `source-code/` mirror via `scripts/sync-source-code.sh`.
+5. **[FIXED, defensive] Atomic CSV write** — see Round 3; closes the residual "future reader of
+   a mid-job file sees a truncated CSV" risk the sweep noted (today's download route only serves
+   after completion, so it was never actually exposed).
+- **No hard breakages found.** Whole api-server typecheck clean; dashboard phase strings and
+  vertical/language metadata shapes unchanged; no external `DestinationResult` literals.
+
+### Out of scope (pre-existing, unrelated)
+- `appgoblinDecoder` self-tests: 3 pass / 2 fail. Untouched file, no dependency on the changed
+  modules, separate pipeline. NOT introduced by this work — flagged for the operator.
+
+## Final verification (all green)
+- Whole api-server build: clean (exit 0). Every module's self-tests pass except the pre-existing
+  appgoblinDecoder. Google Ads: keywords 28, scraper 44, pipeline 5.
+- Atomic-write race test: 600 concurrent reads / 300 rewrites → 0 partial, 0 stray temp files.
+- Consolidated pipeline smoke (blocked creatives, 2 back-to-back jobs): both completed in ~4s
+  with 24-row CSVs; circuit breaker + incremental flush + per-job warm-up all confirmed.
+
 ## Change log
 - 2026-07-20: Investigation complete; root causes A/B/C identified and reproduced. File created.
 - 2026-07-20: Implemented Fix A/B/C + keyword widening. All offline tests green (77 total).
+- 2026-07-20: Offline end-to-end proof (real payload → 3 CPS rows). Godlike audit clean.
+- 2026-07-20: Live smoke test blocked — sandbox IP 429 for 2h straight. Deferred to healthy IP.
+  Build + dist current; fix ready to deploy.

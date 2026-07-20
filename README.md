@@ -46,7 +46,7 @@ Mobile vs CPS **and** HQ country — see `GOOGLE_ADS_INTEGRATION.md`.
 
 ## Editable config
 - `artifacts/api-server/src/keywords.ts` — curated Meta keyword lists per product type
-- `artifacts/api-server/src/googleAdsKeywords.ts` — the multilingual Google Ads keyword exemplar bank (~2,200 keywords, 37 languages, 21 verticals)
+- `artifacts/api-server/src/googleAdsKeywords.ts` — the multilingual Google Ads keyword exemplar bank (~2,650 keywords, 37 languages, 21 verticals)
 - `artifacts/api-server/src/classifier.ts` — known MMP tracker domains (AppsFlyer, Branch, Adjust, Singular, etc.)
 
 ## Pacing

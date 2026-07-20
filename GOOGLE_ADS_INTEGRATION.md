@@ -23,7 +23,7 @@ find a lot of leads.
 
 | File | Role |
 |------|------|
-| `artifacts/api-server/src/googleAdsKeywords.ts` | **The exemplar bank.** ~2,200 deduped keywords across **37 languages / 8 scripts** and **21 verticals** (iGaming, betting, loans, credit, insurance, crypto, forex, e-commerce, dating, travel, health, beauty, SaaS/VPN, real-estate, auto, education/jobs, streaming, telecom, legal, food + CTAs). Deterministic, well-spread sampler `keywordsForJob({verticals, languages, limit})`. |
+| `artifacts/api-server/src/googleAdsKeywords.ts` | **The exemplar bank.** ~2,650 deduped keywords across **37 languages / 8 scripts** and **21 verticals** (iGaming, betting, loans, credit, insurance, crypto, forex, e-commerce, dating, travel, health, beauty, SaaS/VPN, real-estate, auto, education/jobs, streaming, telecom, legal, food + CTAs). Deterministic, well-spread sampler `keywordsForJob({verticals, languages, limit})`. |
 | `artifacts/api-server/src/googleAdsScraper.ts` | Reverse-engineered RPC client (`SearchSuggestions` → advertisers, `SearchCreatives` → creatives, `GetCreativeById` → destination). No browser. Strips the `)]}'` anti-hijack prefix, parses positional payloads defensively (documented key first, then recursive scan), unwraps `googleadservices` click wrappers, and **degrades gracefully** on 403/429/challenge (empty + `blocked` flag, never throws). |
 | `artifacts/api-server/src/googleAdsPipeline.ts` | Orchestrator: keywords → discover advertisers → resolve each destination → classify (**regex only, no LLM**) → CSV → HQ split → notify. |
 | `artifacts/api-server/src/hqSplitWeb.ts` | HQ bucketing for **web/CPS** leads: ccTLD → script → LLM (cheapest first, budgeted, cached). One `.xlsx` per HQ country in a `.zip`, mirroring the mobile split. |
@@ -74,7 +74,7 @@ Every module ships offline self-tests (no network, no LLM key):
 cd artifacts/api-server
 pnpm build
 node dist/googleAdsKeywords.js     # 28 tests — bank size, multi-script, sampler
-node dist/googleAdsScraper.js      # 37 tests — parsers, unwrapping, budgets
+node dist/googleAdsScraper.js      # 44 tests — parsers, unwrapping, budgets, current+legacy shapes
 node dist/googleAdsPipeline.js     #  5 tests — classifier mapping
 node dist/hqSplitWeb.js            #  4 tests — ccTLD/script HQ short-circuits
 node fixtures/google-ads-smoke.mjs # 18 checks — full DB→CSV→HQ-split chain + a

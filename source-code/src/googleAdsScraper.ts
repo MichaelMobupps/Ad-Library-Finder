@@ -36,10 +36,22 @@ const BASE = (process.env.GOOGLE_ADS_BASE || 'https://adstransparency.google.com
 const AUTHUSER = process.env.GOOGLE_ADS_AUTHUSER ?? '0';
 const SUGGEST_LIMIT = clampInt(process.env.GOOGLE_ADS_SUGGEST_LIMIT, 10, 1, 30);
 const CREATIVES_LIMIT = clampInt(process.env.GOOGLE_ADS_CREATIVES_LIMIT, 5, 1, 40);
-const FETCH_DELAY_MS = clampInt(process.env.GOOGLE_ADS_FETCH_DELAY_MS, 600, 0, 10_000);
+// Base delay between requests. Google flags fast bursts from one IP, so this is
+// deliberately generous and is throttled UP adaptively after any 429/403.
+const FETCH_DELAY_MS = clampInt(process.env.GOOGLE_ADS_FETCH_DELAY_MS, 1_500, 0, 30_000);
 const TIMEOUT_MS = clampInt(process.env.GOOGLE_ADS_TIMEOUT_MS, 20_000, 2_000, 60_000);
 const CREATIVE_LOOKUPS_PER_ADV = clampInt(process.env.GOOGLE_ADS_CREATIVE_LOOKUPS_PER_ADV, 2, 0, 10);
 const SEND_REGION = process.env.GOOGLE_ADS_SEND_REGION === '1';
+// On a soft block (429/403/challenge) we retry a few times with exponential
+// backoff before giving up on that request. A transient rate-limit window
+// usually clears within one or two backoffs; a hard IP block will exhaust them
+// and the caller degrades as before.
+const MAX_RETRIES = clampInt(process.env.GOOGLE_ADS_MAX_RETRIES, 3, 0, 8);
+const BACKOFF_BASE_MS = clampInt(process.env.GOOGLE_ADS_BACKOFF_BASE_MS, 4_000, 250, 60_000);
+const BACKOFF_MAX_MS = clampInt(process.env.GOOGLE_ADS_BACKOFF_MAX_MS, 30_000, 1_000, 120_000);
+// Warm a cookie session (GET the homepage once) so RPC calls carry Google's
+// consent/NID cookies like a real visit — raises the flagging threshold.
+const WARMUP = process.env.GOOGLE_ADS_WARMUP !== '0';
 
 function clampInt(v: string | undefined, def: number, min: number, max: number): number {
   const n = Number(v);
@@ -61,6 +73,88 @@ const FETCH_HEADERS: Record<string, string> = {
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 export type LogFn = (level: 'info' | 'warn' | 'error' | 'debug', msg: string) => void;
+
+// ───────────────────────────────────────────────────────────────────────────
+// Session state: a lightweight cookie jar + adaptive throttle. Both are module
+// scoped and shared across a job's requests so the client behaves like one
+// continuous visit (better reputation) and slows itself down once Google starts
+// pushing back.
+// ───────────────────────────────────────────────────────────────────────────
+
+const cookieJar = new Map<string, string>();
+let warmedUp = false;
+/** Multiplied into the inter-request delay; ratchets up after each block. */
+let throttleFactor = 1;
+
+function cookieHeader(): string {
+  return Array.from(cookieJar.entries())
+    .map(([k, v]) => `${k}=${v}`)
+    .join('; ');
+}
+
+/** Merge a response's Set-Cookie(s) into the jar (name=value only). */
+function absorbSetCookie(res: Response): void {
+  try {
+    const getter = (res.headers as unknown as { getSetCookie?: () => string[] }).getSetCookie;
+    const cookies = typeof getter === 'function' ? getter.call(res.headers) : [];
+    for (const c of cookies) {
+      const first = c.split(';', 1)[0];
+      const eq = first.indexOf('=');
+      if (eq <= 0) continue;
+      const name = first.slice(0, eq).trim();
+      const value = first.slice(eq + 1).trim();
+      if (name) cookieJar.set(name, value);
+    }
+  } catch {
+    /* headers.getSetCookie unsupported — cookies are a nice-to-have, skip */
+  }
+}
+
+function baseHeaders(withCookie: boolean): Record<string, string> {
+  const h: Record<string, string> = { ...FETCH_HEADERS };
+  if (withCookie) {
+    const ck = cookieHeader();
+    if (ck) h['cookie'] = ck;
+  }
+  return h;
+}
+
+/**
+ * GET the Transparency Center homepage once to collect consent/NID cookies so
+ * subsequent RPC calls look like they came from a real page visit. Best-effort:
+ * any failure just means we proceed cookieless (still works from a fresh IP).
+ */
+export async function warmUpSession(onLog?: LogFn): Promise<void> {
+  if (warmedUp || !WARMUP) {
+    warmedUp = true;
+    return;
+  }
+  warmedUp = true;
+  try {
+    const res = await fetch(`${BASE}/?region=anywhere`, {
+      method: 'GET',
+      headers: {
+        'user-agent': FETCH_HEADERS['user-agent'],
+        accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'accept-language': FETCH_HEADERS['accept-language'],
+      },
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    });
+    absorbSetCookie(res);
+    // Drain body so the socket is released promptly.
+    await res.text().catch(() => '');
+    onLog?.('debug', `google-ads: warm-up GET → ${res.status}, ${cookieJar.size} cookie(s)`);
+  } catch (err) {
+    onLog?.('debug', `google-ads: warm-up skipped (${(err as Error).message})`);
+  }
+}
+
+/** Reset session state — used by tests and any caller that wants a clean slate. */
+export function resetGoogleAdsSession(): void {
+  cookieJar.clear();
+  warmedUp = false;
+  throttleFactor = 1;
+}
 
 // ───────────────────────────────────────────────────────────────────────────
 // Types
@@ -96,6 +190,10 @@ export interface DestinationResult {
   format: 'text' | 'image' | 'video' | null;
   creativesSeen: number;
   note: string;
+  /** True when the creative RPCs for this advertiser were soft-blocked (429/403/
+   *  challenge). Lets the pipeline trip a circuit breaker instead of grinding
+   *  through retries for every remaining advertiser. */
+  blocked: boolean;
 }
 
 /** Shared, mutable cap on creative-detail lookups across a whole job. */
@@ -247,52 +345,89 @@ export function firstResultArray(json: unknown): unknown[] {
 }
 
 /**
- * Parse a SearchSuggestions response into advertisers. Documented shape:
- *   { "1": [ { "1": advertiserId, "12": name, … }, … ] }
- * Falls back to a recursive scan per item when the numeric keys have drifted.
+ * Parse a SearchSuggestions response into leads. The CURRENT (2026) response
+ * shape returns a mix of two entry kinds inside the top-level "1" array:
+ *
+ *   advertiser:  { "1": { "1": name, "2": "AR…id", "3": "US"(region), "5": true } }
+ *   domain:      { "2": { "1": "example.com" } }
+ *
+ * Both are real leads. An advertiser is a named account (id + name + region);
+ * a domain suggestion is a verified advertiser WEBSITE that matched the keyword
+ * — which for a CPS pull is exactly the lead we want, so we emit it as a
+ * domain-only advertiser (no id, name = domain, domain set) and let the resolver
+ * turn it straight into https://domain.
+ *
+ * Robust to field drift: we read the documented positions first, then fall back
+ * to a recursive scan (AR-id anywhere, region = the first positionally-nested
+ * ISO2, first registrable host = domain). Older flat shapes still parse.
  */
 export function parseAdvertiserSuggestions(json: unknown, keyword: string): GoogleAdsAdvertiser[] {
   const arr = firstResultArray(json);
   const out: GoogleAdsAdvertiser[] = [];
   const seen = new Set<string>();
 
+  const emit = (adv: GoogleAdsAdvertiser) => {
+    const key = adv.advertiser_id || (adv.domain ? `d:${adv.domain}` : adv.name.toLowerCase());
+    if (!key) return;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(adv);
+  };
+
   for (const raw of arr) {
     const item = asObj(raw);
     if (!item) continue;
 
-    // id: documented key "1", else deep scan for AR-id.
-    let id = str(item['1']).trim();
+    // Nested advertiser object lives under key "1"; domain object under "2".
+    const advObj = asObj(item['1']);
+    const domObj = asObj(item['2']);
     const strings = collectStrings(item);
-    if (!looksLikeAdvertiserId(id)) {
+
+    // ── Advertiser id: nested "2", else any AR-id in the subtree. ──
+    let id = '';
+    if (advObj && looksLikeAdvertiserId(str(advObj['2']))) id = str(advObj['2']).trim();
+    if (!id) {
       const found = strings.find(looksLikeAdvertiserId);
       if (found) id = found;
     }
 
-    // name: documented key "12", else "2", else the longest human-ish string.
-    let name = str(item['12']).trim() || str(item['2']).trim();
-    if (!name) {
-      name =
-        strings
-          .filter((s) => s !== id && !looksLikeAdvertiserId(s) && !looksLikeDomain(s) && s.length >= 2 && s.length <= 120)
-          .sort((a, b) => b.length - a.length)[0] || '';
+    if (id) {
+      // Named advertiser account.
+      let name = advObj ? str(advObj['1']).trim() : '';
+      if (!name) name = str(item['12']).trim();
+      if (!name) {
+        name =
+          strings
+            .filter((s) => s !== id && !looksLikeAdvertiserId(s) && !looksLikeDomain(s) && s.length >= 2 && s.length <= 120)
+            .sort((a, b) => b.length - a.length)[0] || '';
+      }
+      // Region is now positionally reliable: advertiser["3"] is an ISO2 country.
+      let region: string | null = null;
+      const r = advObj ? str(advObj['3']).trim().toUpperCase() : '';
+      if (isCountryCode(r)) region = r;
+      const domain = strings.map((s) => (looksLikeDomain(s) ? s.toLowerCase() : '')).find(Boolean) || null;
+      emit({ advertiser_id: id, name, domain, region, matchedKeyword: keyword });
+      continue;
     }
 
-    const domain = strings.map((s) => (looksLikeDomain(s) ? s.toLowerCase() : '')).find(Boolean) || null;
-    // NOTE: we deliberately do NOT infer the advertiser region from a loose
-    // deep-scan for a 2-letter ISO code — far too many non-region tokens
-    // (language codes DE/IT/NO/IN, literals AR/CO) collide with country codes,
-    // and this only feeds the informational `country` CSV column anyway (HQ
-    // bucketing uses the RESOLVED HQ, not this field). Left null on purpose; the
-    // pipeline falls back to the job's country. `isCountryCode` is retained as a
-    // helper for any future, positionally-verified region field.
-    const region = null;
+    // ── Domain-only suggestion → website lead. ──
+    let domain = '';
+    if (domObj && looksLikeDomain(str(domObj['1']))) domain = str(domObj['1']).trim().toLowerCase();
+    if (!domain) {
+      const found = strings.find((s) => looksLikeDomain(s));
+      if (found) domain = found.toLowerCase();
+    }
+    if (domain) {
+      emit({ advertiser_id: '', name: domain, domain, region: null, matchedKeyword: keyword });
+      continue;
+    }
 
-    if (!id && !name) continue;
-    const key = id || name.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-
-    out.push({ advertiser_id: id, name, domain, region, matchedKeyword: keyword });
+    // ── Last resort: a bare human-ish name with no id/domain (rare). ──
+    const name =
+      strings
+        .filter((s) => !looksLikeAdvertiserId(s) && !looksLikeDomain(s) && s.length >= 2 && s.length <= 120)
+        .sort((a, b) => b.length - a.length)[0] || '';
+    if (name) emit({ advertiser_id: '', name, domain: null, region: null, matchedKeyword: keyword });
   }
   return out;
 }
@@ -327,12 +462,16 @@ export function parseCreativesResponse(json: unknown): {
       if (found) advertiserId = found;
     }
     if (!creativeId) continue;
-    const fmtRaw = item['8'];
+    // Format code: current shape uses key "4"; older payloads used "8". Try both.
+    const fmtRaw = item['4'] ?? item['8'];
     const format = FORMAT_MAP[String(fmtRaw)] ?? null;
     creatives.push({ advertiser_id: advertiserId, creative_id: creativeId, format });
   }
+  // Next-page token: top-level "2" (older) or "3" (current) if it's an opaque string.
   const obj = asObj(json);
-  const nextToken = obj && typeof obj['2'] === 'string' && obj['2'] ? (obj['2'] as string) : null;
+  const tok2 = obj && typeof obj['2'] === 'string' ? (obj['2'] as string) : '';
+  const tok3 = obj && typeof obj['3'] === 'string' ? (obj['3'] as string) : '';
+  const nextToken = tok2 || tok3 || null;
   return { creatives, nextToken };
 }
 
@@ -388,6 +527,57 @@ interface RpcOutcome {
   error: string | null;
 }
 
+/** One physical RPC attempt (no retry). Separated so the retry loop stays clean. */
+async function rpcPostOnce(
+  url: string,
+  body: string,
+  label: string,
+  onLog?: LogFn,
+): Promise<RpcOutcome> {
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: baseHeaders(true),
+      body,
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    });
+    absorbSetCookie(res);
+    if (res.status === 429 || res.status === 403) {
+      // Drain so the connection is reusable.
+      await res.text().catch(() => '');
+      return { json: null, status: res.status, blocked: true, error: `HTTP ${res.status}` };
+    }
+    if (!res.ok) {
+      await res.text().catch(() => '');
+      onLog?.('warn', `google-ads: HTTP ${res.status} on ${label}`);
+      return { json: null, status: res.status, blocked: false, error: `HTTP ${res.status}` };
+    }
+    const text = await res.text();
+    const json = parseRpcJson(text);
+    if (json === null) {
+      // A 200 with unparseable body is almost always an HTML interstitial/challenge
+      // (e.g. the google.com/sorry CAPTCHA) — treat as a soft block so we back off.
+      return { json: null, status: res.status, blocked: true, error: 'unparseable body' };
+    }
+    return { json, status: res.status, blocked: false, error: null };
+  } catch (err) {
+    return { json: null, status: 0, blocked: false, error: (err as Error).message };
+  }
+}
+
+function backoffMs(attempt: number): number {
+  const raw = BACKOFF_BASE_MS * Math.pow(2, attempt);
+  const capped = Math.min(BACKOFF_MAX_MS, raw);
+  // Deterministic jitter in [0.5,1.0)*capped so retries de-synchronise without Math.random.
+  return Math.floor(capped * (0.5 + 0.5 * pseudoJitter(attempt + 1)));
+}
+
+/**
+ * POST an RPC with a shared cookie session and exponential-backoff retry on soft
+ * blocks (429/403/challenge). Never throws — returns the last outcome. A block
+ * ratchets the module throttle so the NEXT request (and this one's retries) wait
+ * longer, which is the single most effective way to get un-flagged mid-job.
+ */
 async function rpcPost(
   method: string,
   payload: Record<string, unknown>,
@@ -396,34 +586,39 @@ async function rpcPost(
 ): Promise<RpcOutcome> {
   const url = `${BASE}/anji/_/rpc/${method}?authuser=${encodeURIComponent(AUTHUSER)}`;
   const body = new URLSearchParams({ 'f.req': JSON.stringify(payload) }).toString();
-  try {
-    onLog?.('debug', `google-ads rpc ${label} → ${method}`);
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: FETCH_HEADERS,
-      body,
-      signal: AbortSignal.timeout(TIMEOUT_MS),
-    });
-    if (res.status === 429 || res.status === 403) {
-      onLog?.('warn', `google-ads: HTTP ${res.status} on ${label} — blocked/rate-limited (TLS fingerprint or geo)`);
-      return { json: null, status: res.status, blocked: true, error: `HTTP ${res.status}` };
+  onLog?.('debug', `google-ads rpc ${label} → ${method}`);
+
+  let last: RpcOutcome = { json: null, status: 0, blocked: false, error: 'no attempt' };
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    last = await rpcPostOnce(url, body, label, onLog);
+    if (last.json) {
+      // A clean success gently relaxes the throttle back toward baseline.
+      if (throttleFactor > 1) throttleFactor = Math.max(1, throttleFactor - 0.5);
+      return last;
     }
-    if (!res.ok) {
-      onLog?.('warn', `google-ads: HTTP ${res.status} on ${label}`);
-      return { json: null, status: res.status, blocked: false, error: `HTTP ${res.status}` };
+    // Non-block transport errors (DNS/refused/timeout) or 5xx: one quick retry, no ratchet.
+    const retriable = last.blocked || last.status === 0 || last.status >= 500;
+    if (!retriable || attempt === MAX_RETRIES) break;
+    if (last.blocked) {
+      throttleFactor = Math.min(8, throttleFactor + 1); // slow everything down
+      const wait = backoffMs(attempt);
+      onLog?.(
+        'warn',
+        `google-ads: soft block on ${label} (${last.error}) — backoff ${Math.round(wait / 1000)}s, retry ${attempt + 1}/${MAX_RETRIES}`,
+      );
+      await sleep(wait);
+    } else {
+      const wait = Math.min(BACKOFF_MAX_MS, BACKOFF_BASE_MS);
+      onLog?.('debug', `google-ads: transient error on ${label} (${last.error}) — retry ${attempt + 1}/${MAX_RETRIES} in ${Math.round(wait / 1000)}s`);
+      await sleep(wait);
     }
-    const text = await res.text();
-    const json = parseRpcJson(text);
-    if (json === null) {
-      // A 200 with unparseable body is almost always an HTML interstitial/challenge.
-      onLog?.('warn', `google-ads: unparseable response on ${label} (challenge/HTML?) — treating as blocked`);
-      return { json: null, status: res.status, blocked: true, error: 'unparseable body' };
-    }
-    return { json, status: res.status, blocked: false, error: null };
-  } catch (err) {
-    onLog?.('warn', `google-ads: request error on ${label}: ${(err as Error).message}`);
-    return { json: null, status: 0, blocked: false, error: (err as Error).message };
   }
+  if (last.blocked) {
+    onLog?.('warn', `google-ads: HTTP ${last.status || '—'} on ${label} — blocked/rate-limited after ${MAX_RETRIES} retries (IP flagged, geo, or challenge)`);
+  } else if (last.error) {
+    onLog?.('warn', `google-ads: request error on ${label}: ${last.error}`);
+  }
+  return last;
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -457,6 +652,10 @@ export async function discoverAdvertisers(
   const seen = new Set<string>();
   let consecutiveFailures = 0;
   const MAX_CONSECUTIVE_FAILURES = 5;
+
+  // Warm a cookie session first so the very first RPC already carries Google's
+  // consent/NID cookies (best-effort; a fresh IP works without it too).
+  await warmUpSession(onLog);
 
   for (let i = 0; i < keywords.length; i++) {
     const kw = keywords[i];
@@ -499,7 +698,10 @@ export async function discoverAdvertisers(
     opts.onProgress?.(i + 1, keywords.length, out.advertisers.length);
 
     if (i < keywords.length - 1 && FETCH_DELAY_MS > 0) {
-      await sleep(FETCH_DELAY_MS + Math.floor(FETCH_DELAY_MS * 0.5 * pseudoJitter(i)));
+      // Adaptive pace: base delay + jitter, scaled by the throttle factor which
+      // rises after any soft block (see rpcPost) and eases back on success.
+      const base = FETCH_DELAY_MS * throttleFactor;
+      await sleep(Math.floor(base + base * 0.5 * pseudoJitter(i)));
     }
   }
 
@@ -517,6 +719,10 @@ export interface ResolveDestinationOptions {
   region?: string | null;
   lookupBudget?: LookupBudget;
   onLog?: LogFn;
+  /** Skip the SearchCreatives/GetCreativeById round-trips entirely and resolve
+   *  from the verified domain only (no network). Set by the pipeline's circuit
+   *  breaker once the creative endpoint starts hard-blocking. */
+  skipCreativeLookups?: boolean;
 }
 
 /**
@@ -536,11 +742,18 @@ export async function resolveAdvertiserDestination(
   const onLog = opts.onLog;
   let creativesSeen = 0;
   let format: DestinationResult['format'] = null;
+  let sawBlock = false;
 
   // Only spend a SearchCreatives round-trip while the per-job creative-lookup
   // budget still has room — once it is exhausted every creative would be read
   // for free anyway, so fall straight through to the verified domain instead.
-  if (adv.advertiser_id && CREATIVE_LOOKUPS_PER_ADV > 0 && opts.lookupBudget && opts.lookupBudget.remaining() > 0) {
+  if (
+    !opts.skipCreativeLookups &&
+    adv.advertiser_id &&
+    CREATIVE_LOOKUPS_PER_ADV > 0 &&
+    opts.lookupBudget &&
+    opts.lookupBudget.remaining() > 0
+  ) {
     const creativesPayload: Record<string, unknown> = {
       '2': CREATIVES_LIMIT,
       '3': { '12': { '1': '', '2': true }, '13': { '1': [adv.advertiser_id] } },
@@ -555,6 +768,7 @@ export async function resolveAdvertiserDestination(
       `creatives ${adv.advertiser_id}`,
       onLog,
     );
+    if (cres.blocked) sawBlock = true;
     if (cres.json) {
       const { creatives } = parseCreativesResponse(cres.json);
       creativesSeen = creatives.length;
@@ -574,12 +788,13 @@ export async function resolveAdvertiserDestination(
           `creative ${c.creative_id}`,
           onLog,
         );
+        if (dres.blocked) sawBlock = true;
         if (FETCH_DELAY_MS > 0) await sleep(FETCH_DELAY_MS);
         if (!dres.json) continue;
         const dest = extractDestinationUrl(dres.json);
         if (dest) {
           format = c.format;
-          return { landingUrl: dest, format, creativesSeen, note: `creative:${c.format || 'unknown'}` };
+          return { landingUrl: dest, format, creativesSeen, note: `creative:${c.format || 'unknown'}`, blocked: sawBlock };
         }
       }
     }
@@ -587,10 +802,10 @@ export async function resolveAdvertiserDestination(
 
   // Fallback: the verified advertiser domain.
   if (adv.domain && looksLikeDomain(adv.domain)) {
-    return { landingUrl: `https://${adv.domain}`, format, creativesSeen, note: 'advertiser-domain' };
+    return { landingUrl: `https://${adv.domain}`, format, creativesSeen, note: 'advertiser-domain', blocked: sawBlock };
   }
 
-  return { landingUrl: null, format, creativesSeen, note: 'no-destination' };
+  return { landingUrl: null, format, creativesSeen, note: 'no-destination', blocked: sawBlock };
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -654,6 +869,23 @@ export function runGoogleAdsScraperTests(): { passed: number; failed: number; fa
   check(advs[0].matchedKeyword === 'shoes', 'matchedKeyword tagged');
   check(advs[2].advertiser_id === 'AR03333333333333333333', 'id recovered via deep scan when key "1" absent');
 
+  // parseAdvertiserSuggestions — CURRENT (2026) nested shape + domain-only leads
+  const suggestNested = `)]}'
+{"1":[
+  {"1":{"1":"HelloFresh SE","2":"AR17410177287600472065","3":"DE","5":true}},
+  {"1":{"1":"Yummy Food Delivery","2":"AR14547402811097743361","3":"RO"}},
+  {"2":{"1":"hellofresh.ca"}},
+  {"2":{"1":"hellofresh.de"}}
+],"3":"NEXTTOKEN"}`;
+  const nested = parseAdvertiserSuggestions(parseRpcJson(suggestNested), 'hellofresh');
+  check(nested.length === 4, `nested: 2 advertisers + 2 domain leads (got ${nested.length})`);
+  const advN = nested.find((a) => a.advertiser_id === 'AR17410177287600472065');
+  check(!!advN && advN.name === 'HelloFresh SE', 'nested: advertiser name from adv["1"]');
+  check(!!advN && advN.region === 'DE', 'nested: region from adv["3"] (positionally reliable)');
+  const domLead = nested.find((a) => !a.advertiser_id && a.domain === 'hellofresh.ca');
+  check(!!domLead && domLead.name === 'hellofresh.ca', 'nested: domain-only suggestion → website lead');
+  check(nested.filter((a) => a.domain && !a.advertiser_id).length === 2, 'nested: both domain suggestions kept');
+
   // parseCreativesResponse
   const creativesBody = `)]}'
 {"1":[
@@ -666,6 +898,13 @@ export function runGoogleAdsScraperTests(): { passed: number; failed: number; fa
   check(parsedCreatives.creatives[0].format === 'image', 'format 2 → image');
   check(parsedCreatives.creatives[1].format === 'video', 'format 3 → video');
   check(parsedCreatives.nextToken === 'NEXT_PAGE_TOKEN_ABC', 'next page token from key "2"');
+
+  // parseCreativesResponse — CURRENT shape: format key "4", token key "3"
+  const creativesNew = `)]}'
+{"1":[{"1":"AR01111111111111111111","2":"CR33333333333333333333","4":2,"12":"Advertiser"}],"3":"NEXT2"}`;
+  const pcNew = parseCreativesResponse(parseRpcJson(creativesNew));
+  check(pcNew.creatives.length === 1 && pcNew.creatives[0].format === 'image', 'creatives: format from key "4"');
+  check(pcNew.nextToken === 'NEXT2', 'creatives: next token from key "3"');
 
   // extractDestinationUrl — store link wins, wrapper unwrapped, assets skipped
   const detailWeb = `)]}'
