@@ -44,6 +44,7 @@ import {
   discoverAdvertisers,
   resolveAdvertiserDestination,
   makeLookupBudget,
+  resetGoogleAdsSession,
   type GoogleAdsAdvertiser,
 } from './googleAdsScraper.js';
 import { keywordsForJob, keywordStats } from './googleAdsKeywords.js';
@@ -138,6 +139,11 @@ export async function runGoogleAdsJob(job: JobRow): Promise<void> {
     // Resume-safety: a job deferred for the daily cap replays from the top.
     clearJobResults(job.id);
 
+    // Start each job with a clean scraper session: fresh cookies (re-warmed at
+    // discovery) and throttle baseline, so a long-lived server doesn't carry one
+    // job's stale cookies / ratcheted-up throttle into the next.
+    resetGoogleAdsSession();
+
     const params = parseParams(job);
     const countries: string[] = JSON.parse(job.countries);
     const informationalCountry = countries[0] || '';
@@ -226,9 +232,53 @@ export async function runGoogleAdsJob(job: JobRow): Promise<void> {
     let dupSkipped = 0;
     const insertedKeys = new Set<string>();
 
+    // Circuit breaker: when the creative endpoint hard-blocks (each blocked
+    // lookup costs the full retry/backoff ladder), stop probing it after a few
+    // consecutive blocks and resolve the REMAINING advertisers from their
+    // verified domains only — instant, no network, and the job finishes in
+    // minutes instead of grinding for hours writing nothing.
+    let consecutiveBlockedLookups = 0;
+    let skipCreativeLookups = false;
+    const CIRCUIT_BREAKER_AFTER = 3;
+
+    // Incremental CSV flush: rebuild the CSV every N inserts so a partial file
+    // exists (and grows) from the first lead onward — even if the job is later
+    // interrupted, "Download CSV" already has everything found so far.
+    const FLUSH_EVERY = 25;
+    let lastFlushMark = 0;
+    let lastFlushedCount = 0;
+    const flushCsv = () => {
+      try {
+        const { rowsWritten } = buildCsv({ jobId: job.id, productType: job.product_type, results: getResults(job.id) });
+        if (lastFlushedCount === 0 && rowsWritten > 0) {
+          onLog('info', `google-ads: partial CSV flushed (${rowsWritten} rows so far) — leads are saved incrementally from here on`);
+        }
+        lastFlushedCount = rowsWritten;
+      } catch (err) {
+        onLog('warn', `google-ads: incremental CSV flush failed (non-fatal): ${(err as Error).message}`);
+      }
+    };
+
     for (let i = 0; i < advertisers.length; i++) {
       const adv = advertisers[i];
-      const dest = await resolveAdvertiserDestination(adv, { region, lookupBudget, onLog });
+      const dest = await resolveAdvertiserDestination(adv, { region, lookupBudget, onLog, skipCreativeLookups });
+      if (!skipCreativeLookups && adv.advertiser_id) {
+        if (dest.blocked) {
+          consecutiveBlockedLookups++;
+          if (consecutiveBlockedLookups >= CIRCUIT_BREAKER_AFTER) {
+            skipCreativeLookups = true;
+            onLog(
+              'warn',
+              `google-ads: creative endpoint blocked ${consecutiveBlockedLookups}× in a row — circuit breaker ON: ` +
+                `resolving the remaining ${advertisers.length - i - 1} advertisers from verified domains only ` +
+                `(no more lookups this job; mobile store detection degraded)`,
+            );
+            flushCsv();
+          }
+        } else {
+          consecutiveBlockedLookups = 0;
+        }
+      }
       const cls = classifyGoogleAdsUrl(dest.landingUrl);
 
       if (cls.classification === 'unknown' || !dest.landingUrl) {
@@ -264,6 +314,10 @@ export async function runGoogleAdsJob(job: JobRow): Promise<void> {
           `resolved ${i + 1}/${advertisers.length} · ${mobileCount} mobile · ${webCount} web`,
         );
       }
+      if (inserted >= lastFlushMark + FLUSH_EVERY) {
+        lastFlushMark = inserted;
+        flushCsv();
+      }
       if ((i + 1) % 25 === 0) {
         onLog(
           'info',
@@ -295,6 +349,14 @@ export async function runGoogleAdsJob(job: JobRow): Promise<void> {
             : 'No advertiser destinations resolved to a website.'
         } Check the discovery/block warnings above.`,
       );
+      if (job.product_type === 'mobile' && webCount > 0) {
+        onLog(
+          'warn',
+          `google-ads: NOTE — ${webCount} WEB (cps_web) leads WERE found but are excluded from a mobile CSV. ` +
+            `Store URLs require creative lookups, which were blocked/degraded this run. ` +
+            `Re-run this job with product type CPS to export those ${webCount} website leads.`,
+        );
+      }
     }
 
     // ── 6. HQ split (mobile → store-page HQ; cps → web/domain HQ) ──

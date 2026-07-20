@@ -1,4 +1,4 @@
-import { writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { writeFileSync, renameSync, mkdirSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import type { JobResultRow, ProductType } from './db.js';
 
@@ -93,7 +93,13 @@ export function buildCsv(input: BuildCsvInput): { path: string; rowsWritten: num
   const csv = [header, ...rows].join('\n') + '\n';
   const fname = `${productType}-${jobId}.csv`;
   const fpath = path.join(CSV_DIR, fname);
-  writeFileSync(fpath, csv, 'utf8');
+  // Atomic write: some pipelines (Google Ads) now rebuild this file repeatedly
+  // WHILE the job runs, and the download route may serve it at any moment.
+  // Write to a temp sibling then rename so a concurrent reader never sees a
+  // truncated/partial file (rename is atomic within the same directory).
+  const tmp = `${fpath}.tmp-${process.pid}`;
+  writeFileSync(tmp, csv, 'utf8');
+  renameSync(tmp, fpath);
 
   return { path: fpath, rowsWritten: rows.length };
 }

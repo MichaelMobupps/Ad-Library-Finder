@@ -190,6 +190,10 @@ export interface DestinationResult {
   format: 'text' | 'image' | 'video' | null;
   creativesSeen: number;
   note: string;
+  /** True when the creative RPCs for this advertiser were soft-blocked (429/403/
+   *  challenge). Lets the pipeline trip a circuit breaker instead of grinding
+   *  through retries for every remaining advertiser. */
+  blocked: boolean;
 }
 
 /** Shared, mutable cap on creative-detail lookups across a whole job. */
@@ -715,6 +719,10 @@ export interface ResolveDestinationOptions {
   region?: string | null;
   lookupBudget?: LookupBudget;
   onLog?: LogFn;
+  /** Skip the SearchCreatives/GetCreativeById round-trips entirely and resolve
+   *  from the verified domain only (no network). Set by the pipeline's circuit
+   *  breaker once the creative endpoint starts hard-blocking. */
+  skipCreativeLookups?: boolean;
 }
 
 /**
@@ -734,11 +742,18 @@ export async function resolveAdvertiserDestination(
   const onLog = opts.onLog;
   let creativesSeen = 0;
   let format: DestinationResult['format'] = null;
+  let sawBlock = false;
 
   // Only spend a SearchCreatives round-trip while the per-job creative-lookup
   // budget still has room — once it is exhausted every creative would be read
   // for free anyway, so fall straight through to the verified domain instead.
-  if (adv.advertiser_id && CREATIVE_LOOKUPS_PER_ADV > 0 && opts.lookupBudget && opts.lookupBudget.remaining() > 0) {
+  if (
+    !opts.skipCreativeLookups &&
+    adv.advertiser_id &&
+    CREATIVE_LOOKUPS_PER_ADV > 0 &&
+    opts.lookupBudget &&
+    opts.lookupBudget.remaining() > 0
+  ) {
     const creativesPayload: Record<string, unknown> = {
       '2': CREATIVES_LIMIT,
       '3': { '12': { '1': '', '2': true }, '13': { '1': [adv.advertiser_id] } },
@@ -753,6 +768,7 @@ export async function resolveAdvertiserDestination(
       `creatives ${adv.advertiser_id}`,
       onLog,
     );
+    if (cres.blocked) sawBlock = true;
     if (cres.json) {
       const { creatives } = parseCreativesResponse(cres.json);
       creativesSeen = creatives.length;
@@ -772,12 +788,13 @@ export async function resolveAdvertiserDestination(
           `creative ${c.creative_id}`,
           onLog,
         );
+        if (dres.blocked) sawBlock = true;
         if (FETCH_DELAY_MS > 0) await sleep(FETCH_DELAY_MS);
         if (!dres.json) continue;
         const dest = extractDestinationUrl(dres.json);
         if (dest) {
           format = c.format;
-          return { landingUrl: dest, format, creativesSeen, note: `creative:${c.format || 'unknown'}` };
+          return { landingUrl: dest, format, creativesSeen, note: `creative:${c.format || 'unknown'}`, blocked: sawBlock };
         }
       }
     }
@@ -785,10 +802,10 @@ export async function resolveAdvertiserDestination(
 
   // Fallback: the verified advertiser domain.
   if (adv.domain && looksLikeDomain(adv.domain)) {
-    return { landingUrl: `https://${adv.domain}`, format, creativesSeen, note: 'advertiser-domain' };
+    return { landingUrl: `https://${adv.domain}`, format, creativesSeen, note: 'advertiser-domain', blocked: sawBlock };
   }
 
-  return { landingUrl: null, format, creativesSeen, note: 'no-destination' };
+  return { landingUrl: null, format, creativesSeen, note: 'no-destination', blocked: sawBlock };
 }
 
 // ───────────────────────────────────────────────────────────────────────────
