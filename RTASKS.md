@@ -1,5 +1,69 @@
 # RTASKS — running task record
 
+## 2026-07-21 (round 2) — post-key audit + placeholder-proxy guard
+
+Trigger: first production job scraped 0 ads. Root cause was NOT the monitor — the
+`GOOGLE_ADS_PROXY_URL` secret still contained the literal `HOST:PORT` placeholder, the
+scraper silently fell back to direct egress, and Google penalty-boxed the deploy IP.
+`PROXY_SELLER_API_KEY` was then added to Secrets; full rebuild + re-audit + auto-fix ran.
+
+| # | Task | Status | Outcome |
+|---|------|--------|---------|
+| 1 | Rebuild (`tsc`) + unit tests | ✅ done | Clean; 25/25 (was 21 — see fixes) |
+| 2 | Permanent smoke script | ✅ done | `scripts/smoke-proxy-traffic.mjs` — 21 mocked checks + `--live` mode |
+| 3 | Godlike audit — correctness (subagent) | ✅ done | 2 MED, 1 LOW — all fixed |
+| 4 | Godlike audit — blast radius (subagent) | ✅ done | 1 HIGH, 2 LOW — all fixed |
+| 5 | Auto-fix + re-verify | ✅ done | 25 unit + 21 smoke + typecheck green; mutation re-test now CATCHES the filter deletion (2 fails); mirrors re-synced (incl. `googleAdsScraper.ts`) |
+
+### Round-2 findings → resolutions
+
+**Fixed:**
+- HIGH (blast): set-but-unusable `GOOGLE_ADS_PROXY_URL` silently degraded to direct egress
+  (warn logged once per process, then cached-null forever) → new `assertProxyUrlUsable()`
+  in `googleAdsScraper.ts`, called first in the job try-block: placeholder tokens
+  (HOST/PORT/USER/PASS as whole words) or unparsable URL ⇒ job fails at start with a
+  <200-char config error. Unset remains valid (deliberate direct egress).
+- MED (correctness): status-string inactive filter had ZERO effective test coverage —
+  mutation testing showed it could be deleted with the suite staying green (dead fixtures
+  gave the inactive entry 0 remaining, so the most-remaining sort masked the filter) →
+  fixtures restructured so the dead entry is the richest; +1 test for
+  `active:false`/`deleted`/`archived` variants. Mutant now fails 2 tests.
+- MED (correctness): invalid key / IP-not-allowed / rate-limit were indistinguishable in
+  logs (live API returns 200 + `{status:'error',errors:[{message:'Error api key'},…]}`;
+  from some vantage points an invalid key instead 301-chains to the HTML homepage) →
+  (a) content-type guard before `res.json()` names a non-JSON response "API key likely
+  invalid/revoked"; (b) new `extractApiErrors()` surfaces the envelope messages at warn
+  level ("Error api key; IP not allowed x.x.x.x"). Both only reroute already-failing
+  paths — cannot gate a job. +3 unit tests.
+- LOW (correctness): burn report had survivorship bias — only successful jobs logged
+  traffic cost → `trafficBefore` hoisted above the try; `logProxyTrafficAfterJob` now
+  also runs on the failure AND defer paths (no-op when the monitor is off; the
+  exhausted-gate throw leaves `trafficBefore` null so no double fetch).
+- LOW (blast): orphan `dist/probe.js` (source deleted in May, tsc never cleans) → deleted.
+- LOW (blast): `.env.example` lacked `PROXY_SELLER_API_KEY` / `PROXY_TRAFFIC_WARN_GB` /
+  `PROXY_TRAFFIC_ABORT_GB` though the docs said "see .env.example" → documented.
+- Docs: `GOOGLE_ADS_INTEGRATION.md` — fail-fast proxy-URL behavior, key-diagnostics,
+  IP-allowlist warning, smoke-script usage.
+
+**Verified clean (no action):** mirrors byte-identical pre-fix; dist fresh; Replit deploy
+rebuilds from src (`.replit` build runs `pnpm build`, so committed-dist staleness is moot);
+git tree clean (Replit auto-commit 14:11 picked up round 1); redirect chain, 10s timeout
+across the chain+body, 400 KB HTML body, key-redaction in all error paths — all proven
+against the real dist build. `isTrafficMonitorConfigured` has no prod callers (used by the
+smoke script's live mode).
+
+### User follow-ups (round 2)
+- **BLOCKER for real scraping:** `GOOGLE_ADS_PROXY_URL` secret still has the literal
+  `HOST:PORT` placeholder — replace with the real gateway host:port from the
+  Proxy-Seller dashboard. Until then every google_ads job now fails FAST with an explicit
+  config error (by design, instead of silently scraping 0 ads).
+- Proxy-Seller Custom API has an IP allowlist — ensure it's open (deploy IPs rotate),
+  else the monitor logs "IP not allowed x.x.x.x" and fails open.
+- After fixing the secret + republish: run one job; expect `proxy-traffic: ~10 GB of
+  10 GB remaining` at start and a `this job used …` line at the end.
+- Google's penalty box on the deploy IP needs its cooldown to lapse before direct-egress
+  requests recover (irrelevant once the proxy URL is fixed).
+
 ## 2026-07-21 — Proxy GB monitoring (Proxy-Seller residential)
 
 Goal: before each Google Ads job, check remaining residential proxy traffic via the

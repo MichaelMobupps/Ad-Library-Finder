@@ -87,6 +87,35 @@ function getProxyDispatcher(onLog?: LogFn): Dispatcher | undefined {
   return proxyDispatcher ?? undefined;
 }
 
+/**
+ * Throw when GOOGLE_ADS_PROXY_URL is SET but unusable — an unfilled template
+ * placeholder (HOST/PORT/USER/PASS) or a string that doesn't parse as a URL.
+ * Without this gate the scraper silently falls back to direct egress from the
+ * datacenter IP, Google penalty-boxes it, and the job "completes" with 0 ads —
+ * a config error masquerading as an empty market (observed in production).
+ * Unset stays valid (deliberate direct egress). Placeholder tokens are checked
+ * as whole uppercase words, so real hostnames/credentials can't false-positive;
+ * this also catches the .env.example form USER:PASS@…, which parses fine but
+ * would send literal placeholder credentials. Message < 200 chars so the
+ * dashboard phase_detail slice shows it whole.
+ */
+export function assertProxyUrlUsable(): void {
+  if (!PROXY_URL) return; // unset = deliberate direct egress
+  const placeholder = /\b(HOST|PORT|USER|PASS|PASSWORD)\b/.test(PROXY_URL);
+  let parses = true;
+  try {
+    new URL(PROXY_URL);
+  } catch {
+    parses = false;
+  }
+  if (placeholder || !parses) {
+    throw new Error(
+      `GOOGLE_ADS_PROXY_URL is set but unusable (${placeholder ? 'unfilled placeholder tokens' : 'not a valid URL'}) — ` +
+        `fix the host:port in Secrets, or unset it to egress direct.`,
+    );
+  }
+}
+
 /** Hide credentials in a proxy URL before logging it. */
 function redactProxy(u: string): string {
   try {

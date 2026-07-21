@@ -52,9 +52,11 @@ let passed = 0;
 const failures = [];
 const check = (cond, desc) => (cond ? passed++ : failures.push(`FAIL: ${desc}`));
 
-const jsonRes = (body, status = 200) => ({
+const jsonRes = (body, status = 200, contentType = 'application/json') => ({
   ok: status >= 200 && status < 300,
   status,
+  redirected: false,
+  headers: { get: (h) => (h.toLowerCase() === 'content-type' ? contentType : null) },
   body: { cancel: async () => {} },
   json: async () => body,
 });
@@ -135,18 +137,46 @@ const healthy = { status: 'success', data: { traffic_limit: 10 * GB, traffic_usa
   check(!!debugLine && !debugLine.includes('SMOKEKEY_abc123_SMOKEKEY') && debugLine.includes('***'), 'garbage shape: raw dump redacts key');
 }
 
-// 15: HTML body (res.json throws — real-world invalid-key behavior) → fail-open
+// 15: HTML body (real-world invalid-key behavior: 200 + text/html homepage)
+// → fail-open with the explicit "key likely invalid" diagnostic
 {
   global.fetch = async () => ({
-    ok: true,
-    status: 200,
-    body: { cancel: async () => {} },
+    ...jsonRes(null, 200, 'text/html; charset=utf-8'),
+    redirected: true,
     json: async () => {
       throw new SyntaxError('Unexpected token < in JSON');
     },
   });
   const { lines, log } = collect();
-  check((await m.checkProxyTrafficBeforeJob(log)) === null && lines.some((l) => l.startsWith('[warn]')), 'HTML-instead-of-JSON: fail-open null + warn');
+  const snap = await m.checkProxyTrafficBeforeJob(log);
+  check(
+    snap === null && lines.some((l) => l.startsWith('[warn]') && l.includes('instead of JSON') && l.includes('after a redirect') && l.includes('invalid/revoked')),
+    'HTML-instead-of-JSON: fail-open null + invalid-key diagnostic',
+  );
+}
+
+// 15b: content-type claims JSON but the body is broken → old json-throw fail-open path
+{
+  global.fetch = async () => ({
+    ...jsonRes(null),
+    json: async () => {
+      throw new SyntaxError('Unexpected end of JSON input');
+    },
+  });
+  const { lines, log } = collect();
+  check((await m.checkProxyTrafficBeforeJob(log)) === null && lines.some((l) => l.startsWith('[warn]')), 'broken JSON body: fail-open null + warn');
+}
+
+// 15c: real error envelope (observed live) → reason surfaced at warn level
+{
+  global.fetch = async () =>
+    jsonRes({ status: 'error', data: null, errors: [{ message: 'Error api key', code: 503 }, { message: 'IP not allowed 1.2.3.4', code: 503 }] });
+  const { lines, log } = collect();
+  const snap = await m.checkProxyTrafficBeforeJob(log);
+  check(
+    snap === null && lines.some((l) => l.startsWith('[warn]') && l.includes('Error api key') && l.includes('IP not allowed 1.2.3.4')),
+    'API error envelope: reason surfaced in warn line',
+  );
 }
 
 // 16-17: burn report — normal usage delta

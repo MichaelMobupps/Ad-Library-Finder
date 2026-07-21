@@ -73,6 +73,12 @@ Set **`GOOGLE_ADS_PROXY_URL`** to a residential/mobile proxy gateway to egress t
 (only) from an un-flagged IP; the rest of the server keeps direct egress. Credentials in the
 URL are redacted in logs. For rotating pools, point it at the provider's gateway endpoint.
 
+A **set-but-unusable** `GOOGLE_ADS_PROXY_URL` (an unfilled `HOST:PORT`/`USER:PASS`
+placeholder, or a string that doesn't parse as a URL) **fails the job at start** with an
+explicit config error — it does NOT silently fall back to direct egress, which would
+penalty-box the deploy IP and "complete" jobs with 0 ads. Unset the variable entirely if
+direct egress is what you want.
+
 ### Proxy traffic monitor (Proxy-Seller residential)
 
 The residential package is billed per GB; when it runs dry, jobs would otherwise burn the
@@ -80,9 +86,23 @@ whole retry ladder against a dead proxy. Set **`PROXY_SELLER_API_KEY`** (dashboa
 Custom API) and every Google Ads job will, at start, log the package's remaining GB, warn
 below **`PROXY_TRAFFIC_WARN_GB`** (default 1), and refuse to start below
 **`PROXY_TRAFFIC_ABORT_GB`** (default 0.05) with a clear "add GB or unset the key" error.
-On completion the job logs its own traffic cost (`proxy-traffic: this job used …`).
+On completion the job logs its own traffic cost (`proxy-traffic: this job used …`) — also
+on failure/defer, so a job that dies mid-scrape still has its burn on record.
 All checks are fail-open: an unreachable Proxy-Seller API logs a warning and never blocks
-a job. Unset the key to disable entirely (`proxyTraffic.ts`).
+a job. Key problems are diagnosed explicitly: the API's own error envelope ("Error api
+key", "IP not allowed x.x.x.x", "Request limit reached") is surfaced in the warn line, and
+an HTML response (invalid key redirected to the homepage) is called out as a likely
+invalid/revoked key. Note the Proxy-Seller Custom API supports an **IP allowlist** — leave
+it open or it will reject calls from rotating deploy IPs. Unset the key to disable
+entirely (`proxyTraffic.ts`).
+
+Smoke-test the monitor (hermetic, mocked network — plus a `--live` mode that reads the
+real balance when `PROXY_SELLER_API_KEY` is in the shell):
+
+```bash
+node scripts/smoke-proxy-traffic.mjs          # 21 checks, no key needed
+node scripts/smoke-proxy-traffic.mjs --live   # one real API call, prints the balance
+```
 
 ## Testing
 
