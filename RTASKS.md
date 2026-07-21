@@ -53,16 +53,24 @@ against the real dist build. `isTrafficMonitorConfigured` has no prod callers (u
 smoke script's live mode).
 
 ### User follow-ups (round 2)
-- **BLOCKER for real scraping:** `GOOGLE_ADS_PROXY_URL` secret still has the literal
-  `HOST:PORT` placeholder — replace with the real gateway host:port from the
-  Proxy-Seller dashboard. Until then every google_ads job now fails FAST with an explicit
-  config error (by design, instead of silently scraping 0 ads).
-- Proxy-Seller Custom API has an IP allowlist — ensure it's open (deploy IPs rotate),
-  else the monitor logs "IP not allowed x.x.x.x" and fails open.
-- After fixing the secret + republish: run one job; expect `proxy-traffic: ~10 GB of
-  10 GB remaining` at start and a `this job used …` line at the end.
-- Google's penalty box on the deploy IP needs its cooldown to lapse before direct-egress
-  requests recover (irrelevant once the proxy URL is fixed).
+- ✅ RESOLVED: gateway is `res.proxy-seller.com:10000` (found via `resident/lists` API +
+  docs + verified LIVE from the workspace: HTTP 200 through the proxy, residential exit
+  IP 73.248.97.62 vs datacenter 34.93.147.81 direct). Correct secret value:
+  `http://41baf352181abd69:<pass>@res.proxy-seller.com:10000`. New helper:
+  `scripts/proxy-hostport.mjs` (queries the lists/package API, key-redacted output).
+- ✅ RESOLVED: byte-units validated against the live API — `resident/package` returns
+  `traffic_limit:"10737418240"` (string bytes = exactly 10 GiB), `is_active:true`,
+  `expired_at:"21.08.2026 23:59:59"` — precisely the parser's primary shape. No IP
+  allowlist in play (API answered from the workspace IP).
+- ⏳ REMAINING: user pastes the secret value → republish → run one job. Expect
+  `routing via proxy http://***@res.proxy-seller.com:10000`, `proxy-traffic: 10.00 GB of
+  10.00 GB remaining (package active until 21.08.2026 23:59:59)`, ads > 0, and a
+  `this job used …` burn line.
+- Note: both proxy lists show `rotation: 3600` (1-hour sticky sessions). If Google 429s
+  a sticky exit IP mid-job, switch the Worldwide list's rotation to "For each request"
+  in the dashboard (ports 10000–10999 also map to distinct concurrent exits).
+- The second list `leadfinder-google-ads` (login 664d…, EMPTY password, Americas-only
+  geo) is unusable as-is for auth — using the Worldwide list.
 
 ## 2026-07-21 — Proxy GB monitoring (Proxy-Seller residential)
 
