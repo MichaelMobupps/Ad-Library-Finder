@@ -55,6 +55,7 @@ import { buildCsv } from './csv.js';
 import { notifyJobCompleted, notifyJobFailed } from './notifier.js';
 import { runHqSplit } from './hqSplit.js';
 import { runHqSplitWeb } from './hqSplitWeb.js';
+import { checkProxyTrafficBeforeJob, logProxyTrafficAfterJob } from './proxyTraffic.js';
 import { log } from './logger.js';
 
 /** Per-job cap on GetCreativeById lookups (each is one extra RPC round-trip). */
@@ -146,6 +147,14 @@ export async function runGoogleAdsJob(job: JobRow): Promise<void> {
   onLog('info', `google-ads job started: product=${job.product_type}, countries=${job.countries}`);
 
   try {
+    // Refuse to start against an exhausted residential proxy package — a clear
+    // error now beats burning the whole retry ladder against a dead egress.
+    // Also snapshots usage so the job can report its own traffic cost at the
+    // end. No-op unless PROXY_SELLER_API_KEY is set; fail-open on API errors.
+    // MUST run before clearJobResults: a deferred job that resumes into an
+    // exhausted package should fail with its partial results still intact.
+    const trafficBefore = await checkProxyTrafficBeforeJob(onLog);
+
     // Resume-safety: a job deferred for the daily cap replays from the top.
     clearJobResults(job.id);
 
@@ -477,6 +486,9 @@ export async function runGoogleAdsJob(job: JobRow): Promise<void> {
       if (err instanceof BudgetExceededError) throw err;
       onLog('warn', `google-ads hq-split failed (non-fatal): ${(err as Error).message}`);
     }
+
+    // Burn report: what this job actually cost in proxy traffic (best-effort).
+    await logProxyTrafficAfterJob(trafficBefore, onLog);
 
     markJobCompleted(job.id, csvPath, { ads: discovery.advertisers.length, advertisers: rowsWritten });
     onLog('info', 'google-ads job completed');

@@ -73,6 +73,17 @@ Set **`GOOGLE_ADS_PROXY_URL`** to a residential/mobile proxy gateway to egress t
 (only) from an un-flagged IP; the rest of the server keeps direct egress. Credentials in the
 URL are redacted in logs. For rotating pools, point it at the provider's gateway endpoint.
 
+### Proxy traffic monitor (Proxy-Seller residential)
+
+The residential package is billed per GB; when it runs dry, jobs would otherwise burn the
+whole retry ladder against a dead proxy. Set **`PROXY_SELLER_API_KEY`** (dashboard →
+Custom API) and every Google Ads job will, at start, log the package's remaining GB, warn
+below **`PROXY_TRAFFIC_WARN_GB`** (default 1), and refuse to start below
+**`PROXY_TRAFFIC_ABORT_GB`** (default 0.05) with a clear "add GB or unset the key" error.
+On completion the job logs its own traffic cost (`proxy-traffic: this job used …`).
+All checks are fail-open: an unreachable Proxy-Seller API logs a warning and never blocks
+a job. Unset the key to disable entirely (`proxyTraffic.ts`).
+
 ## Testing
 
 Every module ships offline self-tests (no network, no LLM key):
