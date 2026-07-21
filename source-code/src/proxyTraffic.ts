@@ -99,6 +99,19 @@ export async function fetchProxyTraffic(onLog?: LogFn): Promise<ProxyTrafficSnap
       onLog?.('warn', `proxy-traffic: Proxy-Seller API returned HTTP ${res.status} — skipping the traffic check`);
       return null;
     }
+    // An invalid/revoked key can land on an HTML page (observed live: a 301
+    // chain to the marketing homepage, served 200). Say so, instead of the
+    // misleading "unreachable" that res.json() throwing would produce.
+    const ct = res.headers.get('content-type') || '';
+    if (!ct.toLowerCase().includes('json')) {
+      void res.body?.cancel();
+      onLog?.(
+        'warn',
+        `proxy-traffic: Proxy-Seller API returned ${ct || 'no content-type'} instead of JSON` +
+          `${res.redirected ? ' after a redirect' : ''} — API key likely invalid/revoked — skipping the traffic check`,
+      );
+      return null;
+    }
     body = await res.json();
   } catch (err) {
     // String(…?.message ?? err): this catch IS the fail-open perimeter — it must
@@ -109,7 +122,15 @@ export async function fetchProxyTraffic(onLog?: LogFn): Promise<ProxyTrafficSnap
 
   const snap = parsePackageResponse(body);
   if (!snap) {
-    onLog?.('warn', 'proxy-traffic: could not read traffic_limit/traffic_usage from the Proxy-Seller response — skipping the traffic check');
+    // The API hands over the reason ("Error api key", "IP not allowed x.x.x.x",
+    // "Request limit reached") in its error envelope — surface it at warn level
+    // instead of burying it in the debug raw dump behind an opaque parse message.
+    const apiErrors = extractApiErrors(body);
+    if (apiErrors) {
+      onLog?.('warn', `proxy-traffic: Proxy-Seller API error: ${redactKey(apiErrors).slice(0, 300)} — skipping the traffic check`);
+    } else {
+      onLog?.('warn', 'proxy-traffic: could not read traffic_limit/traffic_usage from the Proxy-Seller response — skipping the traffic check');
+    }
     // Redact BEFORE slicing — a slice landing mid-key would defeat exact-match redaction.
     onLog?.('debug', `proxy-traffic: raw response: ${redactKey(safeJson(body)).slice(0, 500)}`);
     return null;
@@ -214,6 +235,20 @@ export function parsePackageResponse(body: unknown): ProxyTrafficSnapshot | null
   return snaps[0];
 }
 
+/** Pull human-readable messages out of the API's error envelope
+ *  ({ status:'error', errors:[{message,…}] }, observed live) so the operator
+ *  sees "Error api key" / "IP not allowed 1.2.3.4" instead of a parse warning.
+ *  Returns null when the body isn't that envelope. */
+export function extractApiErrors(body: unknown): string | null {
+  if (body === null || typeof body !== 'object') return null;
+  const obj = body as Record<string, unknown>;
+  if (obj['status'] !== 'error' || !Array.isArray(obj['errors'])) return null;
+  const msgs = (obj['errors'] as unknown[])
+    .map((e) => (e && typeof e === 'object' ? str((e as Record<string, unknown>)['message']) : ''))
+    .filter(Boolean);
+  return msgs.length ? msgs.join('; ') : null;
+}
+
 /** An entry the provider itself flags as not current must never gate a job. */
 function isMarkedInactive(pkg: Record<string, unknown>): boolean {
   if (pkg['is_active'] === false || pkg['active'] === false) return true;
@@ -292,21 +327,34 @@ export function runProxyTrafficUnitTests(): { passed: number; failed: number; fa
   const over = parsePackageResponse({ traffic_limit: GB, traffic_usage: GB + 1024 });
   check(!!over && over.remainingBytes === 0, 'overrun usage clamps remaining to 0');
 
-  // Multi-package accounts: an expired entry listed first must never gate.
+  // Multi-package accounts: an expired/inactive entry must be skipped even when
+  // it looks RICHEST — the dead entry gets the most remaining in these fixtures,
+  // so the filter (not the most-remaining sort) is what each assertion exercises.
+  // (Earlier fixtures gave the dead entry 0 remaining; mutation testing showed
+  // the filter could be deleted entirely and those assertions still passed.)
   const multi = parsePackageResponse({
     data: [
-      { is_active: false, traffic_limit: 5 * GB, traffic_usage: 5 * GB },
-      { is_active: true, traffic_limit: 10 * GB, traffic_usage: GB },
+      { is_active: false, traffic_limit: 10 * GB, traffic_usage: GB }, // 9 GB but inactive
+      { is_active: true, traffic_limit: 10 * GB, traffic_usage: 8 * GB }, // 2 GB, must win
     ],
   });
-  check(!!multi && multi.remainingBytes === 9 * GB, 'multi-package: inactive-first skipped, active gated');
+  check(!!multi && multi.remainingBytes === 2 * GB, 'multi-package: inactive entry with MORE remaining is skipped');
   const multiStatus = parsePackageResponse({
     data: [
-      { status: 'expired', traffic_limit: 5 * GB, traffic_usage: 5 * GB },
-      { status: 'active', traffic_limit: 10 * GB, traffic_usage: 2 * GB },
+      { status: 'expired', traffic_limit: 10 * GB, traffic_usage: GB }, // 9 GB but expired
+      { status: 'active', traffic_limit: 10 * GB, traffic_usage: 8 * GB }, // 2 GB, must win
     ],
   });
-  check(!!multiStatus && multiStatus.remainingBytes === 8 * GB, 'multi-package: status-string expired skipped');
+  check(!!multiStatus && multiStatus.remainingBytes === 2 * GB, 'multi-package: expired-status entry with MORE remaining is skipped');
+  const multiFlagVariants = parsePackageResponse({
+    data: [
+      { active: false, traffic_limit: 10 * GB, traffic_usage: 0 }, // 10 GB, active:false variant
+      { status: 'deleted', traffic_limit: 10 * GB, traffic_usage: GB }, // 9 GB, deleted
+      { status: 'archived', traffic_limit: 10 * GB, traffic_usage: 2 * GB }, // 8 GB, archived
+      { traffic_limit: 10 * GB, traffic_usage: 9 * GB }, // 1 GB, the only live entry
+    ],
+  });
+  check(!!multiFlagVariants && multiFlagVariants.remainingBytes === GB, 'multi-package: active:false / deleted / archived variants all skipped');
   const multiUnflagged = parsePackageResponse({
     data: [
       { traffic_limit: 5 * GB, traffic_usage: 5 * GB },
@@ -318,6 +366,15 @@ export function runProxyTrafficUnitTests(): { passed: number; failed: number; fa
     parsePackageResponse({ data: [{ is_active: false, traffic_limit: 5 * GB, traffic_usage: GB }] }) === null,
     'only-inactive packages → null (fail-open)',
   );
+
+  // Error-envelope extraction (real shape observed live from the API).
+  check(
+    extractApiErrors({ status: 'error', data: null, errors: [{ message: 'Error api key', code: 503 }, { message: 'IP not allowed 1.2.3.4' }] }) ===
+      'Error api key; IP not allowed 1.2.3.4',
+    'error envelope: messages joined for the warn line',
+  );
+  check(extractApiErrors({ status: 'success', data: {} }) === null, 'success envelope → no api-error string');
+  check(extractApiErrors({ status: 'error', errors: [{ code: 503 }] }) === null, 'error envelope without messages → null');
 
   // Unit plausibility window: KB-denominated values (10 GB = 10,485,760 KB)
   // normalize to an implausible 10 MB limit → null, never a wrongful abort.

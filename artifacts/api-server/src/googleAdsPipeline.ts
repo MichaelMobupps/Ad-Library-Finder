@@ -46,6 +46,7 @@ import {
   resolveAdvertiserDestination,
   makeLookupBudget,
   resetGoogleAdsSession,
+  assertProxyUrlUsable,
   type GoogleAdsAdvertiser,
 } from './googleAdsScraper.js';
 import { keywordsForJob, keywordStats } from './googleAdsKeywords.js';
@@ -55,7 +56,7 @@ import { buildCsv } from './csv.js';
 import { notifyJobCompleted, notifyJobFailed } from './notifier.js';
 import { runHqSplit } from './hqSplit.js';
 import { runHqSplitWeb } from './hqSplitWeb.js';
-import { checkProxyTrafficBeforeJob, logProxyTrafficAfterJob } from './proxyTraffic.js';
+import { checkProxyTrafficBeforeJob, logProxyTrafficAfterJob, type ProxyTrafficSnapshot } from './proxyTraffic.js';
 import { log } from './logger.js';
 
 /** Per-job cap on GetCreativeById lookups (each is one extra RPC round-trip). */
@@ -146,14 +147,23 @@ export async function runGoogleAdsJob(job: JobRow): Promise<void> {
 
   onLog('info', `google-ads job started: product=${job.product_type}, countries=${job.countries}`);
 
+  // Hoisted above the try so the catch can still report the job's traffic burn.
+  let trafficBefore: ProxyTrafficSnapshot | null = null;
+
   try {
+    // Config gate first: a set-but-unusable GOOGLE_ADS_PROXY_URL (unfilled
+    // HOST:PORT placeholder, unparsable URL) must fail the job loudly here
+    // instead of silently egressing direct into Google's penalty box. Local
+    // and free; before clearJobResults so a deferred job's partials survive.
+    assertProxyUrlUsable();
+
     // Refuse to start against an exhausted residential proxy package — a clear
     // error now beats burning the whole retry ladder against a dead egress.
     // Also snapshots usage so the job can report its own traffic cost at the
     // end. No-op unless PROXY_SELLER_API_KEY is set; fail-open on API errors.
     // MUST run before clearJobResults: a deferred job that resumes into an
     // exhausted package should fail with its partial results still intact.
-    const trafficBefore = await checkProxyTrafficBeforeJob(onLog);
+    trafficBefore = await checkProxyTrafficBeforeJob(onLog);
 
     // Resume-safety: a job deferred for the daily cap replays from the top.
     clearJobResults(job.id);
@@ -500,6 +510,10 @@ export async function runGoogleAdsJob(job: JobRow): Promise<void> {
         .catch((e) => onLog('warn', `notification error: ${(e as Error).message}`));
     }
   } catch (err) {
+    // Burn report even on failure/defer — a job that died mid-scrape is exactly
+    // the one whose traffic cost you want on record. Best-effort and fail-open;
+    // instant no-op when the monitor is off or the before-snapshot never landed.
+    await logProxyTrafficAfterJob(trafficBefore, onLog);
     if (err instanceof BudgetExceededError) {
       const runAfter = nextJerusalemMidnightMs();
       const when = new Date(runAfter).toISOString();
