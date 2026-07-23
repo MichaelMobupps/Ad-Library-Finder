@@ -213,7 +213,13 @@ export function sanitizeStoreUrl(url: string | null | undefined): string | null 
   if (!url || typeof url !== 'string') return null;
   const u = url.trim();
   if (!/^https?:\/\//i.test(u)) return null;
-  if (PLAY_RE.test(u)) return canonicalPlayUrl(u);
+  if (PLAY_RE.test(u)) {
+    // A Play `/details` link is only a real listing when it carries a non-empty
+    // `?id=<package>`. Reject a bare `…/details?id` (empty package): it can't be
+    // looked up and would surface a broken mobile lead. This is the output-side
+    // twin of the scraper's isStoreUrl guard.
+    return /[?&]id=[A-Za-z0-9._]+/.test(u) ? canonicalPlayUrl(u) : null;
+  }
   if (APPSTORE_RE.test(u)) return canonicalAppStoreUrl(u);
   if (isMmpTracker(u)) return u;
   return null;

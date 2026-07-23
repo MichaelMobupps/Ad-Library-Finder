@@ -41,7 +41,12 @@ const CREATIVES_LIMIT = clampInt(process.env.GOOGLE_ADS_CREATIVES_LIMIT, 5, 1, 4
 // deliberately generous and is throttled UP adaptively after any 429/403.
 const FETCH_DELAY_MS = clampInt(process.env.GOOGLE_ADS_FETCH_DELAY_MS, 1_500, 0, 30_000);
 const TIMEOUT_MS = clampInt(process.env.GOOGLE_ADS_TIMEOUT_MS, 20_000, 2_000, 60_000);
-const CREATIVE_LOOKUPS_PER_ADV = clampInt(process.env.GOOGLE_ADS_CREATIVE_LOOKUPS_PER_ADV, 2, 0, 10);
+// Detail lookups per advertiser. Mobile resolution now PREFERS a store URL over
+// a web one (see resolveAdvertiserDestination), so this is also how many of an
+// advertiser's creatives get scanned for a store destination before settling for
+// a web fallback. 3 gives app publishers that also run web ads a real chance to
+// surface their app-install creative; still bounded by the shared per-job budget.
+const CREATIVE_LOOKUPS_PER_ADV = clampInt(process.env.GOOGLE_ADS_CREATIVE_LOOKUPS_PER_ADV, 3, 0, 10);
 const SEND_REGION = process.env.GOOGLE_ADS_SEND_REGION === '1';
 // Creative-format filter for MOBILE jobs. The Transparency Center's internal
 // SearchCreatives RPC exposes no platform (Search/YouTube/Maps) filter — the one
@@ -758,15 +763,31 @@ export function parseCreativesResponse(json: unknown): {
   return { creatives, nextToken };
 }
 
+/** Extract the Play package id from a store URL (`?id=<package>`), or null.
+ *  Package names are `[A-Za-z0-9._]` — the same charset the classifier accepts. */
+export function playPackageId(u: string): string | null {
+  const m = u.match(/[?&]id=([A-Za-z0-9._]+)/);
+  return m ? m[1] : null;
+}
+
 /**
  * True for an app-store LISTING url (Play details page or Apple App Store). The
  * Play pattern MUST match the classifier's PLAY_RE (`/store/apps/details`) so a
  * non-listing Play link (developer / collection page) is NOT treated as a store
  * destination here and then mislabeled cps_web downstream. Shared by the JSON
  * and preview extractors so both agree on what counts as a mobile signal.
+ *
+ * A Play `/details` link is only a real store signal when it carries a non-empty
+ * `?id=<package>`. A bare `…/details?id` (empty package) is unusable — it can't
+ * be looked up and would emit a broken mobile lead — so it is REJECTED here and
+ * the resolver degrades to the advertiser domain (a web lead) instead. With the
+ * unescapeAdPreview fix real packages survive; this guard only catches genuinely
+ * unrecoverable links and any future re-truncation regression.
  */
 export function isStoreUrl(u: string): boolean {
-  return /play\.google\.com\/store\/apps\/details|apps\.apple\.com|itunes\.apple\.com/i.test(u);
+  if (/apps\.apple\.com|itunes\.apple\.com/i.test(u)) return true;
+  if (/play\.google\.com\/store\/apps\/details/i.test(u)) return playPackageId(u) !== null;
+  return false;
 }
 
 /**
@@ -842,11 +863,18 @@ export function extractPreviewRenderUrls(json: unknown): string[] {
  * Decode the layered escaping in an ad preview document so URLs can be matched:
  * `\xNN` / `\uNNNN` JS-string escapes, HTML entities (`&amp;`, `&quot;`, `&#47;`),
  * and escaped slashes (`\/`). Bounded work — operates on the raw body text.
+ *
+ * The `\\+x`/`\\+u` (one-OR-MORE leading backslashes) is load-bearing: live Play
+ * install-ad previews DOUBLE-escape the `=` in `?id=<package>` as `\\x3d`. A
+ * single-backslash regex leaves `\=`, and the URL extractor's terminator set
+ * (which includes `\`) then truncates the link at `?id` — dropping the package
+ * and producing the empty-`?id` store URLs seen in production. Consuming the run
+ * of backslashes decodes `\\x3d` → `=` so the full `?id=<package>` survives.
  */
 export function unescapeAdPreview(body: string): string {
   return body
-    .replace(/\\x([0-9a-fA-F]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
-    .replace(/\\u([0-9a-fA-F]{4})/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
+    .replace(/\\+x([0-9a-fA-F]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
+    .replace(/\\+u([0-9a-fA-F]{4})/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
     .replace(/&#0*47;/g, '/')
     .replace(/&amp;/gi, '&')
     .replace(/&quot;/gi, '"')
@@ -1337,6 +1365,15 @@ export async function resolveAdvertiserDestination(
       const { creatives } = parseCreativesResponse(cres.json);
       creativesSeen = creatives.length;
       let lookups = 0;
+      // Mobile jobs want a STORE destination specifically. Many app publishers run
+      // BOTH web ads and app-install ads, so the FIRST creative that resolves is
+      // often a web landing page — returning it immediately (the old behavior)
+      // meant the advertiser was logged as a web lead and the store creative,
+      // one lookup away, was never checked. So in mobileFocus we keep the first
+      // web destination as a FALLBACK and keep scanning this advertiser's
+      // remaining creatives (within the per-adv lookup cap + shared budget) for a
+      // store URL; a store destination still wins and returns immediately.
+      let webFallback: { url: string; fmt: DestinationResult['format']; note: string } | null = null;
       for (const c of creatives) {
         if (lookups >= CREATIVE_LOOKUPS_PER_ADV) break;
         if (!opts.lookupBudget.tryConsume()) break;
@@ -1357,8 +1394,14 @@ export async function resolveAdvertiserDestination(
         if (!dres.json) continue;
         const dest = extractDestinationUrl(dres.json);
         if (dest) {
-          format = c.format;
-          return { landingUrl: dest, format, creativesSeen, note: `creative:${c.format || 'unknown'}`, blocked: sawBlock, attemptedCreativeLookup };
+          if (!opts.mobileFocus || isStoreUrl(dest)) {
+            format = c.format;
+            return { landingUrl: dest, format, creativesSeen, note: `creative:${c.format || 'unknown'}`, blocked: sawBlock, attemptedCreativeLookup };
+          }
+          // mobileFocus + a non-store (web) destination: hold it and keep looking
+          // for a store URL in the advertiser's other creatives.
+          if (!webFallback) webFallback = { url: dest, fmt: c.format, note: `creative:${c.format || 'unknown'}` };
+          continue;
         }
         // No destination in the detail JSON — for image/video creatives the real
         // store/click URL lives inside the preview render, not the RPC payload.
@@ -1371,11 +1414,20 @@ export async function resolveAdvertiserDestination(
             if (prev.blocked) sawBlock = true;
             if (FETCH_DELAY_MS > 0) await sleep(FETCH_DELAY_MS);
             if (prev.landingUrl) {
-              format = c.format;
-              return { landingUrl: prev.landingUrl, format, creativesSeen, note: `preview:${c.format || 'unknown'}`, blocked: sawBlock, attemptedCreativeLookup };
+              if (isStoreUrl(prev.landingUrl)) {
+                format = c.format;
+                return { landingUrl: prev.landingUrl, format, creativesSeen, note: `preview:${c.format || 'unknown'}`, blocked: sawBlock, attemptedCreativeLookup };
+              }
+              if (!webFallback) webFallback = { url: prev.landingUrl, fmt: c.format, note: `preview:${c.format || 'unknown'}` };
             }
           }
         }
+      }
+      // Scanned the budgeted creatives without a store URL — use the best web
+      // click destination found (a real landing page) ahead of the bare domain.
+      if (webFallback) {
+        format = webFallback.fmt;
+        return { landingUrl: webFallback.url, format, creativesSeen, note: webFallback.note, blocked: sawBlock, attemptedCreativeLookup };
       }
     }
   }
@@ -1511,6 +1563,34 @@ export function runGoogleAdsScraperTests(): { passed: number; failed: number; fa
   check(unescapeAdPreview('a\\x3db\\x26c') === 'a=b&c', 'unescape: \\xNN hex escapes');
   check(unescapeAdPreview('x\\u003dy') === 'x=y', 'unescape: \\uNNNN escapes');
   check(unescapeAdPreview('a&amp;b&quot;c') === 'a&b"c', 'unescape: HTML entities');
+  // DOUBLE-backslash escape (\\x3d) as served by live Play install-ad previews —
+  // must collapse to a single '=' so the ?id=<package> is not truncated. This is
+  // the exact byte form captured from a real Duolingo video creative preview.
+  check(unescapeAdPreview('details?id\\\\x3dcom.duolingo') === 'details?id=com.duolingo', 'unescape: \\\\xNN double-backslash collapses to one char');
+  check(unescapeAdPreview('k\\\\u003dv') === 'k=v', 'unescape: \\\\uNNNN double-backslash collapses');
+
+  // playPackageId + isStoreUrl empty-id guard.
+  check(playPackageId('https://play.google.com/store/apps/details?id=com.foo.bar') === 'com.foo.bar', 'playPackageId: extracts package');
+  check(playPackageId('https://play.google.com/store/apps/details?id=com.foo&hl=en') === 'com.foo', 'playPackageId: stops at & (hl param present)');
+  check(playPackageId('https://play.google.com/store/apps/details?id') === null, 'playPackageId: null for empty ?id');
+  check(isStoreUrl('https://play.google.com/store/apps/details?id=com.foo'), 'isStoreUrl: Play with id is a store');
+  check(!isStoreUrl('https://play.google.com/store/apps/details?id'), 'isStoreUrl: Play with EMPTY id rejected');
+  check(!isStoreUrl('https://play.google.com/store/apps/details'), 'isStoreUrl: Play with no id param rejected');
+  check(isStoreUrl('https://apps.apple.com/us/app/foo/id123456789'), 'isStoreUrl: Apple listing is a store');
+
+  // End-to-end: the exact real preview byte form (double-escaped '=') must now
+  // recover the FULL Play listing, not the truncated empty-?id form that broke
+  // mobile leads in production (hq-split "Play URL missing ?id= param").
+  const previewDoubleEsc =
+    'x "https://play.google.com/store/apps/details?id\\\\x3dcom.duolingo\\x27,final_url: \\x27\\x27";';
+  check(
+    extractDestinationFromPreview(previewDoubleEsc) === 'https://play.google.com/store/apps/details?id=com.duolingo',
+    'preview: double-escaped Play id recovered in full (regression guard for empty-?id truncation)',
+  );
+  // And a preview whose only Play link is a bare empty-?id yields null (→ domain
+  // fallback / web lead) rather than a broken mobile lead.
+  const previewEmptyId = 'y "https://play.google.com/store/apps/details?id" z';
+  check(extractDestinationFromPreview(previewEmptyId) === null, 'preview: bare empty-?id Play link yields null (no broken mobile lead)');
 
   // extractDestinationFromPreview — the REAL production shape captured live
   // (Duolingo video creative): adurl= holds the Play listing, percent-encoded,

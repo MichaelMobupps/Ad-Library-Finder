@@ -59,8 +59,13 @@ import { runHqSplitWeb } from './hqSplitWeb.js';
 import { checkProxyTrafficBeforeJob, logProxyTrafficAfterJob, type ProxyTrafficSnapshot } from './proxyTraffic.js';
 import { log } from './logger.js';
 
-/** Per-job cap on GetCreativeById lookups (each is one extra RPC round-trip). */
-const MAX_CREATIVE_LOOKUPS = Number(process.env.GOOGLE_ADS_MAX_LOOKUPS) || 60;
+/** Per-job cap on GetCreativeById lookups (each is one extra RPC round-trip).
+ *  Only MOBILE jobs spend these (CPS skips creatives), and each lookup is now
+ *  far more productive since the preview store-URL truncation was fixed — so the
+ *  budget is the main lever on how many advertisers get a shot at a store URL.
+ *  Raised from 60 → 100 so resolution doesn't stall a quarter of the way through
+ *  a wide discovery. Env-tunable via GOOGLE_ADS_MAX_LOOKUPS. */
+const MAX_CREATIVE_LOOKUPS = Number(process.env.GOOGLE_ADS_MAX_LOOKUPS) || 100;
 /** Hard cap on advertisers processed per job (defensive; a wide keyword set can
  *  surface thousands). */
 const MAX_ADVERTISERS = Number(process.env.GOOGLE_ADS_MAX_ADVERTISERS) || 1000;
@@ -198,16 +203,36 @@ export async function runGoogleAdsJob(job: JobRow): Promise<void> {
       onLog('info', `google-ads: using ${keywords.length} custom keywords`);
     } else {
       const limit = params.maxKeywords && params.maxKeywords > 0 ? params.maxKeywords : DEFAULT_MAX_KEYWORDS;
+      // A MOBILE lead requires a store destination, which only appears in the ads
+      // of app/game publishers. Those advertisers are surfaced by app-name and
+      // app-category tokens — the 'apps' vertical — NOT by the web-CPS verticals
+      // (casino, betting, dating…) that dominate the bank. So when a mobile job
+      // doesn't pin its own verticals, default it to 'apps' instead of sampling
+      // the whole (web-oriented) bank. An explicit vertical selection always wins,
+      // and CPS/web jobs keep the full-bank default.
+      const mobileJob = job.product_type === 'mobile';
+      const pinnedVerticals = !!(params.verticals && params.verticals.length > 0);
+      let defaulted = mobileJob && !pinnedVerticals;
+      let effectiveVerticals = pinnedVerticals ? params.verticals! : defaulted ? ['apps'] : null;
       keywords = keywordsForJob({
-        verticals: params.verticals || null,
+        verticals: effectiveVerticals,
         languages: params.languages || null,
         limit,
       });
+      // The 'apps' vertical is English-only, so a mobile default combined with a
+      // non-English language filter can yield nothing. Rather than run a 0-lead
+      // job, fall back to the full bank under the same language filter.
+      if (defaulted && keywords.length === 0) {
+        keywords = keywordsForJob({ verticals: null, languages: params.languages || null, limit });
+        defaulted = false;
+        effectiveVerticals = null;
+        onLog('info', "google-ads: 'apps' vertical had no keywords for the requested language(s) — falling back to the full keyword bank");
+      }
       const stats = keywordStats();
       onLog(
         'info',
         `google-ads: drew ${keywords.length} keywords from the exemplar bank (${stats.total} total, ${stats.languages} languages, ${stats.verticals} verticals)` +
-          `${params.verticals?.length ? `; verticals=${params.verticals.join(',')}` : ''}` +
+          `${effectiveVerticals?.length ? `; verticals=${effectiveVerticals.join(',')}${defaulted ? ' (mobile default)' : ''}` : ''}` +
           `${params.languages?.length ? `; languages=${params.languages.join(',')}` : ''}`,
       );
     }
