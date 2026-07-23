@@ -307,6 +307,41 @@ const VERTICAL_DEFS: VerticalDef[] = [
       'dinner delivery', 'lunch delivery', 'breakfast delivery', 'drink delivery', 'alcohol delivery',
     ],
   },
+  {
+    // MOBILE-APP PUBLISHERS. Unlike the other verticals (which surface web-CPS
+    // advertisers whose ads land on a website), this one targets the companies
+    // that promote a Google Play / App Store LISTING. GATC matches advertiser
+    // NAMES and domains, and app publishers cluster around two token families:
+    //   • APP-CATEGORY terms that recur in game/app names and campaigns
+    //     (solitaire, puzzle, rpg, idle, merge, tycoon, launcher, cleaner, vpn…)
+    //   • Legal-entity NAME tokens common to app studios worldwide
+    //     ("Games", "Studio(s)", "Interactive", "PTE. LTD.", "Network Technology"…)
+    // Mobile jobs default to this vertical (see googleAdsPipeline) because a store
+    // destination — the thing that makes a MOBILE lead — only appears in the ads
+    // of these advertisers. Keep it broad: breadth of names = breadth of the pull.
+    meta: { id: 'apps', label: 'Mobile Apps / Games', hint: 'App & game publishers (Play / App Store listings)' },
+    en: [
+      // App-category / game-genre terms (recur in app names + install campaigns)
+      'games', 'gaming', 'mobile game', 'mobile games', 'free game', 'play free', 'download game',
+      'game download', 'install game', 'best mobile game', 'hyper casual', 'casual games', 'arcade game',
+      'puzzle', 'puzzle game', 'match 3', 'merge game', 'idle game', 'clicker game', 'tycoon game',
+      'simulation game', 'strategy game', 'rpg game', 'mmorpg', 'card game', 'board game', 'trivia game',
+      'word game', 'solitaire', 'sudoku', 'mahjong', 'bingo app', 'slots app', 'poker app', 'chess app',
+      'racing game', 'shooter game', 'battle royale', 'sandbox game', 'farm game', 'city builder',
+      // App utility categories (non-game publishers)
+      'vpn app', 'photo editor', 'video editor', 'photo app', 'wallpaper app', 'launcher', 'keyboard app',
+      'cleaner app', 'antivirus app', 'file manager', 'music app', 'streaming app', 'meditation app',
+      'fitness app', 'workout app', 'habit tracker', 'language app', 'learning app', 'scanner app',
+      'ai app', 'ai chat app', 'ai photo', 'ai art', 'wallet app', 'budget app', 'dating app',
+      // Generic install intents
+      'app', 'apps', 'mobile app', 'download app', 'install app', 'get the app', 'app store', 'google play',
+      // Class C legal-entity NAME tokens common to app/game studios worldwide
+      'game studio', 'game studios', 'studio', 'studios', 'interactive', 'entertainment', 'digital entertainment',
+      'game network', 'network technology', 'information technology', 'internet technology', 'mobile technology',
+      'game labs', 'labs', 'game tech', 'games ltd', 'games limited', 'media limited', 'pte ltd',
+      'technology limited', 'gaming ltd', 'game inc', 'apps inc', 'mobile inc', 'play games',
+    ],
+  },
 ];
 
 export const GOOGLE_ADS_VERTICALS: GoogleAdsVerticalMeta[] = VERTICAL_DEFS.map((v) => v.meta);

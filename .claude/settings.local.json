@@ -15,7 +15,8 @@
       "Bash(cp /home/runner/workspace/artifacts/api-server/src/googleAdsPipeline.ts /home/runner/workspace/source-code/src/googleAdsPipeline.ts)",
       "Bash(GOOGLE_ADS_FETCH_DELAY_MS=800 node *)",
       "Bash(npx tsc *)",
-      "Bash(echo \"---exit $?---\")"
+      "Bash(echo \"---exit $?---\")",
+      "Bash(printenv)"
     ]
   }
 }
