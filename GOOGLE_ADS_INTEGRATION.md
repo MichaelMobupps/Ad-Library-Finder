@@ -32,6 +32,28 @@ Wired into: `db.ts` (JobSource), `queue.ts` (dispatch), `routes-jobs.ts`
 (validation + `GET /api/jobs/google-ads-verticals`), and the dashboard
 (`api/client.ts`, `App.tsx`, `styles.css`).
 
+## Mobile (YouTube/CTV) resolution
+
+Mobile jobs sell into app-install / Connected-TV, so they focus on **video
+creatives** and resolve their **app-store** destination:
+
+- **Format focus.** The Transparency Center's internal `SearchCreatives` RPC
+  exposes **no** platform (Search/YouTube/Maps) filter — the only working lever
+  is creative **format** (payload field `"4"`: 1=text, 2=image, 3=video). YouTube
+  and CTV app-install ads are video, so mobile jobs filter to video by default
+  (`GOOGLE_ADS_MOBILE_CREATIVE_FORMAT=3`, `0`=all formats). This concentrates the
+  capped creative-lookup budget on exactly the surface we sell into.
+- **Preview hop (the fix for empty mobile CSVs).** The store URL is **not** in the
+  `GetCreativeById` payload — that only carries a
+  `displayads-formats.googleusercontent.com/ads/preview/content.js` render URL.
+  The real Play/App-Store link is inside that preview document's `adurl=` param.
+  When a creative detail yields no direct destination, the resolver fetches the
+  preview once (through the proxy) and extracts the store/click URL
+  (`GOOGLE_ADS_PREVIEW_FETCH=1`). Verified live: video creatives resolve to
+  `play.google.com/store/apps/details?id=…` and `apps.apple.com` / `itunes` links.
+- **CPS/web is untouched** — those jobs never fetch creatives; both the format
+  filter and the preview hop are gated behind mobile-only `mobileFocus`.
+
 ## Cost & safety profile
 
 - **Classifier uses no LLM.** A store URL ⇒ Mobile; any other real destination ⇒

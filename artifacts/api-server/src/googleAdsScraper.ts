@@ -43,6 +43,20 @@ const FETCH_DELAY_MS = clampInt(process.env.GOOGLE_ADS_FETCH_DELAY_MS, 1_500, 0,
 const TIMEOUT_MS = clampInt(process.env.GOOGLE_ADS_TIMEOUT_MS, 20_000, 2_000, 60_000);
 const CREATIVE_LOOKUPS_PER_ADV = clampInt(process.env.GOOGLE_ADS_CREATIVE_LOOKUPS_PER_ADV, 2, 0, 10);
 const SEND_REGION = process.env.GOOGLE_ADS_SEND_REGION === '1';
+// Creative-format filter for MOBILE jobs. The Transparency Center's internal
+// SearchCreatives RPC exposes no platform (Search/YouTube/Maps) filter — the one
+// working lever is creative FORMAT via payload field "4" (1=text, 2=image,
+// 3=video). YouTube / Connected-TV app-install ads are VIDEO creatives, so mobile
+// jobs default to video-only: it concentrates the limited creative-lookup budget
+// on exactly the surface we sell into (CTV) and is where store destinations live.
+// 0 = no filter (all formats). CPS/web jobs never touch creatives, so unaffected.
+const MOBILE_CREATIVE_FORMAT = clampInt(process.env.GOOGLE_ADS_MOBILE_CREATIVE_FORMAT, 3, 0, 3);
+// The store URL is NOT in the GetCreativeById JSON for image/video creatives —
+// that payload only carries a displayads-formats "preview" render URL. The real
+// Play/App-Store click target lives inside that preview document's `adurl=`
+// param, so mobile resolution fetches the preview once and reads it out. This is
+// the single fix that makes store URLs (⇒ mobile leads) actually resolve.
+const PREVIEW_FETCH = process.env.GOOGLE_ADS_PREVIEW_FETCH !== '0';
 // On a soft block (429/403/challenge) we retry a few times with exponential
 // backoff before giving up on that request. A transient rate-limit window
 // usually clears within one or two backoffs; a hard IP block will exhaust them
@@ -538,7 +552,7 @@ export function looksLikeDomain(s: unknown): boolean {
 }
 
 const ASSET_HOST_RE =
-  /(^|\.)(gstatic\.com|googleusercontent\.com|ggpht\.com|googlesyndication\.com|google\.com|googleapis\.com|youtube\.com|ytimg\.com|doubleclick\.net|google-analytics\.com|schema\.org|w3\.org)$/i;
+  /(^|\.)(gstatic\.com|googleusercontent\.com|ggpht\.com|googlesyndication\.com|google\.com|googleapis\.com|googletagservices\.com|googletagmanager\.com|ampproject\.org|2mdn\.net|googlevideo\.com|gvt1\.com|gvt2\.com|app-measurement\.com|youtube\.com|ytimg\.com|doubleclick\.net|google-analytics\.com|schema\.org|w3\.org)$/i;
 
 /** Google click-wrappers expose the real destination in an `adurl`/`url`/`q`
  *  query param. Unwrap them; return the input unchanged if not a wrapper. */
@@ -745,6 +759,17 @@ export function parseCreativesResponse(json: unknown): {
 }
 
 /**
+ * True for an app-store LISTING url (Play details page or Apple App Store). The
+ * Play pattern MUST match the classifier's PLAY_RE (`/store/apps/details`) so a
+ * non-listing Play link (developer / collection page) is NOT treated as a store
+ * destination here and then mislabeled cps_web downstream. Shared by the JSON
+ * and preview extractors so both agree on what counts as a mobile signal.
+ */
+export function isStoreUrl(u: string): boolean {
+  return /play\.google\.com\/store\/apps\/details|apps\.apple\.com|itunes\.apple\.com/i.test(u);
+}
+
+/**
  * Pull the ad's click destination out of a GetCreativeById response: the first
  * non-Google, non-asset http(s) URL, with googleadservices/doubleclick click
  * wrappers unwrapped to their real `adurl`. Play/App-Store links win if present.
@@ -764,13 +789,8 @@ export function extractDestinationUrl(json: unknown): string | null {
 
   // An app-store destination is an unambiguous mobile signal and always wins —
   // even though play.google.com shares the google.com suffix that the asset
-  // filter otherwise rejects. The Play pattern MUST match the classifier's
-  // PLAY_RE (`/store/apps/details`) so a non-listing Play link (developer /
-  // collection page) does NOT win here and then get mislabeled cps_web
-  // downstream — in that case the real website in the same creative should win.
-  const isStore = (u: string) =>
-    /play\.google\.com\/store\/apps\/details|apps\.apple\.com|itunes\.apple\.com/i.test(u);
-  const store = cleaned.find(isStore);
+  // filter otherwise rejects.
+  const store = cleaned.find(isStoreUrl);
   if (store) return store;
 
   // Otherwise drop ad-serving assets and Google-owned hosts, keep the first real host.
@@ -783,6 +803,102 @@ export function extractDestinationUrl(json: unknown): string | null {
     }
   });
   return nonGoogle || rest[0] || null;
+}
+
+/** URL-decode best-effort: return the raw string if it isn't valid %-encoding. */
+function safeDecodeURIComponent(s: string): string {
+  try {
+    return decodeURIComponent(s);
+  } catch {
+    return s;
+  }
+}
+
+/**
+ * The GetCreativeById detail for an image/video creative doesn't contain the
+ * click destination — only a "preview" render URL on
+ * displayads-formats.googleusercontent.com. Collect those preview URLs so the
+ * resolver can fetch one and read the real destination out of its body.
+ */
+export function extractPreviewRenderUrls(json: unknown): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const s of collectStrings(json)) {
+    if (typeof s !== 'string') continue;
+    const m = s.match(
+      /https?:\/\/[a-z0-9.-]*googleusercontent\.com\/[^\s"'<>\\]*?ads\/preview\/[^\s"'<>\\]+/gi,
+    );
+    if (!m) continue;
+    for (const u of m) {
+      if (seen.has(u)) continue;
+      seen.add(u);
+      out.push(u);
+    }
+  }
+  return out;
+}
+
+/**
+ * Decode the layered escaping in an ad preview document so URLs can be matched:
+ * `\xNN` / `\uNNNN` JS-string escapes, HTML entities (`&amp;`, `&quot;`, `&#47;`),
+ * and escaped slashes (`\/`). Bounded work — operates on the raw body text.
+ */
+export function unescapeAdPreview(body: string): string {
+  return body
+    .replace(/\\x([0-9a-fA-F]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
+    .replace(/\\u([0-9a-fA-F]{4})/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
+    .replace(/&#0*47;/g, '/')
+    .replace(/&amp;/gi, '&')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#0*39;|&apos;/gi, "'")
+    .replace(/\\\//g, '/');
+}
+
+/**
+ * Extract the real click destination from a fetched ad-preview body. The
+ * authoritative source is the creative's `adurl=` param (the click-through the
+ * ad points at); an app-store LISTING url anywhere in the body also wins because
+ * it is an unambiguous mobile signal. Non-store WEB destinations are taken ONLY
+ * from `adurl=` (a trusted click target) — never from an arbitrary URL in the
+ * body, which for a preview is almost always Google ad-serving infrastructure.
+ * Returns null when nothing trustworthy is present (caller falls back to domain).
+ */
+export function extractDestinationFromPreview(body: string): string | null {
+  if (!body) return null;
+  const decoded = unescapeAdPreview(body);
+
+  // adurl= click targets (percent-encoded) — decode + unwrap nested wrappers.
+  // Google percent-encodes the whole adurl value (inner `&` → %26), so capturing
+  // up to the first literal `&`/`"` yields the complete URL. If a value ever
+  // carried an un-encoded `&amp;`-separated param it would truncate there — but
+  // that only shortens a same-host WEB lead (deduped by host anyway), and store
+  // URLs are immune (host+listing-id lead the value), so it's acceptable.
+  const adurls: string[] = [];
+  for (const m of decoded.matchAll(/adurl=([^&"'\s\\<>]+)/gi)) {
+    const v = unwrapGoogleClickUrl(safeDecodeURIComponent(m[1]));
+    if (/^https?:\/\//i.test(v)) adurls.push(v);
+  }
+  // Plain absolute URLs already present in the body (used for store scan only).
+  const plain = (decoded.match(/https?:\/\/[^\s"'<>\\)]+/gi) || []).map((u) => unwrapGoogleClickUrl(u));
+
+  // Store listing: safe to accept from anywhere (adurl first, then plain body).
+  const store = [...adurls, ...plain].find(isStoreUrl);
+  if (store) return store;
+
+  // Non-store web destination: trust ONLY an adurl click target, and only when
+  // it isn't ad-serving infrastructure. Mirror extractDestinationUrl's guard —
+  // reject ANY google.<tld> host (google.co.uk, google.de, …), which ASSET_HOST_RE
+  // alone (google.com only) would let through — so a stray Google-property click
+  // target never lands in the CPS CSV as a bogus advertiser website.
+  const web = adurls.find((u) => {
+    if (isStoreUrl(u) || isAssetUrl(u)) return false;
+    try {
+      return !/(^|\.)google\.[a-z.]+$/i.test(new URL(u).hostname);
+    } catch {
+      return false;
+    }
+  });
+  return web || null;
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -1118,6 +1234,50 @@ export interface ResolveDestinationOptions {
    *  from the verified domain only (no network). Set by the pipeline's circuit
    *  breaker once the creative endpoint starts hard-blocking. */
   skipCreativeLookups?: boolean;
+  /** Mobile job: restrict SearchCreatives to the configured creative format
+   *  (video/CTV by default) and, when a creative's detail carries no direct
+   *  destination, fetch its preview to recover the store URL. Web/CPS leaves
+   *  this false — those jobs don't touch creatives at all. */
+  mobileFocus?: boolean;
+}
+
+/**
+ * Fetch an ad-preview render document (through the proxy) and read the real
+ * click destination out of it — the store/adurl link that the GetCreativeById
+ * JSON does not contain. Best-effort: returns null on any failure. A 429/403
+ * sets `blocked` so the caller can feed the circuit breaker (the preview host is
+ * Google infrastructure and is rate-limited alongside the RPC endpoint).
+ */
+async function fetchPreviewDestination(
+  url: string,
+  onLog?: LogFn,
+): Promise<{ landingUrl: string | null; blocked: boolean }> {
+  try {
+    const res = await fetch(url, withProxy({
+      method: 'GET',
+      headers: {
+        'user-agent': FETCH_HEADERS['user-agent'],
+        accept: '*/*',
+        'accept-language': FETCH_HEADERS['accept-language'],
+        referer: `${BASE}/`,
+      },
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    }, onLog));
+    if (res.status === 429 || res.status === 403) {
+      await res.text().catch(() => '');
+      onLog?.('debug', `google-ads: preview fetch → ${res.status} (blocked)`);
+      return { landingUrl: null, blocked: true };
+    }
+    if (!res.ok) {
+      await res.text().catch(() => '');
+      return { landingUrl: null, blocked: false };
+    }
+    const body = await res.text();
+    return { landingUrl: extractDestinationFromPreview(body), blocked: false };
+  } catch (err) {
+    onLog?.('debug', `google-ads: preview fetch failed (${(err as Error).message})`);
+    return { landingUrl: null, blocked: false };
+  }
 }
 
 /**
@@ -1151,14 +1311,21 @@ export async function resolveAdvertiserDestination(
     opts.lookupBudget.remaining() > 0
   ) {
     attemptedCreativeLookup = true;
+    const creativeFilter: Record<string, unknown> = { '12': { '1': '', '2': true }, '13': { '1': [adv.advertiser_id] } };
+    // Mobile focus: filter to the configured creative format (field "4";
+    // 3=video ⇒ YouTube/CTV). This is the only working platform-ish lever the
+    // internal RPC exposes and concentrates the lookup budget on the CTV surface.
+    if (opts.mobileFocus && MOBILE_CREATIVE_FORMAT > 0) {
+      creativeFilter['4'] = MOBILE_CREATIVE_FORMAT;
+    }
+    if (SEND_REGION && opts.region) {
+      creativeFilter['8'] = opts.region;
+    }
     const creativesPayload: Record<string, unknown> = {
       '2': CREATIVES_LIMIT,
-      '3': { '12': { '1': '', '2': true }, '13': { '1': [adv.advertiser_id] } },
+      '3': creativeFilter,
       '7': { '1': 1 },
     };
-    if (SEND_REGION && opts.region) {
-      (creativesPayload['3'] as Record<string, unknown>)['8'] = opts.region;
-    }
     const cres = await rpcPost(
       'SearchService/SearchCreatives',
       creativesPayload,
@@ -1192,6 +1359,22 @@ export async function resolveAdvertiserDestination(
         if (dest) {
           format = c.format;
           return { landingUrl: dest, format, creativesSeen, note: `creative:${c.format || 'unknown'}`, blocked: sawBlock, attemptedCreativeLookup };
+        }
+        // No destination in the detail JSON — for image/video creatives the real
+        // store/click URL lives inside the preview render, not the RPC payload.
+        // Fetch it once and read the destination out. This is the hop that makes
+        // store URLs (⇒ mobile leads) resolve; without it mobile jobs find none.
+        if (opts.mobileFocus && PREVIEW_FETCH) {
+          const previewUrl = extractPreviewRenderUrls(dres.json)[0];
+          if (previewUrl) {
+            const prev = await fetchPreviewDestination(previewUrl, onLog);
+            if (prev.blocked) sawBlock = true;
+            if (FETCH_DELAY_MS > 0) await sleep(FETCH_DELAY_MS);
+            if (prev.landingUrl) {
+              format = c.format;
+              return { landingUrl: prev.landingUrl, format, creativesSeen, note: `preview:${c.format || 'unknown'}`, blocked: sawBlock, attemptedCreativeLookup };
+            }
+          }
         }
       }
     }
@@ -1315,6 +1498,54 @@ export function runGoogleAdsScraperTests(): { passed: number; failed: number; fa
   );
   const detailNone = `)]}'\n{"5":{"a":"https://www.gstatic.com/x.png"}}`;
   check(extractDestinationUrl(parseRpcJson(detailNone)) === null, 'destination: null when only assets');
+
+  // extractPreviewRenderUrls — lifts the displayads-formats preview URL out of a
+  // GetCreativeById detail (the URL that hides the real store/click destination).
+  const detailPreview = `)]}'
+{"1":{"1":"AR0","2":"CR0","4":3,"5":[{"1":{"4":"https://displayads-formats.googleusercontent.com/ads/preview/content.js?client=ads-integrity-transparency&creativeId=1&responseCallback=cb"}}]}}`;
+  const previewUrls = extractPreviewRenderUrls(parseRpcJson(detailPreview));
+  check(previewUrls.length === 1 && previewUrls[0].includes('/ads/preview/content.js'), 'preview: render URL extracted from detail');
+  check(extractPreviewRenderUrls(parseRpcJson(detailNone)).length === 0, 'preview: none when detail has no render URL');
+
+  // unescapeAdPreview — layered JS/HTML escaping seen in real preview bodies.
+  check(unescapeAdPreview('a\\x3db\\x26c') === 'a=b&c', 'unescape: \\xNN hex escapes');
+  check(unescapeAdPreview('x\\u003dy') === 'x=y', 'unescape: \\uNNNN escapes');
+  check(unescapeAdPreview('a&amp;b&quot;c') === 'a&b"c', 'unescape: HTML entities');
+
+  // extractDestinationFromPreview — the REAL production shape captured live
+  // (Duolingo video creative): adurl= holds the Play listing, percent-encoded,
+  // terminated by \x26quot;. This is exactly the byte form the preview serves.
+  const previewPlay =
+    'var x=[null,"\\x26amp;rf\\x3d1\\x26amp;adurl\\x3dhttps%3A%2F%2Fplay.google.com%2Fstore%2Fapps%2Fdetails%3Fid%3Dcom.duolingo\\x26quot;,null,"https://googleads.g.doubleclick.net/pagead/x"];';
+  check(
+    extractDestinationFromPreview(previewPlay) === 'https://play.google.com/store/apps/details?id=com.duolingo',
+    'preview: Play store URL recovered from adurl (real byte form)',
+  );
+  // Apple store link appearing as a plain URL in the body still wins.
+  const previewApple = 'foo "https://itunes.apple.com/app/id6761767428?mt=8" bar';
+  check(
+    extractDestinationFromPreview(previewApple) === 'https://itunes.apple.com/app/id6761767428?mt=8',
+    'preview: Apple store URL recovered from plain body',
+  );
+  // A preview that is ONLY ad-serving infra (no adurl, no store) → null, so the
+  // resolver falls back to the verified domain instead of emitting infra as a lead.
+  const previewInfra =
+    'a "https://www.gstatic.com/x.js" b "https://www.googletagservices.com/tag/js/gpt.js" c "https://tpc.googlesyndication.com/y.png"';
+  check(extractDestinationFromPreview(previewInfra) === null, 'preview: infra-only body yields null (no false web lead)');
+  // A non-store adurl (real advertiser site) is trusted and returned as web.
+  const previewWeb = 'q\\x26amp;adurl\\x3dhttps%3A%2F%2Fwww.brand.com%2Flp\\x26quot;';
+  check(
+    extractDestinationFromPreview(previewWeb) === 'https://www.brand.com/lp',
+    'preview: non-store adurl returned as web destination',
+  );
+  // A Google-property click target (any ccTLD) must NOT leak as a web lead.
+  const previewGoogleTld = 'x\\x26amp;adurl\\x3dhttps%3A%2F%2Fwww.google.co.uk%2Fmaps\\x26quot;';
+  check(extractDestinationFromPreview(previewGoogleTld) === null, 'preview: google.<ccTLD> adurl rejected (not a web lead)');
+  // Google ad-serving CDNs (2mdn / googlevideo) are assets, never a destination.
+  check(isAssetUrl('https://s0.2mdn.net/viewad/x'), 'asset: 2mdn.net CDN blocked');
+  check(isAssetUrl('https://r1.googlevideo.com/videoplayback'), 'asset: googlevideo.com blocked');
+  const previewCdn = 'a\\x26amp;adurl\\x3dhttps%3A%2F%2Fs0.2mdn.net%2Fviewad%2Fx\\x26quot;';
+  check(extractDestinationFromPreview(previewCdn) === null, 'preview: 2mdn adurl rejected (asset, not a web lead)');
 
   // firstResultArray fallback
   check(firstResultArray({ '7': [{ a: 1 }] }).length === 1, 'firstResultArray finds array under drifted key');
