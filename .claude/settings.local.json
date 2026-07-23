@@ -4,7 +4,18 @@
       "WebSearch",
       "Bash(node *)",
       "Bash(cp artifacts/api-server/src/googleAdsScraper.ts source-code/src/googleAdsScraper.ts)",
-      "Bash(pnpm build *)"
+      "Bash(pnpm build *)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" -m 10 \"https://adstransparency.google.com/?region=anywhere\" -A \"Mozilla/5.0 \\(Macintosh; Intel Mac OS X 10_15_7\\) AppleWebKit/537.36 \\(KHTML, like Gecko\\) Chrome/130.0.0.0 Safari/537.36\")",
+      "Bash(curl -s -m 15 \"https://adstransparency.google.com/?region=anywhere\" -A \"Mozilla/5.0\" -o home.html)",
+      "Bash(curl -s -m 30 \"https://adstransparency.google.com/main_light_binary.js\" -A \"Mozilla/5.0\" -o main.js)",
+      "Bash(curl -s -m 60 -A \"Mozilla/5.0\" -o app.js -w \"%{http_code} %{size_download}\\\\n\" \"https://www.gstatic.com/acx/transparency/report/acx-tfaar-tfaa-report-ui-frontend_auto_20260720-0645_RC000/gci_91f30755d6a6b787dcc2a4062e6e9824.js\")",
+      "Bash(curl -s -m 90 -A \"Mozilla/5.0\" -o app.js -w \"%{http_code} %{size_download}\\\\n\" \"https://www.gstatic.com/acx/transparency/report/acx-tfaar-tfaa-report-ui-frontend_auto_20260720-0645_RC000/main.dart.js\")",
+      "Bash(grep -oE '\"PLATFORM[_A-Z]*\"[^\\)]{0,30}' app.js)",
+      "Bash(cp /home/runner/workspace/artifacts/api-server/src/googleAdsScraper.ts /home/runner/workspace/source-code/src/googleAdsScraper.ts)",
+      "Bash(cp /home/runner/workspace/artifacts/api-server/src/googleAdsPipeline.ts /home/runner/workspace/source-code/src/googleAdsPipeline.ts)",
+      "Bash(GOOGLE_ADS_FETCH_DELAY_MS=800 node *)",
+      "Bash(npx tsc *)",
+      "Bash(echo \"---exit $?---\")"
     ]
   }
 }

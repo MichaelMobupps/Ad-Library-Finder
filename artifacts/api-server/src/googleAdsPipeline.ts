@@ -295,7 +295,7 @@ export async function runGoogleAdsJob(job: JobRow): Promise<void> {
       processed++;
       if (processed === 1) setJobPhase(job.id, 'classifying', 'resolving as discovered…');
 
-      const dest = await resolveAdvertiserDestination(adv, { region, lookupBudget, onLog, skipCreativeLookups });
+      const dest = await resolveAdvertiserDestination(adv, { region, lookupBudget, onLog, skipCreativeLookups, mobileFocus: !cpsMode });
 
       // Circuit-breaker accounting — creative-endpoint outcomes only.
       if (!skipCreativeLookups && dest.attemptedCreativeLookup) {
