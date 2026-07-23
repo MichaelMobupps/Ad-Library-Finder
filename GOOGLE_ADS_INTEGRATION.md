@@ -73,6 +73,17 @@ Set **`GOOGLE_ADS_PROXY_URL`** to a residential/mobile proxy gateway to egress t
 (only) from an un-flagged IP; the rest of the server keeps direct egress. Credentials in the
 URL are redacted in logs. For rotating pools, point it at the provider's gateway endpoint.
 
+**Exit rotation on penalty box.** When a proxy is configured and the warm-up GET answers
+429/403, the scraper no longer gives up on the first burned exit IP: it rotates to a fresh
+exit — tearing down the proxy connection pool and, if the URL carries a literal
+`{session}` placeholder, minting a new session token — re-warms, and only latches the
+cooldown after **`GOOGLE_ADS_EXIT_ROTATIONS`** (default 2) fresh exits are all blocked.
+Each attempt logs the actual **exit IP** (fetched through the proxy from a neutral IP echo,
+`GOOGLE_ADS_IP_ECHO_URL`, default api.ipify.org) so the logs prove whether the pool really
+rotated or handed back the same burned IP. Block responses are also fingerprinted
+("block forensics": server header + body signature) to distinguish a genuine Google
+penalty page from a 429 the proxy provider generated itself.
+
 A **set-but-unusable** `GOOGLE_ADS_PROXY_URL` (an unfilled `HOST:PORT`/`USER:PASS`
 placeholder, or a string that doesn't parse as a URL) **fails the job at start** with an
 explicit config error — it does NOT silently fall back to direct egress, which would

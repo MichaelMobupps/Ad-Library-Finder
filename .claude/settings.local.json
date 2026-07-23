@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "Bash(node *)",
+      "Bash(cp artifacts/api-server/src/googleAdsScraper.ts source-code/src/googleAdsScraper.ts)",
+      "Bash(pnpm build *)"
+    ]
+  }
+}
