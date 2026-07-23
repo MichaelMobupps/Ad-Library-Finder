@@ -66,16 +66,37 @@ export function buildCsv(input: BuildCsvInput): { path: string; rowsWritten: num
     //   app_store_link, itunes_link, google_play_link, app_url.
     // "preview_url" is NOT in that list. Both the Affplus pipeline and the
     // Meta scraper feed EP through this same writer, so both benefit.
-    header = 'advertiser_name,country,store_url,store,ad_text';
-    rows = mobile.map((r) =>
-      [
-        escapeFreeText(r.advertiser_name),
-        escapeCsv(r.country),
-        escapeCsv(r.store_url),
-        escapeCsv(r.classification === 'mobile_google_play' ? 'google_play' : 'app_store'),
-        escapeFreeText(r.ad_text),
-      ].join(',')
-    );
+    //
+    // app_category / is_game are appended ONLY when at least one included row was
+    // enriched (GATC mobile jobs). Meta / Affplus / AppGoblin leave these NULL, so
+    // their CSVs keep the exact original 5-column shape — no cross-pipeline drift.
+    // EP keys on header names it recognizes and ignores the extra columns.
+    const enriched = mobile.some((r) => r.app_category != null || r.is_game != null);
+    if (enriched) {
+      header = 'advertiser_name,country,store_url,store,app_category,is_game,ad_text';
+      rows = mobile.map((r) =>
+        [
+          escapeFreeText(r.advertiser_name),
+          escapeCsv(r.country),
+          escapeCsv(r.store_url),
+          escapeCsv(r.classification === 'mobile_google_play' ? 'google_play' : 'app_store'),
+          escapeFreeText(r.app_category),
+          escapeCsv(r.is_game == null ? '' : r.is_game ? 'true' : 'false'),
+          escapeFreeText(r.ad_text),
+        ].join(',')
+      );
+    } else {
+      header = 'advertiser_name,country,store_url,store,ad_text';
+      rows = mobile.map((r) =>
+        [
+          escapeFreeText(r.advertiser_name),
+          escapeCsv(r.country),
+          escapeCsv(r.store_url),
+          escapeCsv(r.classification === 'mobile_google_play' ? 'google_play' : 'app_store'),
+          escapeFreeText(r.ad_text),
+        ].join(',')
+      );
+    }
   } else {
     // CPS: web destinations only.
     const cps = results.filter((r) => r.classification === 'cps_web' && r.landing_url);

@@ -11,6 +11,7 @@ export type JobPhase =
   | 'starting'
   | 'scraping'
   | 'classifying'
+  | 'enriching'
   | 'building_csv'
   | 'hq_splitting'
   | 'done'
@@ -72,6 +73,10 @@ export interface JobResultRow {
   ad_text: string | null;
   country: string;
   created_at: number;
+  /** App-store category label (game vs non-game enrichment). Null = not enriched. */
+  app_category: string | null;
+  /** 1=game, 0=non-game, null=unknown/unclassified (or non-mobile lead). */
+  is_game: number | null;
 }
 
 export interface UserRow {
@@ -234,6 +239,18 @@ export async function initDb() {
   }
   if (!colNames.has('run_after')) {
     db.exec(`ALTER TABLE jobs ADD COLUMN run_after INTEGER`);
+  }
+
+  // Idempotent additive migrations on job_results: app-category enrichment
+  // (game vs non-game) for GATC mobile leads. Nullable, so every other pipeline
+  // (Meta / Affplus / AppGoblin) is unaffected — the columns simply stay NULL.
+  const resultCols = db.prepare(`PRAGMA table_info(job_results)`).all() as Array<{ name: string }>;
+  const resultColNames = new Set(resultCols.map((c) => c.name));
+  if (!resultColNames.has('app_category')) {
+    db.exec(`ALTER TABLE job_results ADD COLUMN app_category TEXT`);
+  }
+  if (!resultColNames.has('is_game')) {
+    db.exec(`ALTER TABLE job_results ADD COLUMN is_game INTEGER`); // 1=game, 0=non-game, NULL=unknown
   }
 
   db.exec(`CREATE INDEX IF NOT EXISTS idx_jobs_user ON jobs(created_by_user_id)`);
@@ -428,6 +445,14 @@ export function getResults(jobId: string): JobResultRow[] {
   return getDb()
     .prepare(`SELECT * FROM job_results WHERE job_id = ? ORDER BY id ASC`)
     .all(jobId) as JobResultRow[];
+}
+
+/** Set the app-category enrichment fields on a single result row.
+ *  is_game: true→1, false→0, null→NULL (unknown/unclassified). */
+export function setResultCategory(resultId: number, appCategory: string | null, isGame: boolean | null): void {
+  getDb()
+    .prepare(`UPDATE job_results SET app_category = ?, is_game = ? WHERE id = ?`)
+    .run(appCategory, isGame === null ? null : isGame ? 1 : 0, resultId);
 }
 
 /**

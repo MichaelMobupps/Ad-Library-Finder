@@ -6,6 +6,7 @@ export type JobPhase =
   | 'starting'
   | 'scraping'
   | 'classifying'
+  | 'enriching'
   | 'building_csv'
   | 'hq_splitting'
   | 'done'
@@ -178,6 +179,7 @@ const PHASE_ORDER: JobPhase[] = [
   'starting',
   'scraping',
   'classifying',
+  'enriching',
   'building_csv',
   'done',
 ];
@@ -187,6 +189,7 @@ const PHASE_LABEL: Record<JobPhase, string> = {
   starting: 'Starting',
   scraping: 'Scraping',
   classifying: 'Classifying',
+  enriching: 'Categorizing apps',
   building_csv: 'Building CSV',
   hq_splitting: 'HQ split',
   done: 'Done',
