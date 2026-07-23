@@ -64,12 +64,36 @@ const warmupEnabled = () => process.env.GOOGLE_ADS_WARMUP !== '0';
 // For rotating residential pools, point this at the provider's gateway endpoint
 // (it rotates the exit IP per connection / sticky-session TTL on its side).
 const PROXY_URL = (process.env.GOOGLE_ADS_PROXY_URL || '').trim();
+// How many FRESH proxy exits to try when the warm-up finds the current exit IP
+// penalty-boxed, before latching the cooldown. Each rotation tears down the
+// proxy connection pool (and swaps the `{session}` placeholder when the URL has
+// one) so rotating/sticky pools hand out a different exit IP. 0 disables.
+const EXIT_ROTATIONS = clampInt(process.env.GOOGLE_ADS_EXIT_ROTATIONS, 2, 0, 5);
+// Neutral IP-echo endpoint used (through the proxy) to LOG which exit IP Google
+// actually sees — the only way to tell "same burned IP again" from "fresh IP,
+// still blocked" in production logs. Never touches Google.
+const IP_ECHO_URL = (process.env.GOOGLE_ADS_IP_ECHO_URL || 'https://api.ipify.org').trim();
+
+/** Replace every `{session}` placeholder in a proxy URL with a session token.
+ *  Exported for tests. Substitution happens on the RAW string (before `new URL`
+ *  or ProxyAgent), because URL parsing percent-encodes the braces. */
+export function substituteSessionToken(url: string, token: string): string {
+  return url.split('{session}').join(token);
+}
+
+/** Monotonic per-process counter so each rotation mints a distinct session id. */
+let proxySessionCounter = 0;
+function currentProxyUrl(): string {
+  if (!PROXY_URL.includes('{session}')) return PROXY_URL;
+  return substituteSessionToken(PROXY_URL, `s${Date.now().toString(36)}x${proxySessionCounter}`);
+}
 
 /**
  * A single process-lifetime undici dispatcher bound to the proxy, or undefined
  * when no proxy is configured (→ normal direct fetch). Built lazily on first use
  * so a malformed URL degrades to a warning + direct egress instead of crashing
- * the module at import time.
+ * the module at import time. rotateProxyExit() invalidates it to force a fresh
+ * connection pool (⇒ fresh exit IP on rotating/sticky pools).
  */
 let proxyDispatcher: Dispatcher | null | undefined; // undefined = not yet built
 function getProxyDispatcher(onLog?: LogFn): Dispatcher | undefined {
@@ -78,13 +102,59 @@ function getProxyDispatcher(onLog?: LogFn): Dispatcher | undefined {
   try {
     // Per-request AbortSignal.timeout(TIMEOUT_MS) bounds the whole fetch (incl.
     // proxy connect), so no separate proxy timeout is needed here.
-    proxyDispatcher = new ProxyAgent({ uri: PROXY_URL });
+    proxyDispatcher = new ProxyAgent({ uri: currentProxyUrl() });
     onLog?.('info', `google-ads: routing via proxy ${redactProxy(PROXY_URL)}`);
   } catch (err) {
     proxyDispatcher = null; // don't retry a bad URL every request
     onLog?.('warn', `google-ads: GOOGLE_ADS_PROXY_URL is invalid (${(err as Error).message}) — using direct egress`);
   }
   return proxyDispatcher ?? undefined;
+}
+
+/**
+ * Burn the current proxy exit and force the next request onto a fresh one:
+ * close the dispatcher's connection pool (rotating pools assign exits
+ * per-connection) and bump the `{session}` token when the URL carries one
+ * (sticky pools assign exits per-session). Cookies are cleared too — they
+ * belong to the burned exit's browsing session and would look stolen on a new
+ * IP. No-op without a proxy.
+ */
+function rotateProxyExit(onLog?: LogFn): void {
+  if (!PROXY_URL) return;
+  proxySessionCounter++;
+  const old = proxyDispatcher;
+  proxyDispatcher = undefined; // rebuilt lazily by the next request
+  if (old) old.close().catch(() => {});
+  cookieJar.clear();
+  warmedUp = false; // the next warm-up call really warms the NEW exit
+  onLog?.(
+    'info',
+    `google-ads: rotated proxy exit — new connection pool${PROXY_URL.includes('{session}') ? ' + new {session} id' : ''}`,
+  );
+}
+
+/** Last exit IP observed via the IP echo — lets rotation prove it actually
+ *  changed the IP (survives across jobs so "same IP as last job" is visible). */
+let lastExitIp: string | null = null;
+
+/**
+ * Ask a neutral IP-echo (through the proxy) which exit IP we present. Purely
+ * diagnostic + best-effort: any failure returns null and costs nothing.
+ */
+async function fetchExitIp(onLog?: LogFn): Promise<string | null> {
+  if (!PROXY_URL) return null;
+  try {
+    const res = await fetch(IP_ECHO_URL, withProxy({
+      method: 'GET',
+      headers: { 'user-agent': FETCH_HEADERS['user-agent'], accept: 'text/plain' },
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    }, onLog));
+    const text = (await res.text().catch(() => '')).trim();
+    if (res.ok && text.length <= 45 && /^[0-9a-f.:]+$/i.test(text)) return text;
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -238,14 +308,40 @@ export async function warmUpSession(onLog?: LogFn): Promise<{ blocked: boolean }
       signal: AbortSignal.timeout(TIMEOUT_MS),
     }, onLog));
     absorbSetCookie(res);
-    // Drain body so the socket is released promptly.
-    await res.text().catch(() => '');
+    // Drain body so the socket is released promptly (kept for block forensics).
+    const body = await res.text().catch(() => '');
     onLog?.('debug', `google-ads: warm-up GET → ${res.status}, ${cookieJar.size} cookie(s)`);
-    return { blocked: res.status === 429 || res.status === 403 };
+    const blocked = res.status === 429 || res.status === 403;
+    if (blocked) logBlockForensics(res, body, 'warm-up', onLog);
+    return { blocked };
   } catch (err) {
     onLog?.('debug', `google-ads: warm-up skipped (${(err as Error).message})`);
     return { blocked: false };
   }
+}
+
+/**
+ * Print WHO seems to have produced a 429/403 block page. A "proxy healthy on
+ * example.com" check alone cannot distinguish "Google penalty-boxed this exit"
+ * from "the proxy provider throttles Google-bound CONNECTs specifically" —
+ * but the response itself can: Google's block pages carry Google server
+ * headers (gws/ESF/sffe) and recognizable copy ("unusual traffic", /sorry/).
+ * Anything else strongly suggests the proxy generated the status itself.
+ */
+function logBlockForensics(res: Response, body: string, label: string, onLog?: LogFn): void {
+  const server = res.headers.get('server') || '—';
+  const retryAfter = res.headers.get('retry-after') || '—';
+  const snippet = body.replace(/\s+/g, ' ').trim().slice(0, 160) || '(empty body)';
+  const looksGoogle =
+    /unusual traffic|\/sorry\/|automated queries|rate.?limit/i.test(body) ||
+    /^(gws|ESF|sffe|GSE)/i.test(server);
+  onLog?.(
+    'warn',
+    `google-ads: ${label} block forensics — HTTP ${res.status}, server="${server}", retry-after=${retryAfter}, body="${snippet}" — ` +
+      (looksGoogle
+        ? 'signature matches a GOOGLE block page (the exit IP is penalty-boxed).'
+        : 'signature does NOT look like a Google block page — this 429 may be generated by the PROXY provider itself (some pools deny/throttle Google-bound requests while other sites work). Check the proxy plan/list settings.'),
+  );
 }
 
 /** Reset session state — used by tests and any caller that wants a clean slate.
@@ -867,11 +963,47 @@ export async function discoverAdvertisers(
     return out;
   }
 
+  // Log which exit IP the pool handed us BEFORE any Google request — the only
+  // way production logs can distinguish "same burned IP again" from "fresh IP".
+  if (PROXY_URL) {
+    const ip = await fetchExitIp(onLog);
+    if (ip) {
+      onLog?.('info', `google-ads: proxy exit IP ${ip}${ip === lastExitIp ? ' (SAME as the previous attempt/job)' : ''}`);
+      lastExitIp = ip;
+    }
+  }
+
   // Warm a cookie session first so the very first RPC already carries Google's
   // consent/NID cookies (best-effort; a fresh IP works without it too). A 429
-  // on the homepage itself ⇒ penalty box: switch to probe mode (one cheap
-  // keyword attempt, no retry ladder) instead of grinding backoffs.
-  const warm = await warmUpSession(onLog);
+  // on the homepage ⇒ this exit IP is penalty-boxed. With a proxy configured
+  // that is NOT terminal: rotate to a fresh exit (new connection/session) and
+  // re-warm, up to EXIT_ROTATIONS times — the exact remedy the old code only
+  // suggested in its log message. Only when every exit is blocked do we fall
+  // through to probe mode (one cheap keyword attempt, no retry ladder).
+  let warm = await warmUpSession(onLog);
+  if (warm.blocked && PROXY_URL && EXIT_ROTATIONS > 0) {
+    for (let r = 1; r <= EXIT_ROTATIONS && warm.blocked; r++) {
+      onLog?.('warn', `google-ads: warm-up blocked on this exit IP — rotating proxy exit and re-warming (${r}/${EXIT_ROTATIONS})`);
+      rotateProxyExit(onLog);
+      const ip = await fetchExitIp(onLog);
+      if (ip) {
+        if (ip === lastExitIp) {
+          onLog?.(
+            'warn',
+            `google-ads: exit IP UNCHANGED after rotation (${ip}) — the pool is handing out the same exit. ` +
+              `Use a rotating list, or put a {session} placeholder in GOOGLE_ADS_PROXY_URL's username so each rotation mints a new sticky session.`,
+          );
+        } else {
+          onLog?.('info', `google-ads: new proxy exit IP ${ip}`);
+        }
+        lastExitIp = ip;
+      }
+      warm = await warmUpSession(onLog);
+    }
+    if (!warm.blocked) {
+      onLog?.('info', 'google-ads: exit rotation worked — warm-up is clean on the new exit IP; proceeding with discovery');
+    }
+  }
   const probeMode = warm.blocked;
   if (probeMode) {
     onLog?.('warn', 'google-ads: warm-up got 429 — IP looks penalty-boxed; probing ONE keyword without retries before giving up');
@@ -1190,6 +1322,17 @@ export function runGoogleAdsScraperTests(): { passed: number; failed: number; fa
   // makeLookupBudget
   const b = makeLookupBudget(2);
   check(b.tryConsume() && b.tryConsume() && !b.tryConsume(), 'lookup budget consumes exactly max');
+
+  // substituteSessionToken — raw-string substitution for sticky-session proxies
+  check(
+    substituteSessionToken('http://user-{session}:pass@res.proxy.com:10000/', 'sX1') ===
+      'http://user-sX1:pass@res.proxy.com:10000/',
+    'session token substituted in proxy URL',
+  );
+  check(
+    substituteSessionToken('http://u:p@host:1/', 'sX1') === 'http://u:p@host:1/',
+    'proxy URL without {session} passes through unchanged',
+  );
 
   return { passed, failed: failures.length, failures };
 }
