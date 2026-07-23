@@ -342,6 +342,34 @@ const VERTICAL_DEFS: VerticalDef[] = [
       'technology limited', 'gaming ltd', 'game inc', 'apps inc', 'mobile inc', 'play games',
     ],
   },
+  {
+    // NON-GAME MOBILE APPS. The 'apps' vertical skews toward games; this one is
+    // the Class-C non-game token battery from the category-enrichment addendum —
+    // fintech, delivery, health, productivity, etc. — the app categories whose
+    // PUBLISHERS we most want to surface and (via appCategory enrichment) confirm
+    // as is_game=false. Mobile jobs default to apps + apps_nongame together for
+    // full-spectrum app coverage. Terms double as both app-category and
+    // advertiser-name tokens ("… Pay", "… Wallet", "… Health", "… Labs").
+    meta: { id: 'apps_nongame', label: 'Non-Game Apps', hint: 'Fintech, delivery, health, productivity & other non-game app publishers' },
+    en: [
+      // Addendum battery
+      'fintech', 'wallet', 'loan', 'bank', 'pay', 'payments', 'trading', 'crypto', 'exchange',
+      'insurance', 'health', 'fitness', 'telehealth', 'delivery', 'taxi', 'ride', 'travel', 'booking',
+      'shopping', 'commerce', 'marketplace', 'education', 'learning', 'streaming', 'news', 'productivity',
+      // Non-game app-category expansions (recur in non-game app names + campaigns)
+      'banking app', 'finance app', 'money app', 'budgeting app', 'investing app', 'stock trading app',
+      'payment app', 'money transfer', 'digital wallet', 'neobank', 'crypto wallet', 'crypto exchange',
+      'insurance app', 'health app', 'fitness app', 'workout app', 'nutrition app', 'meditation app',
+      'mental health app', 'period tracker', 'sleep app', 'medical app', 'pharmacy app', 'doctor app',
+      'food delivery app', 'grocery app', 'ride hailing', 'ride sharing', 'car rental app', 'parking app',
+      'travel app', 'flight booking', 'hotel booking', 'maps app', 'navigation app', 'shopping app',
+      'ecommerce app', 'deals app', 'coupon app', 'loyalty app', 'learning app', 'language learning app',
+      'course app', 'kids learning', 'news app', 'weather app', 'productivity app', 'notes app',
+      'task manager', 'calendar app', 'email app', 'scanner app', 'pdf app', 'translation app',
+      'ai assistant app', 'ai writing app', 'business app', 'crm app', 'invoicing app', 'dating app',
+      'social app', 'messaging app', 'video call app', 'utilities app', 'parental control',
+    ],
+  },
 ];
 
 export const GOOGLE_ADS_VERTICALS: GoogleAdsVerticalMeta[] = VERTICAL_DEFS.map((v) => v.meta);

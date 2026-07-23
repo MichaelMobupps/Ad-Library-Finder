@@ -36,10 +36,12 @@ import {
   setJobPhase,
   setJobHqZipPath,
   setJobCsvPath,
+  setResultCategory,
   getJob,
   deferJob,
   type JobRow,
 } from './db.js';
+import { enrichStoreUrls } from './appCategory.js';
 import { BudgetExceededError, nextJerusalemMidnightMs, DAILY_CAP_USD } from './llmBudget.js';
 import {
   discoverAdvertisers,
@@ -205,15 +207,17 @@ export async function runGoogleAdsJob(job: JobRow): Promise<void> {
       const limit = params.maxKeywords && params.maxKeywords > 0 ? params.maxKeywords : DEFAULT_MAX_KEYWORDS;
       // A MOBILE lead requires a store destination, which only appears in the ads
       // of app/game publishers. Those advertisers are surfaced by app-name and
-      // app-category tokens — the 'apps' vertical — NOT by the web-CPS verticals
+      // app-category tokens — the 'apps' (game-heavy) and 'apps_nongame' (fintech,
+      // delivery, health, productivity…) verticals — NOT by the web-CPS verticals
       // (casino, betting, dating…) that dominate the bank. So when a mobile job
-      // doesn't pin its own verticals, default it to 'apps' instead of sampling
-      // the whole (web-oriented) bank. An explicit vertical selection always wins,
-      // and CPS/web jobs keep the full-bank default.
+      // doesn't pin its own verticals, default it to both app verticals for
+      // full-spectrum app coverage instead of sampling the whole (web-oriented)
+      // bank. An explicit vertical selection always wins; CPS/web jobs keep the
+      // full-bank default.
       const mobileJob = job.product_type === 'mobile';
       const pinnedVerticals = !!(params.verticals && params.verticals.length > 0);
       let defaulted = mobileJob && !pinnedVerticals;
-      let effectiveVerticals = pinnedVerticals ? params.verticals! : defaulted ? ['apps'] : null;
+      let effectiveVerticals = pinnedVerticals ? params.verticals! : defaulted ? ['apps', 'apps_nongame'] : null;
       keywords = keywordsForJob({
         verticals: effectiveVerticals,
         languages: params.languages || null,
@@ -461,6 +465,38 @@ export async function runGoogleAdsJob(job: JobRow): Promise<void> {
       `google-ads: classification done — inserted ${inserted} rows (mobile ${mobileCount}, web ${webCount}), unresolved ${unresolved}, dup-skipped ${dupSkipped}` +
         (nameSearched > 0 ? `, name-searches ${nameSearched}/${WEB_NAME_SEARCHES}` : ''),
     );
+
+    // ── 4b. App-category enrichment (mobile only) — game vs non-game per app ──
+    // Keyed on the app_id in each store URL; asks the store listing itself
+    // (Apple genre 6014 / Play applicationCategory GAME*), permanently cached so
+    // re-runs make zero store requests. Best-effort: a failure never fails the
+    // job (leads still ship, just Unclassified). Runs BEFORE the CSV so the
+    // app_category / is_game columns are populated in the exported file.
+    if (job.product_type === 'mobile') {
+      try {
+        const mobileRows = getResults(job.id).filter(
+          (r) => (r.classification === 'mobile_google_play' || r.classification === 'mobile_app_store') && r.store_url,
+        );
+        if (mobileRows.length > 0) {
+          setJobPhase(job.id, 'enriching', `categorizing ${mobileRows.length} app(s)`);
+          const { byStoreUrl, summary } = await enrichStoreUrls(
+            mobileRows.map((r) => r.store_url as string),
+            onLog,
+          );
+          for (const r of mobileRows) {
+            const rec = r.store_url ? byStoreUrl.get(r.store_url) : undefined;
+            if (rec) setResultCategory(r.id, rec.category_raw, rec.is_game);
+          }
+          onLog(
+            'info',
+            `google-ads: category enrichment — ${summary.games} game, ${summary.nonGames} non-game, ${summary.unclassified} unclassified across ${summary.apps} app(s) ` +
+              `(${summary.cached} cached, ${summary.requests} store request(s))`,
+          );
+        }
+      } catch (err) {
+        onLog('warn', `google-ads: category enrichment failed (non-fatal): ${(err as Error).message}`);
+      }
+    }
 
     // ── 5. CSV (filters by product type) ──
     setJobPhase(job.id, 'building_csv', `writing ${job.product_type} CSV`);
