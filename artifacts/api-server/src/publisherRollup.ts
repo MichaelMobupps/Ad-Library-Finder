@@ -68,6 +68,16 @@ export interface RollupSummary {
 const LEGAL_ENTITY_SUFFIXES =
   /\b(inc|inc\.|llc|l\.l\.c|ltd|ltd\.|limited|gmbh|co|co\.|corp|corp\.|corporation|company|pte|plc|s\.?a\.?|s\.?r\.?l|b\.?v|oy|ab|as)\b/gi;
 
+/** The same designators for IDENTITY, but anchored: a legal form designates only
+ *  where it TRAILS the name (possibly stacked — "Acme Co., Ltd."). Matching them
+ *  anywhere stripped brand-bearing short tokens ("SA Money Transfer", "AB
+ *  Fitness", "Co-op Bank") and collided unrelated companies on the residue —
+ *  the same Bilt-class over-merge the descriptor rule above documents. Applied
+ *  iteratively from the end; normalizeNameForMatch keeps the anywhere-variant
+ *  deliberately (recall against a third party's spelling, cost documented there). */
+const TRAILING_LEGAL_ENTITY_SUFFIX =
+  /[\s,.]*\b(inc|llc|l\.l\.c|ltd|limited|gmbh|co|corp|corporation|company|pte|plc|s\.?a\.?|s\.?r\.?l|b\.?v|oy|ab|as)\.?\s*$/i;
+
 /** Brand descriptors — stripped ONLY for fuzzy matching against a third party's
  *  spelling of a name (see normalizeNameForMatch), never for identity. */
 const BRAND_DESCRIPTORS = /\b(studios?|games?|apps?|technolog(?:y|ies)|software|mobile|labs?)\b/gi;
@@ -76,11 +86,12 @@ const BRAND_DESCRIPTORS = /\b(studios?|games?|apps?|technolog(?:y|ies)|software|
  *  suffixes, collapse to [a-z0-9]. Empty string when nothing meaningful remains. */
 export function normalizeName(name: string | null | undefined): string {
   if (!name) return '';
-  return name
-    .toLowerCase()
-    .replace(LEGAL_ENTITY_SUFFIXES, ' ')
-    .replace(/[^a-z0-9]+/g, '')
-    .trim();
+  let s = name.toLowerCase();
+  for (let prev = ''; prev !== s; ) {
+    prev = s;
+    s = s.replace(TRAILING_LEGAL_ENTITY_SUFFIX, '');
+  }
+  return s.replace(/[^a-z0-9]+/g, '').trim();
 }
 
 /**
@@ -579,6 +590,12 @@ export function runPublisherRollupTests(): { passed: number; failed: number; fai
     ['Zen Mobile', 'Zen Technologies'],
     ['Lion Studio', 'Lion Games'],
     ['Cash App Labs', 'Cash Apps Ltd'],
+    // Same over-merge via ANYWHERE-matched legal tokens: short designators (co,
+    // ab, sa, as, oy, bv…) are brand-bearing mid-name and may only be stripped
+    // where they actually designate a legal form — trailing the name.
+    ['SA Money Transfer', 'Money Transfer Ltd'],
+    ['AB Fitness', 'Fitness Co'],
+    ['Co-op Bank', 'OP Bank'],
   ];
   for (const [a, b] of mustNotCollide) {
     check(
@@ -596,6 +613,7 @@ export function runPublisherRollupTests(): { passed: number; failed: number; fai
     'normalizeNameForMatch: recall is the goal there, so these DO match',
   );
   check(normalizeName('King.com Ltd') === 'kingcom', 'normalize: keeps distinctive token');
+  check(normalizeName('Acme Co., Ltd.') === 'acme', 'normalize: stacked trailing suffixes all go');
   check(normalizeName('') === '', 'normalize: empty → empty');
 
   // registrableDomain

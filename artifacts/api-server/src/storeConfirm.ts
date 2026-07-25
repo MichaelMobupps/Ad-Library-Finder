@@ -33,7 +33,7 @@ import {
   type GoogleAdsAdvertiser,
 } from './googleAdsScraper.js';
 import { normalizeNameForMatch, registrableDomain } from './publisherRollup.js';
-import { META_CONFIRM_ENABLED, META_STORE_LINK_HOSTS, STORE_FETCH_TIMEOUT_MS } from './storeDiscoveryConfig.js';
+import { META_CONFIRM_ENABLED, META_STORE_LINK_HOSTS, STORE_FETCH_TIMEOUT_MS, isSharedHost } from './storeDiscoveryConfig.js';
 
 export type LogFn = (level: 'info' | 'warn' | 'error' | 'debug', msg: string) => void;
 
@@ -103,6 +103,10 @@ export function gatcCountIsTrustworthy(
 // ── Meta (optional) ──────────────────────────────────────────────────────────
 
 interface MetaAd {
+  // ScrapeCreators /v1/facebook/adLibrary/search/ads returns each ad's
+  // destination inside `snapshot.link_url` (per their OpenAPI docs); a bare
+  // `link` never appears there but is kept as a defensive fallback.
+  snapshot?: { link_url?: string | null } | null;
   link?: string | null;
   [k: string]: unknown;
 }
@@ -132,8 +136,15 @@ export async function fetchMetaStoreLinkAds(
       onLog?.('debug', `meta: HTTP ${res.status} for "${q.slice(0, 40)}"`);
       return { ads: 0, ok: false };
     }
-    const json = (await res.json()) as { ads?: MetaAd[]; results?: MetaAd[] };
-    const ads = json.ads || json.results || [];
+    // Documented 200 shape: { success, credits_charged, searchResults: [...] }.
+    // `ads`/`results` never appear in the current API but stay as fallbacks so a
+    // ScrapeCreators shape change degrades to 0-with-ok rather than a crash.
+    const json = (await res.json()) as {
+      searchResults?: MetaAd[];
+      ads?: MetaAd[];
+      results?: MetaAd[];
+    };
+    const ads = json.searchResults || json.ads || json.results || [];
     return { ads: countStoreLinkAds(ads), ok: true };
   } catch (err) {
     onLog?.('debug', `meta: fetch failed (${(err as Error).message})`);
@@ -159,7 +170,7 @@ export function metaQueryFor(p: { preview_title: string | null; name: string | n
 export function countStoreLinkAds(ads: MetaAd[]): number {
   let n = 0;
   for (const ad of ads) {
-    const link = (ad.link || '').toString().toLowerCase();
+    const link = (ad.snapshot?.link_url || ad.link || '').toString().toLowerCase();
     if (link && META_STORE_LINK_HOSTS.some((h) => link.includes(h))) n++;
   }
   return n;
@@ -256,6 +267,19 @@ export async function confirmPublishers(
   return summary;
 }
 
+/** Pure: the domain a publisher's GATC domain query (and domain-tier match) may
+ *  use — '' when the stored website is a shared host. A shared-host "website"
+ *  (a facebook.com page, sites.google.com, linktr.ee…) identifies the PLATFORM,
+ *  not the publisher: searching GATC by it returns the platform's own advertiser
+ *  (Meta Platforms for facebook.com), which the domain tier would match
+ *  immediately — a false confirmation with a saturated ads_count. Same guard the
+ *  rollup merge (publisherRollup) and lead dedupe (storeLeads) apply to this very
+ *  field; the name query still runs. Exported for tests. */
+export function confirmDomainFor(website: string | null): string {
+  const d = registrableDomain(website);
+  return d && !isSharedHost(d) ? d : '';
+}
+
 interface ConfirmOneResult {
   advertiserId: string | null;
   adsCount: number;
@@ -291,7 +315,7 @@ async function confirmOne(
 
   // ── GATC ──
   if (gatcAvailable) {
-    const domain = registrableDomain(p.website);
+    const domain = confirmDomainFor(p.website);
     const queries = [p.name, domain].map((q) => (q || '').trim()).filter(Boolean);
     const advertisers: GoogleAdsAdvertiser[] = [];
     // How many of the planned searches actually ANSWERED. Answered is not "was not
@@ -386,15 +410,31 @@ export function runStoreConfirmTests(): { passed: number; failed: number; failur
   );
   check(noId.advertiser === null, 'match: domain-only suggestion (no id) rejected');
 
-  // Meta store-link counting.
+  // Shared-host websites must never drive a GATC domain query or domain-tier
+  // match — facebook.com would match Meta Platforms' own advertiser.
+  check(confirmDomainFor('https://www.facebook.com/acmegames') === '', 'confirm: shared-host website yields no domain query');
+  check(confirmDomainFor('https://sites.google.com/view/acme') === '', 'confirm: sites.google.com yields no domain query');
+  check(confirmDomainFor('https://www.acme.com/about') === 'acme.com', 'confirm: real website yields its registrable domain');
+  check(confirmDomainFor(null) === '', 'confirm: null website yields no domain query');
+
+  // Meta store-link counting — the REAL ScrapeCreators shape puts the
+  // destination in snapshot.link_url; a bare `link` is the legacy fallback.
   check(
     countStoreLinkAds([
-      { link: 'https://play.google.com/store/apps/details?id=x' },
-      { link: 'https://example.com/promo' },
-      { link: 'https://go.link/abc' },
-      { link: null },
+      { snapshot: { link_url: 'https://play.google.com/store/apps/details?id=x' } },
+      { snapshot: { link_url: 'https://example.com/promo' } },
+      { snapshot: { link_url: 'https://go.link/abc' } },
+      { snapshot: { link_url: null } },
+      { snapshot: null },
     ]) === 2,
-    'meta: counts play + go.link, ignores web/null',
+    'meta: counts play + go.link via snapshot.link_url, ignores web/null',
+  );
+  check(
+    countStoreLinkAds([
+      { link: 'https://apps.apple.com/app/id42' },
+      { link: null },
+    ]) === 1,
+    'meta: legacy top-level link fallback still counted',
   );
 
   // A zero is only measured when BOTH planned searches answered — one blocked or

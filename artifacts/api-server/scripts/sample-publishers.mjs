@@ -56,9 +56,15 @@ async function resolves(url) {
   const u = /^https?:\/\//i.test(url) ? url : `https://${url}`;
   try {
     const res = await fetch(u, { headers: UA, redirect: 'follow', signal: AbortSignal.timeout(15_000) });
-    // Some hosts refuse HEAD-ish probes but serve the page; any HTTP answer
-    // proves the domain resolves and is served, which is what we assert.
-    return { ok: res.status < 400, detail: `HTTP ${res.status}${res.url !== u ? ` → ${res.url.slice(0, 60)}` : ''}` };
+    // Some hosts bot-wall non-browser probes (401/403/405/429) but serve the page
+    // in a real browser; that still proves the domain resolves and is served,
+    // which is what we assert. 404/410/5xx stay failures — those mean the stored
+    // URL is wrong or the site is broken, not merely fenced.
+    const botWalled = [401, 403, 405, 429].includes(res.status);
+    return {
+      ok: res.status < 400 || botWalled,
+      detail: `HTTP ${res.status}${botWalled ? ' (bot-walled, site alive)' : ''}${res.url !== u ? ` → ${res.url.slice(0, 60)}` : ''}`,
+    };
   } catch (e) {
     return { ok: false, detail: e.message.slice(0, 70) };
   }

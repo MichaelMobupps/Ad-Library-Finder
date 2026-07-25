@@ -6,8 +6,8 @@
  *       v2 feed the spec names cannot be used):
  *       https://itunes.apple.com/<cc>/rss/topfreeapplications/limit=<n>/genre=<G>/json
  *       (omit the genre segment for all-categories). Lower-case country codes.
- *   • Detail  — itunes.apple.com/lookup?id=<id,id,…>&country=us  (batched ≤100)
- *   • Catalog — itunes.apple.com/lookup?id=<artistId>&entity=software&country=us
+ *   • Detail  — itunes.apple.com/lookup?id=<id,id,…>&country=<cc>  (batched ≤100)
+ *   • Catalog — itunes.apple.com/lookup?id=<artistId>&entity=software&country=<cc>
  *   • Search  — itunes.apple.com/search?term=<t>&country=<cc>&entity=software&limit=200
  *
  * Throttling: ALL of these are itunes.apple.com and share ONE 10-req/min limiter
@@ -170,14 +170,17 @@ function coerceDetail(r: ItunesRaw): AppleAppDetail | null {
   };
 }
 
-/** Batched iTunes /lookup. Returns appId → detail for every id the API resolved.
+/** Batched iTunes /lookup against one storefront. Returns appId → detail for
+ *  every id the API resolved there — a geo-restricted app resolves ONLY in its
+ *  own market, so callers must pass a country the apps were actually sighted in.
  *  Batches internally at ITUNES_LOOKUP_BATCH; each batch is one throttled call. */
-export async function appleLookup(ids: string[], onLog?: LogFn): Promise<Map<string, AppleAppDetail>> {
+export async function appleLookup(ids: string[], country: string, onLog?: LogFn): Promise<Map<string, AppleAppDetail>> {
   const out = new Map<string, AppleAppDetail>();
+  const cc = (country || 'us').toLowerCase();
   const unique = [...new Set(ids.filter(Boolean))];
   for (let i = 0; i < unique.length; i += ITUNES_LOOKUP_BATCH) {
     const batch = unique.slice(i, i + ITUNES_LOOKUP_BATCH);
-    const url = `https://itunes.apple.com/lookup?id=${batch.map(encodeURIComponent).join(',')}&country=us`;
+    const url = `https://itunes.apple.com/lookup?id=${batch.map(encodeURIComponent).join(',')}&country=${encodeURIComponent(cc)}`;
     // eslint-disable-next-line no-await-in-loop
     const json = (await itunesLimiter.schedule(() => getJson(url, STORE_FETCH_TIMEOUT_MS, onLog))) as
       | { results?: ItunesRaw[] }
@@ -191,9 +194,10 @@ export async function appleLookup(ids: string[], onLog?: LogFn): Promise<Map<str
 }
 
 /** iTunes developer catalog for an artistId: the software apps (drops the leading
- *  artist entry). Returns [] on failure. */
-export async function appleDeveloper(artistId: string, onLog?: LogFn): Promise<AppleAppDetail[]> {
-  const url = `https://itunes.apple.com/lookup?id=${encodeURIComponent(artistId)}&entity=software&country=us`;
+ *  artist entry) as listed in `country`'s storefront. Returns [] on failure. */
+export async function appleDeveloper(artistId: string, country: string, onLog?: LogFn): Promise<AppleAppDetail[]> {
+  const cc = (country || 'us').toLowerCase();
+  const url = `https://itunes.apple.com/lookup?id=${encodeURIComponent(artistId)}&entity=software&country=${encodeURIComponent(cc)}`;
   const json = (await itunesLimiter.schedule(() => getJson(url, STORE_FETCH_TIMEOUT_MS, onLog))) as
     | { results?: ItunesRaw[] }
     | null;

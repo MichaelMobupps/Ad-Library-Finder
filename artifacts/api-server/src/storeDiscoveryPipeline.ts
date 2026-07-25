@@ -283,7 +283,7 @@ function buildWorklist(): EnrichWorkItem[] {
   const items: EnrichWorkItem[] = [];
   for (const store of ['google_play', 'app_store'] as StoreKind[]) {
     for (const a of distinctAppsForStore(store)) {
-      items.push({ store, app_id: a.app_id, is_chart: a.is_chart === 1 });
+      items.push({ store, app_id: a.app_id, is_chart: a.is_chart === 1, country: a.country });
     }
   }
   return items;
@@ -448,7 +448,7 @@ async function expandDeveloperCatalogs(onLog: OnLog): Promise<number> {
   // executed a single request. Play gets half; whatever it leaves flows to Apple.
   const playShare = Math.ceil(total / 2);
   const playUsed = await runStore(playDevelopersWithContact(), playShare, (id) => playDeveloper(id, CRAWL_COUNTRY, onLog), 'google_play');
-  const appleUsed = await runStore(appleArtistsWithContact(), total - playUsed, (id) => appleDeveloper(id, onLog), 'app_store');
+  const appleUsed = await runStore(appleArtistsWithContact(), total - playUsed, (id) => appleDeveloper(id, CRAWL_COUNTRY, onLog), 'app_store');
 
   onLog('info', `dev-catalog: ${playUsed} Play + ${appleUsed} Apple catalogs → +${newApps} new apps`);
   if (playUsed + appleUsed >= total) {

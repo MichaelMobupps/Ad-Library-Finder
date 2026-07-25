@@ -221,18 +221,21 @@ function addColumnIfMissing(table: string, column: string, decl: string): void {
 }
 
 /**
- * Repair discovery_depth rows written under the OLD depth semantics.
+ * ONE-SHOT repair of discovery_depth rows written under the OLD depth semantics.
  *
  * There is no migration framework here (tables are CREATE TABLE IF NOT EXISTS),
- * so this runs on every boot. It is idempotent AND self-limiting: both states it
- * repairs are UNREACHABLE under the current write path, so once a database is
- * clean it matches zero rows forever.
+ * so this is invoked on every boot but guarded by a settings marker to actually
+ * run once. The marker is load-bearing: state 1's predicate is NOT unreachable
+ * going forward — the similar crawl legitimately lowers a search/developer_catalog
+ * row's depth via MIN() without changing source (see upsertDiscoveredApp), and
+ * re-running this repair on every boot would erase those real graph depths,
+ * silently shrinking the similar-crawl frontier after every restart.
  *
  * Two legacy states, both of which make an app a bogus depth-0 crawl seed and so
  * re-create the runaway the depth sentinel was introduced to stop:
  *
- *  1. search / developer_catalog rows used to default to depth 0. They are not in
- *     the similar graph at all → NON_GRAPH_DEPTH.
+ *  1. search / developer_catalog rows used to default to depth 0. Under the OLD
+ *     semantics they were never graph-sighted, so → NON_GRAPH_DEPTH.
  *  2. similar rows that the old `discovery_depth = MIN(depth, 0)` update flattened
  *     to 0. A similar row is always written at parent+1, so depth 0 is impossible
  *     now and proves corruption. Their true depth is unrecoverable, so we clamp
@@ -240,8 +243,12 @@ function addColumnIfMissing(table: string, column: string, decl: string): void {
  *     if such an app really is reachable at depth 1, the next run's crawl re-sights
  *     it from a chart seed and MIN() lowers it back.
  */
+const DEPTH_BACKFILL_MARKER = 'store_discovery.depth_backfill_v1';
+
 function backfillDiscoveryDepth(): void {
   const db = getDb();
+  const done = db.prepare(`SELECT value FROM settings WHERE key = ?`).get(DEPTH_BACKFILL_MARKER);
+  if (done) return;
   const nonGraph = db
     .prepare(
       `UPDATE discovered_apps SET discovery_depth = ?
@@ -251,6 +258,10 @@ function backfillDiscoveryDepth(): void {
   const flattened = db
     .prepare(`UPDATE discovered_apps SET discovery_depth = ? WHERE source = 'similar' AND discovery_depth = 0`)
     .run(SIMILAR_MAX_DEPTH);
+  db.prepare(
+    `INSERT INTO settings (key, value, updated_at) VALUES (?, '1', ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+  ).run(DEPTH_BACKFILL_MARKER, Date.now());
   const n = nonGraph.changes + flattened.changes;
   if (n > 0) {
     log.info(
@@ -420,18 +431,28 @@ export function getDiscoveredApp(store: StoreKind, appId: string, country: strin
 }
 
 /** Distinct (store, app_id) pairs for a store, most-charted first. Used as the
- *  similar-crawl seed set and the enrichment worklist source. */
-export function distinctAppsForStore(store: StoreKind): Array<{ app_id: string; min_depth: number; is_chart: number }> {
+ *  similar-crawl seed set and the enrichment worklist source.
+ *
+ *  `country` is the market the detail fetch should run against: 'us' when the
+ *  app was sighted there (the least geo-restricted market and the historical
+ *  default, so cached details keep meaning the same thing), otherwise the
+ *  alphabetically-first market it WAS sighted in — a geo-restricted app (e.g. a
+ *  German bank charting only in de) 404s on a us detail lookup and would be
+ *  permanently marked failed after MAX_ENRICH_ATTEMPTS. */
+export function distinctAppsForStore(
+  store: StoreKind,
+): Array<{ app_id: string; min_depth: number; is_chart: number; country: string }> {
   return getDb()
     .prepare(
       `SELECT app_id,
               MIN(discovery_depth) AS min_depth,
-              MAX(CASE WHEN source = 'chart' THEN 1 ELSE 0 END) AS is_chart
+              MAX(CASE WHEN source = 'chart' THEN 1 ELSE 0 END) AS is_chart,
+              COALESCE(MAX(CASE WHEN country = 'us' THEN country END), MIN(country)) AS country
          FROM discovered_apps
         WHERE store = ?
         GROUP BY app_id`,
     )
-    .all(store) as Array<{ app_id: string; min_depth: number; is_chart: number }>;
+    .all(store) as Array<{ app_id: string; min_depth: number; is_chart: number; country: string }>;
 }
 
 /**

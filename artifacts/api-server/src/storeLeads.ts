@@ -177,6 +177,20 @@ export function publisherToCsvRow(r: PublisherRow): string {
   ].join(',');
 }
 
+/**
+ * CSV for the VIEW export (GET /publishers.csv): the rows exactly as given —
+ * no batch dedupe and no file. The route's contract is export-what-you-see; the
+ * batch dedupe belongs to the pipeline's own "new since last run" feed
+ * (buildPublisherCsv below), where a shared contact email means one lead. Two
+ * distinct publisher ROWS legitimately share an email (the rollup never merges
+ * on email), both render in the table, and both must appear in its download.
+ * Building the string in memory also stops the per-download file leak the
+ * old unique-token file naming caused — nothing ever pruned csv-output/.
+ */
+export function publisherViewCsv(rows: PublisherRow[]): string {
+  return [PUBLISHER_CSV_HEADER, ...rows.map(publisherToCsvRow)].join('\n') + '\n';
+}
+
 export function buildPublisherCsv(
   jobId: string,
   rows: PublisherRow[],
@@ -402,6 +416,22 @@ export function runStoreLeadsTests(): { passed: number; failed: number; failures
     'csv: both-stores publisher resolves to a single store value');
   check(publisherToCsvRow(mk({ apple_seller_name: 'S' })).includes(',app_store,'),
     'csv: apple-only publisher without preview link → app_store');
+
+  // View export (export-what-you-see): rows sharing a contact email are DISTINCT
+  // rows in the table (the rollup never merges on email) and must all appear in
+  // its CSV — the batch dedupe belongs only to the pipeline's history feed.
+  const shared = [
+    mk({ id: 1, name: 'Alpha Ltd', email: 'dev@whitelabel.com' }),
+    mk({ id: 2, name: 'Beta GmbH', email: 'dev@whitelabel.com' }),
+  ];
+  check(
+    publisherViewCsv(shared).trimEnd().split('\n').length === 3,
+    'csv: view export keeps both shared-email rows (header + 2)',
+  );
+  check(
+    dedupePublishers(shared).length === 1,
+    'csv: …while the pipeline batch dedupe still collapses them',
+  );
 
   return { passed, failed: failures.length, failures };
 }

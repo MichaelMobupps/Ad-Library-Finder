@@ -40,7 +40,7 @@ import {
   countConfirmedPublishers,
   type PublisherRow,
 } from './storeDiscoveryDb.js';
-import { buildPublisherCsv } from './storeLeads.js';
+import { publisherViewCsv } from './storeLeads.js';
 
 export const jobsRouter: Router = Router();
 
@@ -99,23 +99,6 @@ function filterPublishers(rows: PublisherRow[], q: Request['query']): PublisherR
     }
     return true;
   });
-}
-
-/**
- * A short, filesystem-safe token identifying this export's filter combination.
- * buildPublisherCsv writes `store_first-<token>.csv` via a temp file named from
- * the pid, so two concurrent downloads with the SAME token in one process raced
- * on that temp path and the loser's rename threw ENOENT. Distinct filters now
- * get distinct files, and a counter disambiguates identical concurrent ones.
- */
-let csvSeq = 0;
-function csvToken(q: Request['query']): string {
-  const parts = ['vertical', 'market', 'source', 'game', 'confirmed', 'email', 'q']
-    .map((k) => (typeof q[k] === 'string' ? String(q[k]).trim() : ''))
-    .filter(Boolean);
-  const base = parts.length === 0 ? 'all' : 'filtered';
-  csvSeq = (csvSeq + 1) % 100000;
-  return `${base}-${process.pid}-${csvSeq}`;
 }
 
 /** Shape a publishers row for the dashboard table (parse JSON, booleans). */
@@ -487,16 +470,18 @@ jobsRouter.get('/publishers', (req: Request, res: Response) => {
 // GET /api/jobs/publishers.csv — Prospector export of the publisher table
 // (score desc), honouring the same filter query params as the Publishers view.
 jobsRouter.get('/publishers.csv', (req: Request, res: Response) => {
-  // Deliberately NO lead-history seed here. The pipeline persists everything it
-  // exports into job_results, so seeding history would make this download empty.
-  // This endpoint exports the table the operator is LOOKING AT — filters applied,
+  // Deliberately NO dedupe of any kind here — neither the lead-history seed (the
+  // pipeline persists everything it exports into job_results, so seeding history
+  // would make this download empty) nor the batch dedupe (two distinct publisher
+  // rows legitimately share a contact email; both render in the table). This
+  // endpoint exports the table the operator is LOOKING AT — filters applied,
   // nothing silently dropped — while the pipeline's own export is the
-  // "new since last run" feed that does dedupe against history.
+  // "new since last run" feed that does dedupe. Streamed from memory: no file,
+  // so downloads no longer accumulate orphans under csv-output/.
   const rows = filterPublishers(listPublishersByScore(1_000_000), req.query);
-  const { path: p } = buildPublisherCsv(csvToken(req.query), rows);
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
   res.setHeader('Content-Disposition', 'attachment; filename="store_first-publishers.csv"');
-  createReadStream(p).pipe(res);
+  res.send(publisherViewCsv(rows));
 });
 
 jobsRouter.get('/:id', (req, res) => {

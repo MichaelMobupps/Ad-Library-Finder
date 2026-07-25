@@ -16,7 +16,15 @@
       "Bash(GOOGLE_ADS_FETCH_DELAY_MS=800 node *)",
       "Bash(npx tsc *)",
       "Bash(echo \"---exit $?---\")",
-      "Bash(printenv)"
+      "Bash(printenv)",
+      "Bash(echo \"EXIT=$?\")",
+      "Bash(git *)",
+      "Bash(echo \"TSC_EXIT=$?\")",
+      "Bash(npm run *)",
+      "Bash(npm test *)",
+      "Bash(echo \"TSC=$?\")",
+      "Bash(npx vite *)",
+      "Bash(grep *)"
     ]
   }
 }

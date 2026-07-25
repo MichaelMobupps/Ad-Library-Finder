@@ -30,7 +30,7 @@ import {
   type StoreAppDetailRow,
 } from './storeDiscoveryDb.js';
 import { playAppDetail } from './playSource.js';
-import { appleLookup } from './appleSource.js';
+import { appleLookup, type AppleAppDetail } from './appleSource.js';
 import {
   MAX_ENRICH_ATTEMPTS,
   ENRICH_MAX_APPS_PER_RUN,
@@ -45,6 +45,9 @@ export interface EnrichWorkItem {
   store: StoreKind;
   app_id: string;
   is_chart: boolean;
+  /** Market to fetch detail against — a country the app was actually discovered
+   *  in ('us' preferred). Geo-restricted apps 404 outside their market. */
+  country?: string;
 }
 
 export interface EnrichSummary {
@@ -189,7 +192,7 @@ export async function enrichApps(items: EnrichWorkItem[], onLog?: LogFn): Promis
     const attempts = (prior?.attempts ?? 0) + 1;
     summary.requests++;
     // eslint-disable-next-line no-await-in-loop
-    const d = await playAppDetail(it.app_id, 'us', onLog);
+    const d = await playAppDetail(it.app_id, it.country || 'us', onLog);
     if (!d) {
       upsertAppDetail(failedRow(it.store, it.app_id, prior, attempts));
       summary.failed++;
@@ -220,47 +223,76 @@ export async function enrichApps(items: EnrichWorkItem[], onLog?: LogFn): Promis
     noteBand(it, d.minInstalls);
   }
 
-  // ── Apple: batched /lookup. ──
-  for (let i = 0; i < toFetchApple.length; i += ITUNES_LOOKUP_BATCH) {
-    const batch = toFetchApple.slice(i, i + ITUNES_LOOKUP_BATCH);
-    summary.requests++;
-    // eslint-disable-next-line no-await-in-loop
-    const map = await appleLookup(batch.map((b) => b.app_id), onLog);
-    for (const it of batch) {
-      const prior = getAppDetail(it.store, it.app_id);
-      const attempts = (prior?.attempts ?? 0) + 1;
-      const d = map.get(it.app_id);
-      if (!d) {
-        upsertAppDetail(failedRow(it.store, it.app_id, prior, attempts));
-        summary.failed++;
-        continue;
-      }
-      const isGame = appleIsGame(d.primaryGenreId, d.genreIds);
-      upsertAppDetail({
-        store: 'app_store',
-        app_id: d.appId,
-        title: d.title || null,
-        developer: d.sellerName ?? d.artistName ?? null,
-        developer_id: d.artistId,
-        developer_email: null, // Apple never publishes a contact email
-        developer_website: d.sellerUrl,
-        min_installs: null, // Apple exposes no install count
-        genre_id: d.primaryGenreId,
-        category_raw: d.primaryGenreName,
-        is_game: isGame,
-        store_updated_at: d.currentVersionReleaseDate,
-        artist_id: d.artistId,
-        seller_name: d.sellerName,
-        bundle_id: d.bundleId,
-        enrich_status: 'done',
-        attempts,
-      });
-      summary.enriched++;
-      tally(summary, isGame);
+  // ── Apple: batched /lookup, one storefront per batch. A geo-restricted app
+  // resolves only in its own market (the same failure the Play path guards
+  // against above), and /lookup takes a single country — so mixing markets in
+  // one call would silently fail the minority-market apps into failedRow. ──
+  for (const [cc, group] of groupByEnrichCountry(toFetchApple)) {
+    for (let i = 0; i < group.length; i += ITUNES_LOOKUP_BATCH) {
+      const batch = group.slice(i, i + ITUNES_LOOKUP_BATCH);
+      summary.requests++;
+      // eslint-disable-next-line no-await-in-loop
+      const map = await appleLookup(batch.map((b) => b.app_id), cc, onLog);
+      enrichAppleBatch(batch, map, summary);
     }
   }
 
   return summary;
+}
+
+/** Group a worklist by the storefront its detail fetch must run against
+ *  ('us' when unset — the least geo-restricted market and the historical
+ *  default). Insertion order is preserved within and across groups. Exported
+ *  for tests. */
+export function groupByEnrichCountry(items: EnrichWorkItem[]): Map<string, EnrichWorkItem[]> {
+  const groups = new Map<string, EnrichWorkItem[]>();
+  for (const it of items) {
+    const cc = (it.country || 'us').toLowerCase();
+    let g = groups.get(cc);
+    if (!g) groups.set(cc, (g = []));
+    g.push(it);
+  }
+  return groups;
+}
+
+/** Write one /lookup batch's results (or failures) onto the cache + summary. */
+function enrichAppleBatch(
+  batch: EnrichWorkItem[],
+  map: Map<string, AppleAppDetail>,
+  summary: EnrichSummary,
+): void {
+  for (const it of batch) {
+    const prior = getAppDetail(it.store, it.app_id);
+    const attempts = (prior?.attempts ?? 0) + 1;
+    const d = map.get(it.app_id);
+    if (!d) {
+      upsertAppDetail(failedRow(it.store, it.app_id, prior, attempts));
+      summary.failed++;
+      continue;
+    }
+    const isGame = appleIsGame(d.primaryGenreId, d.genreIds);
+    upsertAppDetail({
+      store: 'app_store',
+      app_id: d.appId,
+      title: d.title || null,
+      developer: d.sellerName ?? d.artistName ?? null,
+      developer_id: d.artistId,
+      developer_email: null, // Apple never publishes a contact email
+      developer_website: d.sellerUrl,
+      min_installs: null, // Apple exposes no install count
+      genre_id: d.primaryGenreId,
+      category_raw: d.primaryGenreName,
+      is_game: isGame,
+      store_updated_at: d.currentVersionReleaseDate,
+      artist_id: d.artistId,
+      seller_name: d.sellerName,
+      bundle_id: d.bundleId,
+      enrich_status: 'done',
+      attempts,
+    });
+    summary.enriched++;
+    tally(summary, isGame);
+  }
 }
 
 function playIsGame(genreId: string | null): number | null {
@@ -318,6 +350,20 @@ export function runStoreEnrichTests(): { passed: number; failed: number; failure
   check(isInInstallBand(0) === false, 'band: 0 installs out-of-band');
   check(isInInstallBand(null) === false, 'band: null installs out-of-band');
   check(isInInstallBand(undefined) === false, 'band: undefined installs out-of-band');
+
+  // Apple lookups run one storefront per batch: a geo-restricted app resolves
+  // only in the market it was sighted in, so mixing countries in one /lookup
+  // call would silently fail the minority-market apps.
+  const mkItem = (app_id: string, country?: string): EnrichWorkItem => ({
+    store: 'app_store',
+    app_id,
+    is_chart: false,
+    country,
+  });
+  const groups = groupByEnrichCountry([mkItem('1', 'us'), mkItem('2', 'de'), mkItem('3'), mkItem('4', 'DE')]);
+  check([...groups.keys()].join(',') === 'us,de', 'country: one group per market, unset → us, case-folded');
+  check(groups.get('us')?.map((i) => i.app_id).join(',') === '1,3', 'country: unset joins the us group in order');
+  check(groups.get('de')?.map((i) => i.app_id).join(',') === '2,4', 'country: DE folds into de, order kept');
 
   return { passed, failed: failures.length, failures };
 }

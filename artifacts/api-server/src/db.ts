@@ -335,6 +335,24 @@ export function getNextPendingJob(): JobRow | null {
     .get(Date.now()) as JobRow) ?? null;
 }
 
+/** Oldest runnable job EXEMPT from the LLM daily cap (source='store_first').
+ *  Used when the queue head is cap-blocked: getNextPendingJob returns only the
+ *  single oldest job, and a cap-blocked head never leaves 'pending', so without
+ *  this an exempt job queued behind it would be head-of-line blocked until the
+ *  Jerusalem-day reset even though it spends no LLM budget at all. */
+export function getNextPendingCapExemptJob(): JobRow | null {
+  return (getDb()
+    .prepare(
+      `SELECT * FROM jobs
+        WHERE source = 'store_first'
+          AND (status = 'pending'
+           OR (status = 'deferred' AND (run_after IS NULL OR run_after <= ?)))
+        ORDER BY created_at ASC
+        LIMIT 1`,
+    )
+    .get(Date.now()) as JobRow) ?? null;
+}
+
 export function markJobRunning(id: string) {
   const now = Date.now();
   getDb()
