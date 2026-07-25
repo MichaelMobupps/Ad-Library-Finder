@@ -4,7 +4,7 @@ hidden = [".pnpm-store", "node_modules", ".cache", "dist"]
 
 [deployment]
 deploymentTarget = "vm"
-build = ["sh", "-c", "pnpm install && pnpm install:playwright && pnpm build"]
+build = ["sh", "-c", "pnpm install --prod=false && pnpm install:playwright && pnpm build"]
 run = ["sh", "-c", "pnpm start"]
 
 [[ports]]

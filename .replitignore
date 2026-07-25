@@ -10,11 +10,14 @@
 # own build step (`pnpm install && pnpm install:playwright && pnpm build`).
 # A smaller image pushes faster and spends less time exposed to registry errors.
 #
-# NOTE: .cache/ms-playwright is deliberately NOT excluded. browserSetup.ts
-# resolves the Chromium binary out of .cache/ms-playwright/chromium-*/, and it is
-# the only copy in this Repl — dropping it takes the GATC/CPS scraper offline.
+# .cache/ms-playwright IS excluded, despite what an earlier note here claimed.
+# It contains only chromium-1223, and locateInBrowsersDir (browserSetup.ts:304)
+# matches solely 'chromium_headless_shell-*' — so no code path can reach it.
+# The binary the scraper actually launches is chromium_headless_shell-1228 under
+# playwright-core/.local-browsers in node_modules, which ships (see below).
 .config/.vscode-server
 .config/npm
+.cache/ms-playwright
 .cache/pnpm
 .cache/node-gyp
 .cache/typescript
