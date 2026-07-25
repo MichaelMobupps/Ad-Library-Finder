@@ -319,7 +319,15 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
     }
     // Dedupe against leads earlier jobs already exported, then persist the
     // survivors into the shared lead store (spec step 12).
-    const { path: csvPath, rowsWritten, exported } = buildPublisherCsv(job.id, publishers, leadHistorySeed());
+    const { path: csvPath, rowsWritten, exported } = buildPublisherCsv(
+      job.id,
+      publishers,
+      leadHistorySeed(),
+      params.maxLeads,
+    );
+    if (params.maxLeads != null && rowsWritten >= params.maxLeads) {
+      onLog('info', `lead cap: exported the top ${rowsWritten} publishers by score (cap ${params.maxLeads})`);
+    }
     const persisted = persistPublisherLeads(job.id, exported);
     onLog(
       'info',

@@ -38,10 +38,52 @@ function escapeFreeText(v: string | null | undefined): string {
   return escapeCsv(neutralizeFormula(v));
 }
 
+/** Lead-count choices offered in the UI. null ⇒ "as many as found". */
+export const LEAD_LIMIT_CHOICES = [20, 50, 100] as const;
+
+/**
+ * Normalize a caller-supplied lead cap to one of the offered choices or null.
+ *
+ * Deliberately permissive about the VALUE (any positive integer is honoured, so
+ * ops can pass 250 via the API) but strict about the TYPE: anything non-numeric,
+ * zero or negative becomes null = uncapped, because silently exporting 0 leads
+ * would look identical to "the search found nothing".
+ */
+export function normalizeMaxLeads(v: unknown): number | null {
+  const n = typeof v === 'number' ? v : Number(v);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return Math.floor(n);
+}
+
 export interface BuildCsvInput {
   jobId: string;
   productType: ProductType;
   results: JobResultRow[];
+  /** Cap on exported rows; null/omitted = every row found. */
+  maxRows?: number | null;
+}
+
+/**
+ * The rows a job actually exports: product-type filter, then the operator's lead
+ * cap. Shared so the CSV and the per-HQ-country Excel bundle export the SAME set —
+ * capping only inside buildCsv would ship a 20-row CSV beside a 300-row Excel.
+ *
+ * The cap is applied AFTER filtering, so "20 leads" means 20 usable rows, not 20
+ * candidates of which some lacked a store URL and vanished.
+ */
+export function selectExportRows(
+  results: JobResultRow[],
+  productType: ProductType,
+  maxRows?: number | null,
+): JobResultRow[] {
+  const filtered =
+    productType === 'mobile'
+      ? results.filter(
+          (r) =>
+            (r.classification === 'mobile_google_play' || r.classification === 'mobile_app_store') && r.store_url,
+        )
+      : results.filter((r) => r.classification === 'cps_web' && r.landing_url);
+  return maxRows != null && maxRows > 0 ? filtered.slice(0, maxRows) : filtered;
 }
 
 export function buildCsv(input: BuildCsvInput): { path: string; rowsWritten: number } {
@@ -53,12 +95,7 @@ export function buildCsv(input: BuildCsvInput): { path: string; rowsWritten: num
   let rows: string[];
 
   if (productType === 'mobile') {
-    // Only include results that have a store_url (Google Play or App Store).
-    const mobile = results.filter(
-      (r) =>
-        (r.classification === 'mobile_google_play' || r.classification === 'mobile_app_store') &&
-        r.store_url
-    );
+    const mobile = selectExportRows(results, 'mobile', input.maxRows);
 
     // Header MUST use "store_url" — Email Prospector's CSV ingest auto-detects
     // the store-URL column by header name. Its accepted aliases are:
@@ -99,7 +136,7 @@ export function buildCsv(input: BuildCsvInput): { path: string; rowsWritten: num
     }
   } else {
     // CPS: web destinations only.
-    const cps = results.filter((r) => r.classification === 'cps_web' && r.landing_url);
+    const cps = selectExportRows(results, 'cps', input.maxRows);
     header = 'advertiser_name,country,website_url,ad_text';
     rows = cps.map((r) =>
       [
@@ -130,6 +167,7 @@ export function buildCsv(input: BuildCsvInput): { path: string; rowsWritten: num
 // ─────────────────────────────────────────────────────────────
 
 export function runCsvUnitTests(): { passed: number; failed: number; failures: string[] } {
+  // (lead-cap assertions are appended at the end of this function)
   let passed = 0;
   const failures: string[] = [];
   const check = (cond: boolean, desc: string) => {
@@ -160,6 +198,35 @@ export function runCsvUnitTests(): { passed: number; failed: number; failures: s
   const malicious = '=HYPERLINK("http://x"),2';
   const out = escapeCsv(neutralizeFormula(malicious));
   check(out.startsWith('"\'=HYPERLINK') && out.endsWith('"'), 'free-text guard: neutralized and quoted');
+
+  // ── Lead cap: N means N USABLE rows, and it must not change what qualifies ──
+  const mk = (n: number, cls: string, store: string | null, land: string | null): JobResultRow =>
+    ({ id: n, job_id: 'j', advertiser_name: `A${n}`, page_url: null, landing_url: land,
+       classification: cls, store_url: store, ad_text: null, country: 'US', created_at: 0,
+       app_category: null, is_game: null } as JobResultRow);
+  // Two of these four mobile rows are unusable (no store_url).
+  const mixed = [
+    mk(1, 'mobile_google_play', 'https://play.google.com/store/apps/details?id=a', null),
+    mk(2, 'mobile_google_play', null, null),
+    mk(3, 'mobile_app_store', 'https://apps.apple.com/app/id2', null),
+    mk(4, 'cps_web', null, 'https://x.com'),
+  ];
+  check(selectExportRows(mixed, 'mobile').length === 2, 'cap: uncapped mobile keeps only rows with a store url');
+  check(selectExportRows(mixed, 'mobile', 1).length === 1, 'cap: mobile cap of 1 yields exactly 1');
+  check(
+    selectExportRows(mixed, 'mobile', 2).length === 2,
+    'cap: cap applies AFTER the filter — 2 usable rows, not 2 candidates of which one was dropped',
+  );
+  check(selectExportRows(mixed, 'mobile', 99).length === 2, 'cap: a cap above supply returns everything available');
+  check(selectExportRows(mixed, 'cps').length === 1, 'cap: cps keeps only web rows');
+  check(selectExportRows(mixed, 'mobile', null).length === 2, 'cap: null = as many as found');
+  check(selectExportRows(mixed, 'mobile', 0).length === 2, 'cap: 0 is uncapped, never an empty export');
+  // normalizeMaxLeads is the single gate on operator input.
+  check(normalizeMaxLeads(20) === 20 && normalizeMaxLeads('50') === 50, 'cap: numbers and numeric strings honored');
+  check(normalizeMaxLeads(null) === null && normalizeMaxLeads(undefined) === null, 'cap: absent → uncapped');
+  check(normalizeMaxLeads(0) === null && normalizeMaxLeads(-3) === null, 'cap: 0/negative → uncapped');
+  check(normalizeMaxLeads('abc') === null && normalizeMaxLeads({}) === null, 'cap: junk → uncapped');
+  check(LEAD_LIMIT_CHOICES.join(',') === '20,50,100', 'cap: offered choices are 20/50/100 (+ as many as found)');
 
   return { passed, failed: failures.length, failures };
 }

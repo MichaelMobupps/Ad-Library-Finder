@@ -15,6 +15,8 @@
  * tuning without a code change; the seed value is the spec's exact default.
  */
 
+import { normalizeMaxLeads } from './csv.js';
+
 // ── small env helpers (mirror the clampInt pattern used across the codebase) ──
 function clampInt(v: string | undefined, def: number, min: number, max: number): number {
   const n = Number(v);
@@ -406,6 +408,8 @@ export interface StoreDiscoveryParams {
   similarMaxAppsPerRun: number;
   searchTermsLimit: number | null; // cap terms/vertical (smoke uses 5); null = all 15
   confirmationMaxApiCalls: number;
+  /** Operator-chosen cap on EXPORTED leads (best-scored first); null = all found. */
+  maxLeads: number | null;
 }
 
 /** Normalize an arbitrary source_params blob into a fully-defaulted param set. */
@@ -449,6 +453,10 @@ export function resolveStoreParams(raw: unknown): StoreDiscoveryParams {
       0,
       CONFIRMATION_HARD_MAX_API_CALLS,
     ),
+    // Absent/invalid ⇒ null ⇒ "as many as found". NOT defaulted to a number:
+    // silently capping an operator who never asked for a cap would look like the
+    // search simply stopped finding leads.
+    maxLeads: normalizeMaxLeads(p.maxLeads),
   };
 }
 
@@ -508,6 +516,16 @@ export function runStoreConfigTests(): { passed: number; failed: number; failure
   check(nulls.verticals.join(',') === DEFAULT_ACTIVE_VERTICALS.join(','), 'params: null verticals → configured default');
   // An EXPLICIT 0 is still honored (a caller may legitimately disable a stage).
   check(resolveStoreParams({ confirmationMaxApiCalls: 0 }).confirmationMaxApiCalls === 0, 'params: explicit 0 honored');
+  // Lead cap: absent means "as many as found", never a silent default.
+  check(resolveStoreParams({}).maxLeads === null, 'leads: absent cap → null (uncapped)');
+  check(resolveStoreParams({ maxLeads: null }).maxLeads === null, 'leads: explicit null → uncapped');
+  check(resolveStoreParams({ maxLeads: 20 }).maxLeads === 20, 'leads: 20 honored');
+  check(resolveStoreParams({ maxLeads: 50 }).maxLeads === 50, 'leads: 50 honored');
+  check(resolveStoreParams({ maxLeads: 100 }).maxLeads === 100, 'leads: 100 honored');
+  check(resolveStoreParams({ maxLeads: '50' }).maxLeads === 50, 'leads: numeric string coerced');
+  check(resolveStoreParams({ maxLeads: 0 }).maxLeads === null, 'leads: 0 → uncapped, never an empty export');
+  check(resolveStoreParams({ maxLeads: -5 }).maxLeads === null, 'leads: negative → uncapped');
+  check(resolveStoreParams({ maxLeads: 'abc' }).maxLeads === null, 'leads: junk → uncapped');
   // A job body cannot exceed the operator-owned paid-API ceiling.
   check(
     resolveStoreParams({ confirmationMaxApiCalls: 999_999 }).confirmationMaxApiCalls === CONFIRMATION_HARD_MAX_API_CALLS,

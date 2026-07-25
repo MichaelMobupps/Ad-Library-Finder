@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback } from 'react';
 import {
   api,
+  LEAD_LIMIT_CHOICES,
   Job,
   JobLog,
   ProductType,
@@ -300,6 +301,11 @@ function NewJob({
   const [countriesText, setCountriesText] = useState('US, BR, IN');
   const [productTypes, setProductTypes] = useState<ProductType[]>(['mobile']);
   const [recipientEmail, setRecipientEmail] = useState('');
+  // Lead cap for the two high-volume sources. null = "as many as found".
+  const [maxLeads, setMaxLeads] = useState<number | null>(null);
+  // Only the two Google Ads sources routinely return hundreds of leads; the
+  // others are already small, so offering a cap there would be noise.
+  const leadCapApplies = source === 'google_ads' || source === 'store_first';
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -480,6 +486,7 @@ function NewJob({
         appgoblinAdNetwork: source === 'appgoblin' ? (appgoblinAdNetwork.trim() || null) : undefined,
         googleAds,
         storeFirst,
+        maxLeads: leadCapApplies ? maxLeads : null,
       });
       onCreated();
     } catch (err) {
@@ -807,6 +814,29 @@ function NewJob({
                 : 'Selecting both creates two separate jobs (one CSV per type).'}
         </p>
       </div>
+
+      {leadCapApplies && (
+        <div className="form-row">
+          <label>How many leads?</label>
+          <div className="checkbox-row">
+            {LEAD_LIMIT_CHOICES.map((n) => (
+              <label className="checkbox" key={n}>
+                <input type="radio" name="maxLeads" checked={maxLeads === n} onChange={() => setMaxLeads(n)} />
+                <span>{n}</span>
+              </label>
+            ))}
+            <label className="checkbox">
+              <input type="radio" name="maxLeads" checked={maxLeads === null} onChange={() => setMaxLeads(null)} />
+              <span>As many as found</span>
+            </label>
+          </div>
+          <p className="form-hint">
+            {source === 'store_first'
+              ? 'Caps the CSV and the Excel to the highest-scoring publishers — best rank, most countries, most Ads Transparency activity first. Discovery still runs in full, so the rest stay in the Publishers tab.'
+              : 'Caps the CSV and the Excel to the first leads found. The scrape still runs in full, so nothing discovered is lost.'}
+          </p>
+        </div>
+      )}
 
       <div className="form-row">
         <label>Notification recipient (optional)</label>

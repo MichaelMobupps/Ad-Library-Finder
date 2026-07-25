@@ -63,7 +63,7 @@ import {
 import { keywordsForJob, keywordStats, GOOGLE_ADS_VERTICALS } from './googleAdsKeywords.js';
 import { sanitizeStoreUrl } from './classifier.js';
 import { makeSearchBudget, searchAdvertiserWebsite } from './webResolver.js';
-import { buildCsv } from './csv.js';
+import { buildCsv, selectExportRows, normalizeMaxLeads } from './csv.js';
 import { notifyJobCompleted, notifyJobFailed } from './notifier.js';
 import { runHqSplit } from './hqSplit.js';
 import { runHqSplitWeb } from './hqSplitWeb.js';
@@ -544,11 +544,22 @@ export async function runGoogleAdsJob(job: JobRow): Promise<void> {
     // ── 5. CSV (filters by product type) ──
     setJobPhase(job.id, 'building_csv', `writing ${job.product_type} CSV`);
     const allResults = getResults(job.id);
+    // Operator-chosen lead cap (20/50/100/all). Resolved once and used for BOTH
+    // the CSV and the HQ split below, so the Excel bundle never disagrees with the
+    // CSV about how many leads this job delivered.
+    const maxLeads = normalizeMaxLeads(
+      job.source_params ? (JSON.parse(job.source_params) as Record<string, unknown>).maxLeads : null,
+    );
     const { path: csvPath, rowsWritten } = buildCsv({
       jobId: job.id,
       productType: job.product_type,
       results: allResults,
+      maxRows: maxLeads,
     });
+    const exportRows = selectExportRows(allResults, job.product_type, maxLeads);
+    if (maxLeads != null && rowsWritten >= maxLeads) {
+      onLog('info', `google-ads: lead cap applied — exported ${rowsWritten} of ${selectExportRows(allResults, job.product_type).length} eligible leads`);
+    }
     onLog('info', `google-ads: CSV written: ${csvPath} (${rowsWritten} ${job.product_type} rows)`);
     if (rowsWritten === 0) {
       onLog(
@@ -573,7 +584,7 @@ export async function runGoogleAdsJob(job: JobRow): Promise<void> {
     setJobPhase(job.id, 'hq_splitting', `resolving HQ for ${rowsWritten} leads`);
     try {
       if (job.product_type === 'mobile') {
-        const outcome = await runHqSplit({ jobId: job.id, results: allResults, onLog });
+        const outcome = await runHqSplit({ jobId: job.id, results: exportRows, onLog });
         if (outcome.zipPath) {
           setJobHqZipPath(job.id, outcome.zipPath);
           const summary = Object.entries(outcome.perCountryCounts)
@@ -586,7 +597,7 @@ export async function runGoogleAdsJob(job: JobRow): Promise<void> {
           onLog('warn', 'google-ads hq-split: Play page-fetch was blocked/rate-limited — Android HQ resolution may be degraded');
         }
       } else {
-        const outcome = await runHqSplitWeb({ jobId: job.id, results: allResults, onLog });
+        const outcome = await runHqSplitWeb({ jobId: job.id, results: exportRows, onLog });
         if (outcome.zipPath) {
           setJobHqZipPath(job.id, outcome.zipPath);
           const summary = Object.entries(outcome.perCountryCounts)

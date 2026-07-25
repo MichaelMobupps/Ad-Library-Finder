@@ -183,7 +183,12 @@ export interface CreateJobOptions {
   appgoblinAdNetwork?: string | null;
   googleAds?: GoogleAdsOptions | null;
   storeFirst?: StoreFirstOptions | null;
+  /** Cap on exported leads (20/50/100); null = as many as found. */
+  maxLeads?: number | null;
 }
+
+/** Lead-count choices offered for the two high-volume sources. null = all. */
+export const LEAD_LIMIT_CHOICES: readonly number[] = [20, 50, 100];
 
 export class AuthRequiredError extends Error {
   constructor() { super('authentication required'); this.name = 'AuthRequiredError'; }
