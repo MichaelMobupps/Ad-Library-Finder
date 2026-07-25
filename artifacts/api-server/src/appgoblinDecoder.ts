@@ -285,8 +285,14 @@ function coerceApp(raw: unknown): AppgoblinApp | null {
 
 import { readFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const FIXTURE_DIR = path.resolve('artifacts/api-server/fixtures');
+// Resolved from THIS module's location, not the cwd: the documented way to run
+// these suites is `cd artifacts/api-server && node dist/<module>.js`, under which
+// a cwd-relative 'artifacts/api-server/fixtures' pointed at a doubled path and
+// both fixture tests silently reported "fixture missing". dist/ and src/ are both
+// one level below api-server/, so '../fixtures' is correct for tsx and node alike.
+const FIXTURE_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../fixtures');
 const COMPANY_FIXTURE = path.join(FIXTURE_DIR, 'appgoblin_company_appsflyer.json');
 const CATEGORY_FIXTURE = path.join(FIXTURE_DIR, 'appgoblin_category_game_casino.json');
 

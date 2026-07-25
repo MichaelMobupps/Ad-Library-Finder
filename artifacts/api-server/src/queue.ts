@@ -1,5 +1,6 @@
 import {
   getNextPendingJob,
+  getNextPendingCapExemptJob,
   markJobRunning,
   markJobCompleted,
   markJobFailed,
@@ -26,6 +27,7 @@ import { notifyJobCompleted, notifyJobFailed } from './notifier.js';
 import { runAffplusJob } from './affplusPipeline.js';
 import { runAppgoblinJob } from './appgoblinPipeline.js';
 import { runGoogleAdsJob } from './googleAdsPipeline.js';
+import { runStoreDiscoveryJob } from './storeDiscoveryPipeline.js';
 import { runHqSplit } from './hqSplit.js';
 import { log } from './logger.js';
 
@@ -42,22 +44,31 @@ export function startQueue() {
 async function tick() {
   while (running) {
     try {
-      const job = getNextPendingJob();
+      let job = getNextPendingJob();
+      // Already at/over the daily cap: do not start the head job. Starting it
+      // would scrape (non-LLM) and then defer at the first LLM call, churning
+      // the whole queue. Leave it untouched and wait for the Jerusalem-day
+      // reset, at which point spend resets and dispatch resumes.
+      //
+      // store_first is EXEMPT: its pipeline makes no LLM calls at all (stores
+      // are free, GATC/Meta confirmation is HTTP), so it can never defer on
+      // spend and holding it back just stalls discovery for a whole day. The
+      // exemption must not depend on the exempt job being the HEAD: the blocked
+      // head never leaves 'pending', so a store_first job queued behind it
+      // would otherwise be head-of-line blocked until midnight. When the head
+      // is cap-parked, run the oldest exempt job behind it instead.
+      if (job && job.source !== 'store_first' && spentTodayUsd() >= DAILY_CAP_USD) {
+        job = getNextPendingCapExemptJob();
+      }
       if (job) {
-        // Already at/over the daily cap: do not start the next job. Starting it
-        // would scrape (non-LLM) and then defer at the first LLM call, churning
-        // the whole queue. Leave jobs untouched and wait for the Jerusalem-day
-        // reset, at which point spend resets and dispatch resumes.
-        if (spentTodayUsd() >= DAILY_CAP_USD) {
-          await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
-          continue;
-        }
         if (job.source === 'affplus') {
           await runAffplusJob(job);
         } else if (job.source === 'appgoblin') {
           await runAppgoblinJob(job);
         } else if (job.source === 'google_ads') {
           await runGoogleAdsJob(job);
+        } else if (job.source === 'store_first') {
+          await runStoreDiscoveryJob(job);
         } else {
           await runMetaJob(job);
         }

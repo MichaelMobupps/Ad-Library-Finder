@@ -923,3 +923,138 @@ input[type="text"].input {
   color: var(--tag-google_ads-text);
   border-color: var(--tag-google_ads-border);
 }
+/* ============================================================
+   Store-first discovery (spec step 15)
+
+   The store_first tag, the missing `deferred` status badge, and the
+   Publishers view: a horizontally scrollable wide table, a filter bar
+   and the discovery-funnel widget.
+   ============================================================ */
+:root {
+  --tag-store_first-text: #0891b2;
+  --tag-store_first-bg: rgba(8, 145, 178, 0.10);
+  --tag-store_first-border: rgba(8, 145, 178, 0.28);
+}
+.tag-store_first {
+  background: var(--tag-store_first-bg);
+  color: var(--tag-store_first-text);
+  border-color: var(--tag-store_first-border);
+}
+
+/* JobStatus includes 'deferred' (LLM daily cap) but had no badge rule. */
+.status-deferred {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+/* --- wide-table scroll ------------------------------------------------
+   .panel is `overflow: hidden`, so a table wider than the panel is
+   CLIPPED rather than scrolled. This wrapper goes inside the panel: it
+   keeps the panel's rounded corners while letting the table scroll. */
+.table-scroll {
+  overflow-x: auto;
+}
+.pub-table {
+  min-width: 1500px;
+}
+.pub-table th,
+.pub-table td {
+  padding: 12px 14px;
+  white-space: nowrap;
+}
+/* Publisher names and emails are the only cells allowed to be long. */
+.pub-table td:first-child,
+.pub-table td:nth-child(2),
+.pub-table td:nth-child(3) {
+  white-space: normal;
+  max-width: 260px;
+}
+.pub-table .num {
+  text-align: right;
+}
+/* Publisher rows are not clickable (links inside them are), so they get hover
+   feedback without .jobs-row's cursor: pointer. */
+.pub-row:hover {
+  background: var(--bg-elev-2);
+}
+.pub-row:last-child td {
+  border-bottom: none;
+}
+/* The scroll container is keyboard-focusable; show that focus. */
+.table-scroll:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.pub-table .tag {
+  margin-right: 4px;
+}
+
+/* --- filter bar -------------------------------------------------------
+   NB: deliberately NOT `.checkbox-row`, which is flex-direction: column. */
+.pub-filters {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding: 16px 24px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-elev-2);
+}
+.pub-filters .input {
+  width: auto;
+  min-width: 150px;
+  padding: 7px 10px;
+  font-size: var(--fs-xs);
+}
+
+/* --- discovery funnel widget ----------------------------------------- */
+.funnel {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 16px 24px;
+  border-bottom: 1px solid var(--border);
+}
+.funnel-step {
+  flex: 1;
+  min-width: 96px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-elev);
+}
+/* The four discovery sources read as inputs to the funnel, not stages. */
+.funnel-source {
+  background: var(--accent-soft);
+  border-color: var(--accent-ring);
+}
+.funnel-value {
+  font-family: var(--font-mono);
+  font-size: var(--fs-lg);
+  font-weight: 700;
+  color: var(--text);
+}
+.funnel-label {
+  font-size: var(--fs-xs);
+  color: var(--text-mute);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* Source-mix chips inside a publisher row, and the two boolean pills. */
+.tag-src-chart,
+.tag-both {
+  background: var(--tag-store_first-bg);
+  color: var(--tag-store_first-text);
+  border-color: var(--tag-store_first-border);
+}
+.tag-src-similar,
+.tag-src-developer_catalog,
+.tag-src-search,
+.tag-inband {
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+  border-color: var(--accent-ring);
+}

@@ -316,9 +316,11 @@ const VERTICAL_DEFS: VerticalDef[] = [
     //     (solitaire, puzzle, rpg, idle, merge, tycoon, launcher, cleaner, vpn…)
     //   • Legal-entity NAME tokens common to app studios worldwide
     //     ("Games", "Studio(s)", "Interactive", "PTE. LTD.", "Network Technology"…)
-    // Mobile jobs default to this vertical (see googleAdsPipeline) because a store
-    // destination — the thing that makes a MOBILE lead — only appears in the ads
-    // of these advertisers. Keep it broad: breadth of names = breadth of the pull.
+    // DEMOTED (store-first migration, spec step 14): mobile jobs NO LONGER default
+    // to this vertical. A name-token search only finds advertisers who put a studio
+    // token in their advertiser NAME, which is not the set of app advertisers and
+    // cannot be made into it. Store-first discovery owns that job now; this battery
+    // is kept and still runs when a caller pins the vertical explicitly.
     meta: { id: 'apps', label: 'Mobile Apps / Games', hint: 'App & game publishers (Play / App Store listings)' },
     en: [
       // App-category / game-genre terms (recur in app names + install campaigns)

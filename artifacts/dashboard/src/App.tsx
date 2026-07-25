@@ -10,14 +10,21 @@ import {
   Me,
   AppgoblinCategory,
   GoogleAdsMeta,
+  StoreFirstConfig,
   CreateJobOptions,
   AuthRequiredError,
   derivePhase,
   phaseLabel,
   PHASE_STEPS,
 } from './api/client';
+import Publishers from './Publishers';
 
-type View = { kind: 'list' } | { kind: 'new' } | { kind: 'detail'; id: string } | { kind: 'settings' };
+type View =
+  | { kind: 'publishers' }
+  | { kind: 'list' }
+  | { kind: 'new' }
+  | { kind: 'detail'; id: string }
+  | { kind: 'settings' };
 type AuthState = { kind: 'loading' } | { kind: 'anon' } | { kind: 'signed-in'; me: Me };
 
 export default function App() {
@@ -73,7 +80,8 @@ function LoginScreen() {
 // -------- Authed app shell --------
 
 function AuthedApp({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
-  const [view, setView] = useState<View>({ kind: 'list' });
+  // Publishers is the primary view (store-first is the discovery engine).
+  const [view, setView] = useState<View>({ kind: 'publishers' });
   const [jobs, setJobs] = useState<Job[]>([]);
   const [settings, setSettings] = useState<Settings | null>(null);
 
@@ -134,6 +142,13 @@ function AuthedApp({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
           <span className="brand-name">AD LIBRARY FINDER</span>
         </div>
         <nav>
+          <button
+            className={`nav-btn ${view.kind === 'publishers' ? 'active' : ''}`}
+            onClick={() => setView({ kind: 'publishers' })}
+            title="Store-first discovery results — the primary view"
+          >
+            Publishers
+          </button>
           <button className={`nav-btn ${view.kind === 'list' ? 'active' : ''}`} onClick={() => setView({ kind: 'list' })}>
             Jobs
           </button>
@@ -151,6 +166,7 @@ function AuthedApp({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
       </header>
 
       <main>
+        {view.kind === 'publishers' && <Publishers onAuthError={handleAuthError} />}
         {view.kind === 'list' && (
           <JobsList
             jobs={jobs}
@@ -182,7 +198,7 @@ function JobsList({ jobs, onSelect, onNew }: { jobs: Job[]; onSelect: (id: strin
     return (
       <div className="empty">
         <p className="empty-title">No jobs yet</p>
-        <p className="empty-sub">Submit a scrape from Meta Ad Library, Affplus, AppGoblin, or Google Ads Transparency.</p>
+        <p className="empty-sub">Run Store-First Discovery, or a scrape from Meta Ad Library, Affplus, AppGoblin, or Google Ads Transparency.</p>
         <button className="btn primary" onClick={onNew}>+ New Job</button>
       </div>
     );
@@ -280,6 +296,17 @@ function NewJob({
   const [agCategoriesError, setAgCategoriesError] = useState<string | null>(null);
   const [agCategoriesLoading, setAgCategoriesLoading] = useState(false);
 
+  // Store-first discovery state. Markets come from the store config (not the
+  // Countries field, which is only CSV metadata for this source).
+  const [sfVerticals, setSfVerticals] = useState<string[]>([]);
+  const [sfMarkets, setSfMarkets] = useState<string[]>([]);
+  const [sfSimilarMax, setSfSimilarMax] = useState<number>(5000);
+  const [sfSearchTerms, setSfSearchTerms] = useState<number>(15);
+  const [sfConfirmMax, setSfConfirmMax] = useState<number>(200);
+  const [sfConfig, setSfConfig] = useState<StoreFirstConfig | null>(null);
+  const [sfConfigError, setSfConfigError] = useState<string | null>(null);
+  const [sfConfigLoading, setSfConfigLoading] = useState(false);
+
   // Google Ads Transparency discovery state
   const [gaVerticals, setGaVerticals] = useState<string[]>([]);
   const [gaLanguages, setGaLanguages] = useState<string[]>([]); // empty = all languages
@@ -320,6 +347,30 @@ function NewJob({
       .finally(() => setGaMetaLoading(false));
   }, [source, gaMeta]);
 
+  // Lazy-load the store-first vertical/market config when that source is picked,
+  // and seed the form with the spec's default active vertical + markets.
+  useEffect(() => {
+    if (source !== 'store_first') return;
+    if (sfConfig !== null) return;
+    setSfConfigLoading(true);
+    setSfConfigError(null);
+    api.storeFirstConfig()
+      .then((c) => {
+        setSfConfig(c);
+        setSfVerticals((prev) => (prev.length ? prev : c.defaults.verticals));
+        setSfMarkets((prev) => (prev.length ? prev : c.defaults.markets));
+      })
+      .catch((err) => setSfConfigError((err as Error).message))
+      .finally(() => setSfConfigLoading(false));
+  }, [source, sfConfig]);
+
+  const toggleSfVertical = (id: string) => {
+    setSfVerticals((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+  };
+  const toggleSfMarket = (m: string) => {
+    setSfMarkets((prev) => (prev.includes(m) ? prev.filter((x) => x !== m) : [...prev, m]));
+  };
+
   const toggleType = (pt: ProductType) => {
     setProductTypes((prev) => (prev.includes(pt) ? prev.filter((x) => x !== pt) : [...prev, pt]));
   };
@@ -331,10 +382,10 @@ function NewJob({
     setGaLanguages((prev) => (prev.includes(code) ? prev.filter((x) => x !== code) : [...prev, code]));
   };
 
-  // AppGoblin is mobile-only; force productType to mobile when it is selected.
+  // AppGoblin and store-first are mobile-only; force productType accordingly.
   const handleSourceChange = (s: JobSource) => {
     setSource(s);
-    if (s === 'appgoblin') setProductTypes(['mobile']);
+    if (s === 'appgoblin' || s === 'store_first') setProductTypes(['mobile']);
   };
 
   const submit = async () => {
@@ -364,6 +415,28 @@ function NewJob({
         return;
       }
     }
+    let storeFirst: CreateJobOptions['storeFirst'] = undefined;
+    if (source === 'store_first') {
+      if (productTypes.some((pt) => pt !== 'mobile')) {
+        setError('Store-First Discovery supports Mobile only');
+        return;
+      }
+      if (sfVerticals.length === 0) {
+        setError('Store-First: pick at least one vertical');
+        return;
+      }
+      if (sfMarkets.length === 0) {
+        setError('Store-First: pick at least one market');
+        return;
+      }
+      storeFirst = {
+        verticals: sfVerticals,
+        markets: sfMarkets,
+        similarMaxAppsPerRun: sfSimilarMax,
+        searchTermsLimit: sfSearchTerms,
+        confirmationMaxApiCalls: sfConfirmMax,
+      };
+    }
     let googleAds: CreateJobOptions['googleAds'] = undefined;
     if (source === 'google_ads') {
       const custom = gaCustomKeywords
@@ -389,6 +462,7 @@ function NewJob({
         appgoblinCategory: source === 'appgoblin' ? (appgoblinCategory.trim() || null) : undefined,
         appgoblinAdNetwork: source === 'appgoblin' ? (appgoblinAdNetwork.trim() || null) : undefined,
         googleAds,
+        storeFirst,
       });
       onCreated();
     } catch (err) {
@@ -410,6 +484,17 @@ function NewJob({
       <div className="form-row">
         <label>Source</label>
         <div className="checkbox-row">
+          <label className="checkbox">
+            <input
+              type="radio"
+              name="source"
+              checked={source === 'store_first'}
+              onChange={() => handleSourceChange('store_first')}
+            />
+            <span>
+              Store-First Discovery <span className="muted">(app-store charts + long tail → publishers; Mobile only)</span>
+            </span>
+          </label>
           <label className="checkbox">
             <input
               type="radio"
@@ -444,17 +529,110 @@ function NewJob({
               checked={source === 'google_ads'}
               onChange={() => handleSourceChange('google_ads')}
             />
-            <span>Google Ads Transparency <span className="muted">(advertisers by multilingual keyword; Mobile + CPS)</span></span>
+            <span>
+              Google Ads Transparency{' '}
+              <span className="muted">(secondary — advertiser search by keyword; Mobile + CPS)</span>
+            </span>
           </label>
         </div>
         <p className="form-hint">
+          <strong>Store-First</strong> is the discovery engine: it harvests Play + App Store charts, crawls the
+          long tail via similar-apps, developer catalogs and store search, then rolls apps up into publishers
+          with the contact email the Play listing publishes. Google Ads Transparency and Meta act as
+          <em> confirmation</em> layers on top of it — they prove a publisher is actively advertising, they do
+          not find publishers.
+        </p>
+        <p className="form-hint">
           Meta scrapes the Facebook Ad Library and classifies landing pages. Affplus lists CPA/CPI mobile
           offers and verifies each against the Google Play / App Store. AppGoblin discovers real apps by
-          category or by which ad-network/MMP SDK they integrate. Google Ads Transparency searches a huge
-          multilingual keyword bank against the Transparency Center, then classifies each advertiser's
-          destination as Mobile (app store) or CPS (website) and splits leads by HQ country.
+          category or by which ad-network/MMP SDK they integrate. Google Ads Transparency is kept as a
+          secondary advertiser view: its search matches advertiser names and verified domains only, caps at
+          100 advertisers per query, and structurally cannot enumerate app advertisers — which is why
+          discovery moved to the stores.
         </p>
       </div>
+
+      {source === 'store_first' && (
+        <div className="form-row">
+          <label>Store-First discovery</label>
+          {sfConfigLoading && <div className="muted small">Loading store config…</div>}
+          {sfConfigError && <div className="error" style={{ marginBottom: 6 }}>Store config failed to load: {sfConfigError}</div>}
+          {sfConfig && (
+            <p className="form-hint" style={{ marginTop: 0 }}>
+              Charts: Play <code>{sfConfig.charts.play.join(' + ')}</code>, Apple{' '}
+              <code>{sfConfig.charts.apple.join(' + ')}</code>. Long-tail apps outside the install band{' '}
+              <code>{sfConfig.installBand.min.toLocaleString()}–{sfConfig.installBand.max.toLocaleString()}</code>{' '}
+              are stored but skip enrichment and confirmation; charted apps are exempt.
+            </p>
+          )}
+
+          <div className="muted small" style={{ margin: '8px 0 4px' }}>
+            Verticals ({sfVerticals.length} selected)
+          </div>
+          <div className="checkbox-row" style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8 }}>
+            {(sfConfig?.verticals || []).map((v) => (
+              <label key={v.id} className="checkbox" style={{ marginRight: 10 }}>
+                <input type="checkbox" checked={sfVerticals.includes(v.id)} onChange={() => toggleSfVertical(v.id)} />
+                <span>{v.label}</span>
+              </label>
+            ))}
+          </div>
+
+          <div className="muted small" style={{ margin: '12px 0 4px' }}>
+            Markets ({sfMarkets.length} selected)
+          </div>
+          <div className="checkbox-row" style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6 }}>
+            {(sfConfig?.markets || []).map((m) => (
+              <label key={m} className="checkbox" style={{ marginRight: 8 }}>
+                <input type="checkbox" checked={sfMarkets.includes(m)} onChange={() => toggleSfMarket(m)} />
+                <span className="mono">{m.toUpperCase()}</span>
+              </label>
+            ))}
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 12, marginTop: 12 }}>
+            <div>
+              <div className="muted small" style={{ marginBottom: 4 }}>Similar-apps cap / run</div>
+              <input
+                className="input"
+                type="number"
+                min={0}
+                max={50000}
+                value={sfSimilarMax}
+                onChange={(e) => setSfSimilarMax(Math.max(0, Math.min(50000, Number(e.target.value) || 0)))}
+              />
+            </div>
+            <div>
+              <div className="muted small" style={{ marginBottom: 4 }}>Search terms / vertical</div>
+              <input
+                className="input"
+                type="number"
+                min={0}
+                max={15}
+                value={sfSearchTerms}
+                onChange={(e) => setSfSearchTerms(Math.max(0, Math.min(15, Number(e.target.value) || 0)))}
+              />
+            </div>
+            <div>
+              <div className="muted small" style={{ marginBottom: 4 }}>Confirmation API calls / run</div>
+              <input
+                className="input"
+                type="number"
+                min={0}
+                max={10000}
+                value={sfConfirmMax}
+                onChange={(e) => setSfConfirmMax(Math.max(0, Math.min(10000, Number(e.target.value) || 0)))}
+              />
+            </div>
+          </div>
+          <p className="form-hint">
+            The similar-apps crawl expands outward from chart apps up to depth 2. The search battery runs each
+            term against both Play and iTunes search. Confirmation spends paid GATC (and Meta, if the key is
+            set) calls in priority order: charted publishers first, then in-band tail publishers with an email,
+            then the rest. Results land in the <strong>Publishers</strong> tab.
+          </p>
+        </div>
+      )}
 
       {source === 'appgoblin' && (
         <div className="form-row">
@@ -510,7 +688,7 @@ function NewJob({
           )}
 
           <div className="muted small" style={{ margin: '8px 0 4px' }}>Verticals ({gaVerticals.length ? `${gaVerticals.length} selected` : 'all'})</div>
-          <div className="checkbox-row" style={{ flexWrap: 'wrap', gap: 8 }}>
+          <div className="checkbox-row" style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8 }}>
             {(gaMeta?.verticals || []).map((v) => (
               <label key={v.id} className="checkbox" title={v.hint} style={{ marginRight: 10 }}>
                 <input type="checkbox" checked={gaVerticals.includes(v.id)} onChange={() => toggleGaVertical(v.id)} />
@@ -520,7 +698,7 @@ function NewJob({
           </div>
 
           <div className="muted small" style={{ margin: '12px 0 4px' }}>Languages ({gaLanguages.length ? `${gaLanguages.length} selected` : 'all'})</div>
-          <div className="checkbox-row" style={{ flexWrap: 'wrap', gap: 6, maxHeight: 120, overflowY: 'auto' }}>
+          <div className="checkbox-row" style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6, maxHeight: 120, overflowY: 'auto' }}>
             {(gaMeta?.languages || []).map((l) => (
               <label key={l.code} className="checkbox" style={{ marginRight: 8 }}>
                 <input type="checkbox" checked={gaLanguages.includes(l.code)} onChange={() => toggleGaLanguage(l.code)} />
@@ -569,7 +747,9 @@ function NewJob({
           placeholder="US, BR, IN, ID, MX"
         />
         <p className="form-hint">
-          {source === 'appgoblin'
+          {source === 'store_first'
+            ? 'Store-First ignores this list for discovery — the Markets checkboxes above choose which store fronts are harvested. The country list here is only metadata on the CSV rows.'
+            : source === 'appgoblin'
             ? 'AppGoblin returns the same apps regardless of country — the country list here is informational metadata on the CSV rows.'
             : source === 'google_ads'
               ? 'Google Ads Transparency treats region as metadata, not a hard filter — the country list here tags CSV rows and seeds the informational region. Leads are split by resolved HQ country, not by this list.'
@@ -593,7 +773,7 @@ function NewJob({
               type="checkbox"
               checked={productTypes.includes('cps')}
               onChange={() => toggleType('cps')}
-              disabled={source === 'appgoblin'}
+              disabled={source === 'appgoblin' || source === 'store_first'}
             />
             <span>CPS <span className="muted">(web product, website URLs)</span></span>
           </label>
@@ -601,7 +781,9 @@ function NewJob({
         <p className="form-hint">
           {source === 'appgoblin'
             ? 'AppGoblin supports Mobile only.'
-            : 'Selecting both creates two separate jobs (one CSV per type).'}
+            : source === 'store_first'
+              ? 'Store-First discovers app publishers, so it supports Mobile only.'
+              : 'Selecting both creates two separate jobs (one CSV per type).'}
         </p>
       </div>
 
@@ -682,6 +864,11 @@ function JobDetail({ id, onBack }: { id: string; onBack: () => void }) {
       if (Array.isArray(p.languages) && p.languages.length) parts.push(`languages=${(p.languages as string[]).join('/')}`);
       if (Array.isArray(p.customKeywords) && p.customKeywords.length) parts.push(`custom keywords=${(p.customKeywords as string[]).length}`);
       if (p.maxKeywords) parts.push(`maxKeywords=${p.maxKeywords}`);
+      // Store-first
+      if (Array.isArray(p.markets) && p.markets.length) parts.push(`markets=${(p.markets as string[]).join('/')}`);
+      if (p.similarMaxAppsPerRun != null) parts.push(`similarCap=${p.similarMaxAppsPerRun}`);
+      if (p.searchTermsLimit != null) parts.push(`searchTerms=${p.searchTermsLimit}`);
+      if (p.confirmationMaxApiCalls != null) parts.push(`confirmCap=${p.confirmationMaxApiCalls}`);
       if (parts.length > 0) sourceParamsDisplay = parts.join(', ');
     } catch { /* ignore */ }
   }

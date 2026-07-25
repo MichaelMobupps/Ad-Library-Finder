@@ -403,6 +403,11 @@ export function runAppCategoryTests(): { passed: number; failed: number; failure
   check(isGameApple('6014', []) === true, 'apple: primaryGenreId "6014" (string) → game');
   check(isGameApple(6005, ['6005', '6002']) === false, 'apple: Social Networking → non-game');
   check(isGameApple(6017, ['6017', '6005']) === false, 'apple: Education → non-game');
+  // 6015 = Finance. The spec names this exact negative because Finance is the
+  // default store-first vertical: misfiring here would flag every fintech
+  // publisher as a game publisher and skew NON_GAME_BONUS scoring.
+  check(isGameApple(6015, ['6015']) === false, 'apple: 6015 Finance → non-game');
+  check(isGameApple('6015', ['6015', '6000']) === false, 'apple: "6015" (string) Finance → non-game');
   check(isGameApple(6005, ['6002', '6014']) === true, 'apple: 6014 present in genreIds → game');
   check(isGameApple(6005, 6014) === false, 'apple: genreIds not an array is ignored (only primary counts)');
 

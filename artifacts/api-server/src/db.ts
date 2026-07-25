@@ -2,10 +2,11 @@ import Database from 'better-sqlite3';
 import { existsSync, mkdirSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import path from 'node:path';
+import { ensureStoreDiscoveryTables } from './storeDiscoveryDb.js';
 
 export type ProductType = 'mobile' | 'cps';
 export type JobStatus = 'pending' | 'running' | 'completed' | 'failed' | 'deferred';
-export type JobSource = 'meta' | 'affplus' | 'appgoblin' | 'google_ads';
+export type JobSource = 'meta' | 'affplus' | 'appgoblin' | 'google_ads' | 'store_first';
 export type JobPhase =
   | 'queued'
   | 'starting'
@@ -255,6 +256,10 @@ export async function initDb() {
 
   db.exec(`CREATE INDEX IF NOT EXISTS idx_jobs_user ON jobs(created_by_user_id)`);
 
+  // Store-first discovery tables (discovered_apps, store_app_detail, publishers).
+  // Created here so they exist before the queue or the /publishers route runs.
+  ensureStoreDiscoveryTables();
+
   // Garbage-collect expired sessions on startup
   db.prepare(`DELETE FROM sessions WHERE expires_at < ?`).run(Date.now());
 
@@ -324,6 +329,24 @@ export function getNextPendingJob(): JobRow | null {
       `SELECT * FROM jobs
         WHERE status = 'pending'
            OR (status = 'deferred' AND (run_after IS NULL OR run_after <= ?))
+        ORDER BY created_at ASC
+        LIMIT 1`,
+    )
+    .get(Date.now()) as JobRow) ?? null;
+}
+
+/** Oldest runnable job EXEMPT from the LLM daily cap (source='store_first').
+ *  Used when the queue head is cap-blocked: getNextPendingJob returns only the
+ *  single oldest job, and a cap-blocked head never leaves 'pending', so without
+ *  this an exempt job queued behind it would be head-of-line blocked until the
+ *  Jerusalem-day reset even though it spends no LLM budget at all. */
+export function getNextPendingCapExemptJob(): JobRow | null {
+  return (getDb()
+    .prepare(
+      `SELECT * FROM jobs
+        WHERE source = 'store_first'
+          AND (status = 'pending'
+           OR (status = 'deferred' AND (run_after IS NULL OR run_after <= ?)))
         ORDER BY created_at ASC
         LIMIT 1`,
     )
@@ -412,6 +435,32 @@ export function getLogs(jobId: string): JobLogRow[] {
 }
 
 // ---------- Result helpers ----------
+
+/**
+ * Identity of every lead already in the Leadfinder store, for cross-job dedupe.
+ *
+ * Returns the raw advertiser names plus every URL that can carry a brand domain.
+ * NOTE: job_results has no email column, so an email-level dedupe against history
+ * is not possible here — callers dedupe on email only WITHIN the current batch and
+ * fall back to domain, then normalized name, against this history.
+ */
+export function existingLeadIdentities(): { names: string[]; urls: string[] } {
+  const rows = getDb()
+    .prepare(`SELECT advertiser_name, landing_url, page_url, store_url FROM job_results`)
+    .all() as Array<{ advertiser_name: string; landing_url: string | null; page_url: string | null; store_url: string | null }>;
+  const names: string[] = [];
+  const urls: string[] = [];
+  for (const r of rows) {
+    if (r.advertiser_name) names.push(r.advertiser_name);
+    // ONLY landing_url — the advertiser's own destination. store_url and page_url
+    // are PLATFORM urls by construction (play.google.com; facebook.com/<page> for
+    // meta, affplus.com/o/<slug>, appgoblin.info/companies/…, adstransparency…),
+    // so feeding them to a domain-based dedupe would drop every unrelated
+    // publisher whose store website happens to be a Facebook page.
+    if (r.landing_url) urls.push(r.landing_url);
+  }
+  return { names, urls };
+}
 
 export function insertResult(input: {
   job_id: string;

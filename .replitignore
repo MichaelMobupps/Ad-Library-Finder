@@ -12,3 +12,9 @@ data/
 artifacts/api-server/data/
 csv-output/
 artifacts/api-server/csv-output/
+
+# Verification sandboxes (scripts/smoke-store-first.mjs, verify-tail-confirm.mjs).
+# Same rule as above — the patterns there match those two literal paths only, so
+# the throwaway SQLite + CSV these write under a nested data/ would otherwise ship.
+artifacts/api-server/.smoke-*
+artifacts/api-server/.tail-confirm-check

@@ -1,5 +1,6 @@
 { pkgs }: {
   deps = [
+    pkgs.tmux
     # Chromium / Playwright headless-shell shared library deps.
     # NOTE: do NOT add pkgs.glibc here. Replit prepends nix glibc's bin/lib
     # paths into the LOGIN-shell LD_LIBRARY_PATH (not just REPLIT_LD_LIBRARY_PATH),
