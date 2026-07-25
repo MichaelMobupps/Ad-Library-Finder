@@ -4,6 +4,23 @@
 # No need to store the pnpm store twice.
 .local
 
+# Editor + package-manager caches. These dominate the image (~2.4GB of a 4.1GB
+# push) and none of it is runtime state: .vscode-server is the IDE's remote
+# server, and the npm/pnpm/node-gyp/tsc caches are rebuilt by the deployment's
+# own build step (`pnpm install && pnpm install:playwright && pnpm build`).
+# A smaller image pushes faster and spends less time exposed to registry errors.
+#
+# NOTE: .cache/ms-playwright is deliberately NOT excluded. browserSetup.ts
+# resolves the Chromium binary out of .cache/ms-playwright/chromium-*/, and it is
+# the only copy in this Repl — dropping it takes the GATC/CPS scraper offline.
+.config/.vscode-server
+.config/npm
+.cache/pnpm
+.cache/node-gyp
+.cache/typescript
+.cache/replit
+.cache/fontconfig
+
 # NEVER ship local dev state to a deployment. The dev SQLite DB carries dev
 # jobs — the deploy's queue processor runs any 'pending' rows at boot, which
 # once replayed stale smoke-test jobs against the live endpoint through the
