@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback } from 'react';
 import {
   api,
+  LEAD_LIMIT_CHOICES,
   Job,
   JobLog,
   ProductType,
@@ -145,7 +146,7 @@ function AuthedApp({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
           <button
             className={`nav-btn ${view.kind === 'publishers' ? 'active' : ''}`}
             onClick={() => setView({ kind: 'publishers' })}
-            title="Store-first discovery results — the primary view"
+            title="Google Ads - Mobile results — the primary view"
           >
             Publishers
           </button>
@@ -191,6 +192,20 @@ function AuthedApp({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
   );
 }
 
+/**
+ * Display name for a job source. The stored id stays `store_first` — it is the
+ * engine's name, written into every existing job row and every API contract — so
+ * the rename lives here, at the one place a user reads it.
+ */
+const SOURCE_LABELS: Record<string, string> = {
+  store_first: 'GOOGLE ADS - MOBILE',
+  google_ads: 'GOOGLE ADS - CPS',
+};
+function sourceLabel(source: string | null | undefined): string {
+  const s = source || 'meta';
+  return SOURCE_LABELS[s] || s.toUpperCase();
+}
+
 // -------- Jobs List --------
 
 function JobsList({ jobs, onSelect, onNew }: { jobs: Job[]; onSelect: (id: string) => void; onNew: () => void }) {
@@ -198,7 +213,7 @@ function JobsList({ jobs, onSelect, onNew }: { jobs: Job[]; onSelect: (id: strin
     return (
       <div className="empty">
         <p className="empty-title">No jobs yet</p>
-        <p className="empty-sub">Run Store-First Discovery, or a scrape from Meta Ad Library, Affplus, AppGoblin, or Google Ads Transparency.</p>
+        <p className="empty-sub">Run Google Ads - Mobile, or a scrape from Meta Ad Library, Affplus, AppGoblin, or Google Ads Transparency.</p>
         <button className="btn primary" onClick={onNew}>+ New Job</button>
       </div>
     );
@@ -229,7 +244,7 @@ function JobsList({ jobs, onSelect, onNew }: { jobs: Job[]; onSelect: (id: strin
           {jobs.map((j) => (
             <tr key={j.id} onClick={() => onSelect(j.id)} className="jobs-row">
               <td className="mono">{j.id}</td>
-              <td><span className={`tag tag-${j.source || 'meta'}`}>{(j.source || 'meta').toUpperCase()}</span></td>
+              <td><span className={`tag tag-${j.source || 'meta'}`}>{sourceLabel(j.source)}</span></td>
               <td><span className={`tag tag-${j.product_type}`}>{j.product_type.toUpperCase()}</span></td>
               <td className="mono small">{(JSON.parse(j.countries) as string[]).join(', ')}</td>
               <td><StatusBadge status={j.status} /></td>
@@ -286,6 +301,11 @@ function NewJob({
   const [countriesText, setCountriesText] = useState('US, BR, IN');
   const [productTypes, setProductTypes] = useState<ProductType[]>(['mobile']);
   const [recipientEmail, setRecipientEmail] = useState('');
+  // Lead cap for the two high-volume sources. null = "as many as found".
+  const [maxLeads, setMaxLeads] = useState<number | null>(null);
+  // Only the two Google Ads sources routinely return hundreds of leads; the
+  // others are already small, so offering a cap there would be noise.
+  const leadCapApplies = source === 'google_ads' || source === 'store_first';
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -382,10 +402,13 @@ function NewJob({
     setGaLanguages((prev) => (prev.includes(code) ? prev.filter((x) => x !== code) : [...prev, code]));
   };
 
-  // AppGoblin and store-first are mobile-only; force productType accordingly.
+  // Product type is not a free choice per source: AppGoblin and Google Ads -
+  // Mobile (store_first) are mobile-only, Google Ads Transparency is CPS-only.
+  // Forcing it here keeps the form from submitting a combination the API rejects.
   const handleSourceChange = (s: JobSource) => {
     setSource(s);
     if (s === 'appgoblin' || s === 'store_first') setProductTypes(['mobile']);
+    else if (s === 'google_ads') setProductTypes(['cps']);
   };
 
   const submit = async () => {
@@ -418,15 +441,15 @@ function NewJob({
     let storeFirst: CreateJobOptions['storeFirst'] = undefined;
     if (source === 'store_first') {
       if (productTypes.some((pt) => pt !== 'mobile')) {
-        setError('Store-First Discovery supports Mobile only');
+        setError('Google Ads - Mobile supports Mobile only');
         return;
       }
       if (sfVerticals.length === 0) {
-        setError('Store-First: pick at least one vertical');
+        setError('Google Ads - Mobile: pick at least one vertical');
         return;
       }
       if (sfMarkets.length === 0) {
-        setError('Store-First: pick at least one market');
+        setError('Google Ads - Mobile: pick at least one market');
         return;
       }
       storeFirst = {
@@ -463,6 +486,7 @@ function NewJob({
         appgoblinAdNetwork: source === 'appgoblin' ? (appgoblinAdNetwork.trim() || null) : undefined,
         googleAds,
         storeFirst,
+        maxLeads: leadCapApplies ? maxLeads : null,
       });
       onCreated();
     } catch (err) {
@@ -492,7 +516,8 @@ function NewJob({
               onChange={() => handleSourceChange('store_first')}
             />
             <span>
-              Store-First Discovery <span className="muted">(app-store charts + long tail → publishers; Mobile only)</span>
+              Google Ads - Mobile{' '}
+              <span className="muted">(app publishers + Ads Transparency check, one run → Excel)</span>
             </span>
           </label>
           <label className="checkbox">
@@ -536,11 +561,11 @@ function NewJob({
           </label>
         </div>
         <p className="form-hint">
-          <strong>Store-First</strong> is the discovery engine: it harvests Play + App Store charts, crawls the
-          long tail via similar-apps, developer catalogs and store search, then rolls apps up into publishers
-          with the contact email the Play listing publishes. Google Ads Transparency and Meta act as
-          <em> confirmation</em> layers on top of it — they prove a publisher is actively advertising, they do
-          not find publishers.
+          <strong>Google Ads - Mobile</strong> is one search, end to end: it harvests Play + App Store charts,
+          crawls the long tail via similar-apps, developer catalogs and store search, rolls the apps up into
+          publishers with the contact email the Play listing publishes, then <em>automatically</em> checks each
+          publisher against Google Ads Transparency (and Meta, when configured) to prove it is actively
+          advertising — and writes the CSV and the per-country Excel. One click, one Excel; no second search.
         </p>
         <p className="form-hint">
           Meta scrapes the Facebook Ad Library and classifies landing pages. Affplus lists CPA/CPI mobile
@@ -554,7 +579,7 @@ function NewJob({
 
       {source === 'store_first' && (
         <div className="form-row">
-          <label>Store-First discovery</label>
+          <label>Google Ads - Mobile</label>
           {sfConfigLoading && <div className="muted small">Loading store config…</div>}
           {sfConfigError && <div className="error" style={{ marginBottom: 6 }}>Store config failed to load: {sfConfigError}</div>}
           {sfConfig && (
@@ -748,7 +773,7 @@ function NewJob({
         />
         <p className="form-hint">
           {source === 'store_first'
-            ? 'Store-First ignores this list for discovery — the Markets checkboxes above choose which store fronts are harvested. The country list here is only metadata on the CSV rows.'
+            ? 'Google Ads - Mobile ignores this list for discovery — the Markets checkboxes above choose which store fronts are harvested. The country list here is only metadata on the CSV rows.'
             : source === 'appgoblin'
             ? 'AppGoblin returns the same apps regardless of country — the country list here is informational metadata on the CSV rows.'
             : source === 'google_ads'
@@ -765,6 +790,7 @@ function NewJob({
               type="checkbox"
               checked={productTypes.includes('mobile')}
               onChange={() => toggleType('mobile')}
+              disabled={source === 'google_ads'}
             />
             <span>Mobile <span className="muted">(Google Play / iTunes preview URLs)</span></span>
           </label>
@@ -782,10 +808,35 @@ function NewJob({
           {source === 'appgoblin'
             ? 'AppGoblin supports Mobile only.'
             : source === 'store_first'
-              ? 'Store-First discovers app publishers, so it supports Mobile only.'
-              : 'Selecting both creates two separate jobs (one CSV per type).'}
+              ? 'Google Ads - Mobile discovers app publishers, so it supports Mobile only.'
+              : source === 'google_ads'
+                ? 'Google Ads Transparency is CPS only. For apps use Google Ads - Mobile, which finds the publishers AND checks Ads Transparency in one run.'
+                : 'Selecting both creates two separate jobs (one CSV per type).'}
         </p>
       </div>
+
+      {leadCapApplies && (
+        <div className="form-row">
+          <label>How many leads?</label>
+          <div className="checkbox-row">
+            {LEAD_LIMIT_CHOICES.map((n) => (
+              <label className="checkbox" key={n}>
+                <input type="radio" name="maxLeads" checked={maxLeads === n} onChange={() => setMaxLeads(n)} />
+                <span>{n}</span>
+              </label>
+            ))}
+            <label className="checkbox">
+              <input type="radio" name="maxLeads" checked={maxLeads === null} onChange={() => setMaxLeads(null)} />
+              <span>As many as found</span>
+            </label>
+          </div>
+          <p className="form-hint">
+            {source === 'store_first'
+              ? 'Caps the CSV and the Excel to the highest-scoring publishers — best rank, most countries, most Ads Transparency activity first. Discovery still runs in full, so the rest stay in the Publishers tab.'
+              : 'Caps the CSV and the Excel to the first leads found. The scrape still runs in full, so nothing discovered is lost.'}
+          </p>
+        </div>
+      )}
 
       <div className="form-row">
         <label>Notification recipient (optional)</label>
@@ -884,7 +935,7 @@ function JobDetail({ id, onBack }: { id: string; onBack: () => void }) {
       <PhaseProgress job={job} latestLog={latestLog} isActive={isActive} />
 
       <div className="detail-grid">
-        <Field label="Source"><span className={`tag tag-${job.source || 'meta'}`}>{(job.source || 'meta').toUpperCase()}</span></Field>
+        <Field label="Source"><span className={`tag tag-${job.source || 'meta'}`}>{sourceLabel(job.source)}</span></Field>
         <Field label="Product Type"><span className={`tag tag-${job.product_type}`}>{job.product_type.toUpperCase()}</span></Field>
         <Field label="Countries"><code>{countries.join(', ')}</code></Field>
         {sourceParamsDisplay && <Field label="Discovery"><code>{sourceParamsDisplay}</code></Field>}
@@ -901,7 +952,7 @@ function JobDetail({ id, onBack }: { id: string; onBack: () => void }) {
         <div className="cta-row">
           <a href={api.csvUrl(job.id)} className="btn primary">⬇ Download CSV</a>
           {job.hq_zip_path && (
-            <a href={api.hqZipUrl(job.id)} className="btn" style={{ marginLeft: 8 }}>⬇ HQ-Split ZIP</a>
+            <a href={api.hqZipUrl(job.id)} className="btn" style={{ marginLeft: 8 }}>⬇ Excel (by HQ country)</a>
           )}
         </div>
       )}

@@ -15,6 +15,8 @@
  * tuning without a code change; the seed value is the spec's exact default.
  */
 
+import { normalizeMaxLeads } from './csv.js';
+
 // ── small env helpers (mirror the clampInt pattern used across the codebase) ──
 function clampInt(v: string | undefined, def: number, min: number, max: number): number {
   const n = Number(v);
@@ -31,8 +33,16 @@ function clampInt(v: string | undefined, def: number, min: number, max: number):
 export const ALL_MARKETS = ['us', 'gb', 'de', 'fr', 'in', 'br', 'mx', 'id', 'jp', 'kr', 'tr', 'il'] as const;
 export type Market = (typeof ALL_MARKETS)[number];
 
-/** Markets a run touches when the job does not name its own. */
-export const DEFAULT_ACTIVE_MARKETS: Market[] = ['us', 'gb', 'de'];
+/**
+ * Markets a run touches when the job does not name its own — the FULL universe.
+ *
+ * Every phase downstream is either request-capped (similar crawl, search battery,
+ * enrichment, developer catalogs, confirmation) or cheap enough to run in full
+ * (charts), and each capped phase rotates least-recently-visited work to the
+ * front, so widening the default market set widens COVERAGE without widening any
+ * single run's cost. A narrower set is still available per job via source_params.
+ */
+export const DEFAULT_ACTIVE_MARKETS: Market[] = [...ALL_MARKETS];
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Vertical map — Play category token + Apple genre id
@@ -64,7 +74,15 @@ export const VERTICALS: VerticalDef[] = [
 ];
 
 export const VERTICAL_IDS = VERTICALS.map((v) => v.id);
-export const DEFAULT_ACTIVE_VERTICALS = ['finance'];
+/**
+ * Verticals a run touches when the job does not name its own — ALL of them,
+ * subverticals included: `games` carries expandGames, so its single entry fans
+ * out to GAME plus all 17 GAME_* Play subcategories at harvest time (18 chart
+ * categories), while the other eight map to one Play category each. Same
+ * reasoning as DEFAULT_ACTIVE_MARKETS — the capped, rotating phases turn a wider
+ * default into wider coverage rather than a longer single run.
+ */
+export const DEFAULT_ACTIVE_VERTICALS = [...VERTICAL_IDS];
 
 export function verticalById(id: string): VerticalDef | undefined {
   return VERTICALS.find((v) => v.id === id);
@@ -111,12 +129,49 @@ export const SIMILAR_MAX_APPS_PER_RUN = clampInt(process.env.STORE_SIMILAR_MAX_A
  * throttle this bound is roughly its own value in seconds (1000 ≈ 17 min).
  */
 export const SIMILAR_MAX_REQUESTS_PER_RUN = clampInt(process.env.STORE_SIMILAR_MAX_REQUESTS, 1000, 0, 50_000); // (env)
+/**
+ * Hard cap on store-search REQUESTS per run (Play + iTunes counted together).
+ *
+ * The battery is verticals x markets x terms, so it is the ONE phase whose cost
+ * grows with the active scope rather than with a cap of its own: at the full
+ * default scope that is 9 x 12 x 15 = 1620 cells, and because each cell awaits an
+ * iTunes slot (6s) alongside its Play slot (1s), an uncapped battery runs ~2.7h
+ * and dominates every other phase combined.
+ *
+ * This bounds ONE RUN, not total coverage: cells are ordered least-recently
+ * -searched first (search_battery_cell), so successive runs sweep the whole grid
+ * instead of re-running the first N cells forever. At the default 600 the full
+ * 1620-cell grid completes in ~6 runs.
+ */
+export const SEARCH_MAX_REQUESTS_PER_RUN = clampInt(process.env.STORE_SEARCH_MAX_REQUESTS, 600, 0, 50_000); // (env)
 /** Install band for non-chart Play apps — outside this range they are stored but
  *  skip enrichment & confirmation (chart apps are exempt). */
 export const TAIL_MIN_INSTALLS = clampInt(process.env.STORE_TAIL_MIN_INSTALLS, 50_000, 0, 1_000_000_000); // (env)
 export const TAIL_MAX_INSTALLS = clampInt(process.env.STORE_TAIL_MAX_INSTALLS, 5_000_000, 1, 5_000_000_000); // (env)
-/** Ceiling on confirmation API calls (GATC + Meta) per run. */
-export const CONFIRMATION_MAX_API_CALLS_PER_RUN = clampInt(process.env.STORE_CONFIRM_MAX_CALLS, 200, 0, 10_000); // (env)
+/**
+ * Ceiling on confirmation API calls (GATC + Meta) per run.
+ *
+ * This is the ONLY paid surface in the pipeline (~$0.002 per RPC round-trip
+ * through the residential proxy), and at ~3 calls per publisher it is what decides
+ * how much of the corpus carries an Ads Transparency verdict. It matters more now
+ * that the export is confirmed-only (EXPORT_CONFIRMED_ONLY): a publisher the budget
+ * never reached is absent from the deliverable, so the budget is effectively the
+ * size of each run's Excel. 2000 ≈ 650 publishers ≈ $4/run; coverage accumulates
+ * because listPublishersForConfirmation orders by last_confirm_at ascending.
+ */
+export const CONFIRMATION_MAX_API_CALLS_PER_RUN = clampInt(process.env.STORE_CONFIRM_MAX_CALLS, 2_000, 0, 10_000); // (env)
+
+/**
+ * Export only publishers with an Ads Transparency (or Meta) hit.
+ *
+ * The deliverable is "app companies that actually advertise on Google", so an
+ * unconfirmed publisher — whether it was checked and had no ads, or was never
+ * reached by the confirmation budget — is not a lead yet and stays out of the CSV
+ * and the Excel. It remains in the Publishers table and in the DB, and becomes
+ * exportable the run its verdict comes back positive. Set false to export the full
+ * discovered set with a `confirmed` column instead.
+ */
+export const EXPORT_CONFIRMED_ONLY = process.env.STORE_EXPORT_CONFIRMED_ONLY !== 'false'; // (env)
 /**
  * Absolute ceiling on the confirmation budget a JOB BODY may request. GATC
  * confirmation is the only paid surface in this pipeline (residential proxy), and
@@ -149,6 +204,26 @@ export const MAX_ENRICH_ATTEMPTS = clampInt(process.env.STORE_MAX_ENRICH_ATTEMPT
 /** Ceiling on apps enriched (network) per run — bounds a huge long-tail from
  *  running the 1-req/sec Play detail fetch for hours. Cache hits don't count. */
 export const ENRICH_MAX_APPS_PER_RUN = clampInt(process.env.STORE_ENRICH_MAX_APPS, 4000, 0, 50_000); // (env)
+// ── Liveness sweep (the catalog is permanent, so it must be kept honest) ─────
+/**
+ * How many known apps a run re-checks for "still listed on the store".
+ *
+ * discovered_apps and store_app_detail accumulate forever and are never
+ * re-fetched once enriched — which is exactly what makes repeat runs fast, and
+ * also what lets the catalog drift: an app pulled from the store keeps counting
+ * toward its publisher's portfolio indefinitely. This sweep re-checks the
+ * least-recently-checked apps within a bounded budget.
+ *
+ * Play and Apple cost wildly different amounts here, so they get separate
+ * budgets: a Play check is one throttled request PER APP (1 req/s), while Apple
+ * checks 100 ids per request (~6s per 100). Hence Apple's budget is ~20x Play's
+ * for a comparable slice of wall-clock.
+ */
+export const LIVENESS_MAX_PLAY_PER_RUN = clampInt(process.env.STORE_LIVENESS_MAX_PLAY, 300, 0, 50_000); // (env)
+export const LIVENESS_MAX_APPLE_PER_RUN = clampInt(process.env.STORE_LIVENESS_MAX_APPLE, 6_000, 0, 200_000); // (env)
+/** An app checked more recently than this many days ago is not re-checked. */
+export const LIVENESS_RECHECK_AFTER_DAYS = clampInt(process.env.STORE_LIVENESS_RECHECK_DAYS, 30, 1, 3650); // (env)
+
 /** Per-store-request timeout. */
 export const STORE_FETCH_TIMEOUT_MS = clampInt(process.env.STORE_FETCH_TIMEOUT_MS, 15_000, 2_000, 60_000); // (env)
 /**
@@ -333,6 +408,8 @@ export interface StoreDiscoveryParams {
   similarMaxAppsPerRun: number;
   searchTermsLimit: number | null; // cap terms/vertical (smoke uses 5); null = all 15
   confirmationMaxApiCalls: number;
+  /** Operator-chosen cap on EXPORTED leads (best-scored first); null = all found. */
+  maxLeads: number | null;
 }
 
 /** Normalize an arbitrary source_params blob into a fully-defaulted param set. */
@@ -376,6 +453,10 @@ export function resolveStoreParams(raw: unknown): StoreDiscoveryParams {
       0,
       CONFIRMATION_HARD_MAX_API_CALLS,
     ),
+    // Absent/invalid ⇒ null ⇒ "as many as found". NOT defaulted to a number:
+    // silently capping an operator who never asked for a cap would look like the
+    // search simply stopped finding leads.
+    maxLeads: normalizeMaxLeads(p.maxLeads),
   };
 }
 
@@ -407,8 +488,20 @@ export function runStoreConfigTests(): { passed: number; failed: number; failure
 
   // resolveStoreParams defaults + filtering
   const d = resolveStoreParams(undefined);
-  check(d.verticals.length === 1 && d.verticals[0] === 'finance', 'params: default vertical finance');
-  check(d.markets.join(',') === 'us,gb,de', 'params: default markets us,gb,de');
+  // Assert the CONTRACT (an absent field resolves to the configured default),
+  // not the literal scope — the scope is an operator tunable and pinning it here
+  // means every retune breaks a test that was not testing the retune.
+  check(d.verticals.join(',') === DEFAULT_ACTIVE_VERTICALS.join(','), 'params: absent verticals → configured default');
+  check(d.markets.join(',') === DEFAULT_ACTIVE_MARKETS.join(','), 'params: absent markets → configured default');
+  // The scope itself is pinned separately, because "all geos, all verticals" is
+  // the intent and a silent narrowing of it is a real regression.
+  check(DEFAULT_ACTIVE_MARKETS.length === ALL_MARKETS.length, 'scope: every market is active by default');
+  check(DEFAULT_ACTIVE_VERTICALS.length === VERTICALS.length, 'scope: every vertical is active by default');
+  check(DEFAULT_ACTIVE_VERTICALS.includes('games'), 'scope: games (and its GAME_* subcategories) is active by default');
+  check(
+    VERTICALS.filter((v) => v.expandGames).length === 1,
+    'scope: exactly one vertical fans out to Play subcategories',
+  );
   const r = resolveStoreParams({ verticals: ['finance', 'bogus'], markets: ['US', 'zz'], searchTermsLimit: 5 });
   check(r.verticals.join(',') === 'finance', 'params: unknown vertical dropped');
   check(r.markets.join(',') === 'us', 'params: unknown market dropped, US lower-cased');
@@ -420,9 +513,19 @@ export function runStoreConfigTests(): { passed: number; failed: number; failure
   const nulls = resolveStoreParams({ similarMaxAppsPerRun: null, confirmationMaxApiCalls: null, verticals: null, markets: null });
   check(nulls.similarMaxAppsPerRun === SIMILAR_MAX_APPS_PER_RUN, 'params: null similar cap → default, not 0');
   check(nulls.confirmationMaxApiCalls === CONFIRMATION_MAX_API_CALLS_PER_RUN, 'params: null confirm cap → default, not 0');
-  check(nulls.verticals.join(',') === 'finance', 'params: null verticals → default');
+  check(nulls.verticals.join(',') === DEFAULT_ACTIVE_VERTICALS.join(','), 'params: null verticals → configured default');
   // An EXPLICIT 0 is still honored (a caller may legitimately disable a stage).
   check(resolveStoreParams({ confirmationMaxApiCalls: 0 }).confirmationMaxApiCalls === 0, 'params: explicit 0 honored');
+  // Lead cap: absent means "as many as found", never a silent default.
+  check(resolveStoreParams({}).maxLeads === null, 'leads: absent cap → null (uncapped)');
+  check(resolveStoreParams({ maxLeads: null }).maxLeads === null, 'leads: explicit null → uncapped');
+  check(resolveStoreParams({ maxLeads: 20 }).maxLeads === 20, 'leads: 20 honored');
+  check(resolveStoreParams({ maxLeads: 50 }).maxLeads === 50, 'leads: 50 honored');
+  check(resolveStoreParams({ maxLeads: 100 }).maxLeads === 100, 'leads: 100 honored');
+  check(resolveStoreParams({ maxLeads: '50' }).maxLeads === 50, 'leads: numeric string coerced');
+  check(resolveStoreParams({ maxLeads: 0 }).maxLeads === null, 'leads: 0 → uncapped, never an empty export');
+  check(resolveStoreParams({ maxLeads: -5 }).maxLeads === null, 'leads: negative → uncapped');
+  check(resolveStoreParams({ maxLeads: 'abc' }).maxLeads === null, 'leads: junk → uncapped');
   // A job body cannot exceed the operator-owned paid-API ceiling.
   check(
     resolveStoreParams({ confirmationMaxApiCalls: 999_999 }).confirmationMaxApiCalls === CONFIRMATION_HARD_MAX_API_CALLS,

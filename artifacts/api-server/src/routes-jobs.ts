@@ -11,7 +11,7 @@ import {
   ProductType,
   JobSource,
 } from './db.js';
-import { buildCsv } from './csv.js';
+import { buildCsv, normalizeMaxLeads, LEAD_LIMIT_CHOICES } from './csv.js';
 import { RequestWithUser } from './auth.js';
 import { fetchAppgoblinCategoryList } from './appgoblinScraper.js';
 import {
@@ -205,6 +205,8 @@ interface StoreFirstBody {
 interface CreateJobBody {
   countries: string[];
   productTypes: ProductType[];
+  /** Cap on exported leads (20/50/100); absent/null = as many as found. */
+  maxLeads?: number | null;
   recipientEmail?: string | null;
   source?: JobSource;
   /** AppGoblin discovery params (only used when source='appgoblin'). */
@@ -222,7 +224,7 @@ const KNOWN_LANG_CODES = new Set(GOOGLE_ADS_LANGUAGES.map((l) => l.code));
 // POST /api/jobs
 jobsRouter.post('/', (req: Request<{}, {}, CreateJobBody>, res: Response) => {
   const user = (req as RequestWithUser).user!;
-  const { countries, productTypes, recipientEmail, source, appgoblinCategory, appgoblinAdNetwork, googleAds, storeFirst } = req.body;
+  const { countries, productTypes, recipientEmail, source, appgoblinCategory, appgoblinAdNetwork, googleAds, storeFirst, maxLeads } = req.body;
 
   if (!Array.isArray(countries) || countries.length === 0) {
     return res.status(400).json({ error: 'countries[] required' });
@@ -255,9 +257,20 @@ jobsRouter.post('/', (req: Request<{}, {}, CreateJobBody>, res: Response) => {
     jobSource = source;
   }
 
-  // AppGoblin and store-first are mobile-only. Affplus and Google Ads support cps (web) too.
+  // AppGoblin and store-first are mobile-only. Affplus supports cps (web) too.
   if ((jobSource === 'appgoblin' || jobSource === 'store_first') && productTypes.some((pt) => pt !== 'mobile')) {
     return res.status(400).json({ error: `${jobSource} source supports productType=mobile only` });
+  }
+  // Google Ads Transparency is CPS-ONLY. Its advertiser search matches advertiser
+  // names and verified domains, which resolves web/CPS advertisers well and
+  // structurally cannot enumerate app advertisers — the reason mobile discovery
+  // moved to the stores. The store_first source ("Google Ads - Mobile") is the
+  // mobile path and runs its own transparency confirmation, so a GATC mobile job
+  // is now strictly a slower, worse duplicate of it.
+  if (jobSource === 'google_ads' && productTypes.some((pt) => pt !== 'cps')) {
+    return res.status(400).json({
+      error: 'google_ads source supports productType=cps only — use the "Google Ads - Mobile" source for apps',
+    });
   }
 
   // AppGoblin needs at least one discovery axis.
@@ -371,6 +384,15 @@ jobsRouter.post('/', (req: Request<{}, {}, CreateJobBody>, res: Response) => {
     };
   }
 
+  // Operator-chosen lead cap (20/50/100, or absent = as many as found). Supported
+  // by the two sources that routinely return hundreds of leads; stored on
+  // sourceParams so each pipeline reads it the same way. Invalid/0/negative
+  // normalizes to null (uncapped) rather than to an empty export.
+  const leadCap = normalizeMaxLeads(maxLeads);
+  if (leadCap != null && (jobSource === 'google_ads' || jobSource === 'store_first')) {
+    sourceParams = { ...(sourceParams || {}), maxLeads: leadCap };
+  }
+
   let recipient: string | null = null;
   if (recipientEmail && typeof recipientEmail === 'string') {
     const t = recipientEmail.trim();
@@ -433,6 +455,7 @@ jobsRouter.get('/store-first-config', (_req: Request, res: Response) => {
     markets: STORE_MARKETS,
     defaults: { verticals: DEFAULT_ACTIVE_VERTICALS, markets: DEFAULT_ACTIVE_MARKETS },
     charts: { play: PLAY_CHARTS, apple: APPLE_CHARTS },
+    leadLimits: LEAD_LIMIT_CHOICES,
     installBand: { min: TAIL_MIN_INSTALLS, max: TAIL_MAX_INSTALLS },
   });
 });

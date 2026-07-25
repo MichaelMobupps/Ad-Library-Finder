@@ -235,6 +235,37 @@ export async function playAppDetail(appId: string, country = 'us', onLog?: LogFn
   });
 }
 
+/**
+ * Whether a package is still listed on the Play store.
+ *
+ * DELIBERATELY separate from playAppDetail, which collapses "gone" and "the
+ * request failed" into the same null. For a liveness sweep that conflation is not
+ * acceptable: acting on it would mark live apps delisted every time Play
+ * rate-limits us, silently shrinking the corpus and corrupting publisher
+ * portfolios. google-play-scraper throws this exact message — verified live — for
+ * a package that genuinely is not there, and anything else is 'unknown', which
+ * the caller must treat as "ask again later", never as "gone".
+ */
+const PLAY_APP_NOT_FOUND = /App not found \(404\)/i;
+
+export async function playAppLiveness(
+  appId: string,
+  country = 'us',
+  onLog?: LogFn,
+): Promise<'live' | 'gone' | 'unknown'> {
+  return limiter.schedule(async () => {
+    try {
+      const a = (await gplay.app({ appId, country })) as Record<string, unknown>;
+      return a && typeof a.appId === 'string' ? 'live' : 'unknown';
+    } catch (err) {
+      const msg = (err as Error).message || '';
+      if (PLAY_APP_NOT_FOUND.test(msg)) return 'gone';
+      onLog?.('debug', `play liveness ${appId}/${country} inconclusive: ${msg}`);
+      return 'unknown';
+    }
+  });
+}
+
 /** Canonical Play store URL for a package. */
 export function playStoreUrl(appId: string): string {
   return `https://play.google.com/store/apps/details?id=${encodeURIComponent(appId)}`;

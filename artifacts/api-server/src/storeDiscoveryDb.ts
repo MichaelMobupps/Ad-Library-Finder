@@ -145,6 +145,8 @@ export function ensureStoreDiscoveryTables(): void {
       bundle_id TEXT,
       enrich_status TEXT NOT NULL DEFAULT 'failed',
       attempts INTEGER NOT NULL DEFAULT 0,
+      last_live_check_at INTEGER,
+      delisted_at INTEGER,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL,
       PRIMARY KEY (store, app_id)
@@ -206,6 +208,11 @@ export function ensureStoreDiscoveryTables(): void {
   // throws "no such column" against a live DB.
   addColumnIfMissing('publishers', 'countries_seen', `TEXT NOT NULL DEFAULT '[]'`);
   addColumnIfMissing('publishers', 'last_confirm_at', 'INTEGER');
+  // Liveness sweep: when the store last confirmed the listing exists, and when it
+  // was first observed GONE. delisted_at is the tombstone — set only on an
+  // unambiguous store "not found", never on a failed request.
+  addColumnIfMissing('store_app_detail', 'last_live_check_at', 'INTEGER');
+  addColumnIfMissing('store_app_detail', 'delisted_at', 'INTEGER');
 
   backfillDiscoveryDepth();
 }
@@ -940,11 +947,82 @@ export function appleArtistsWithContact(): Array<{ id: string; country: string }
 
 // ── rollup / confirmation read helpers ───────────────────────────────────────
 
-/** Every successfully-enriched app detail — the rollup input set. */
+/**
+ * Every successfully-enriched, still-listed app detail — the rollup input set.
+ *
+ * Delisted apps are excluded here rather than deleted: the row stays as the
+ * record that we checked and it was gone (so the sweep does not keep re-checking
+ * it), but it no longer inflates its publisher's app_count, both_stores flag or
+ * portfolio score. This is the single chokepoint for that rule — publisherRollup
+ * reads its whole world through this function.
+ */
 export function allDoneAppDetails(): StoreAppDetailRow[] {
   return getDb()
-    .prepare(`SELECT * FROM store_app_detail WHERE enrich_status = 'done'`)
+    .prepare(`SELECT * FROM store_app_detail WHERE enrich_status = 'done' AND delisted_at IS NULL`)
     .all() as StoreAppDetailRow[];
+}
+
+/**
+ * Apps due a liveness re-check, least-recently-checked first.
+ *
+ * Only 'done' rows are candidates: a row that never enriched has nothing to keep
+ * accurate. `staleBefore` keeps a run from re-checking what it just checked — apps
+ * checked more recently than that are not offered at all, so the budget always
+ * goes to the oldest knowledge first.
+ *
+ * Delisted rows stay in the pool DELIBERATELY. Apps get pulled and re-listed
+ * (policy strikes, temporary regional removals, re-publishes), and excluding
+ * tombstoned rows would make delisting permanent: enrichment already treats the
+ * row as settled and the rollup already skips it, so nothing else would ever look
+ * at it again and a returning app would stay invisible forever. Because a check
+ * stamps last_live_check_at either way, a tombstoned app costs at most one request
+ * per staleness window, and markAppLiveness clears the tombstone the moment the
+ * store answers with the listing again.
+ */
+export function listLivenessCandidates(
+  store: StoreKind,
+  staleBefore: number,
+  limit: number,
+): Array<{ app_id: string; country: string }> {
+  if (limit <= 0) return [];
+  return getDb()
+    .prepare(
+      `SELECT d.app_id AS app_id,
+              ${sightedCountrySql('a.country')} AS country
+         FROM store_app_detail d
+         LEFT JOIN discovered_apps a
+           ON a.store = d.store AND a.app_id = d.app_id
+        WHERE d.store = @store
+          AND d.enrich_status = 'done'
+          AND COALESCE(d.last_live_check_at, 0) < @staleBefore
+        GROUP BY d.app_id
+        ORDER BY COALESCE(MAX(d.last_live_check_at), 0) ASC
+        LIMIT @limit`,
+    )
+    .all({ store, staleBefore, limit }) as Array<{ app_id: string; country: string }>;
+}
+
+/**
+ * Record a liveness verdict. `gone` writes the tombstone; a live result only
+ * advances the checked-at stamp. Callers must never pass an inconclusive result
+ * here — 'unknown' means ask again later, not gone.
+ */
+export function markAppLiveness(store: StoreKind, appId: string, gone: boolean): void {
+  getDb()
+    .prepare(
+      `UPDATE store_app_detail
+          SET last_live_check_at = @now,
+              delisted_at = CASE WHEN @gone = 1 THEN COALESCE(delisted_at, @now) ELSE NULL END
+        WHERE store = @store AND app_id = @appId`,
+    )
+    .run({ store, appId, gone: gone ? 1 : 0, now: Date.now() });
+}
+
+/** Count of apps currently tombstoned as removed from their store. */
+export function countDelistedApps(): number {
+  return (getDb().prepare(`SELECT COUNT(*) AS n FROM store_app_detail WHERE delisted_at IS NOT NULL`).get() as {
+    n: number;
+  }).n;
 }
 
 /** Every identity key → publisher mapping. Lets a caller attribute an app to the

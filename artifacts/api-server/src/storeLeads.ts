@@ -195,9 +195,15 @@ export function buildPublisherCsv(
   jobId: string,
   rows: PublisherRow[],
   seed: DedupeSeed = {},
+  maxRows: number | null = null,
 ): { path: string; rowsWritten: number; exported: PublisherRow[] } {
   if (!existsSync(CSV_DIR)) mkdirSync(CSV_DIR, { recursive: true });
-  const deduped = dedupePublishers(rows, seed);
+  // Cap AFTER dedupe, never before: `rows` arrives score-descending, so slicing
+  // first would hand the deduper N candidates and export however few survived —
+  // a user asking for 20 leads would silently receive 14. Capping here means the
+  // best N SURVIVING publishers, which is what "20 leads" means.
+  const all = dedupePublishers(rows, seed);
+  const deduped = maxRows != null && maxRows > 0 ? all.slice(0, maxRows) : all;
   const lines = [PUBLISHER_CSV_HEADER, ...deduped.map(publisherToCsvRow)];
   const csv = lines.join('\n') + '\n';
   const fpath = path.join(CSV_DIR, `store_first-${jobId}.csv`);
