@@ -46,6 +46,7 @@ import {
   upsertDiscoveredApp,
   distinctAppsForStore,
   similarSeedApps,
+  sightedCountrySql,
   discoveredCountsBySource,
   countDiscoveredApps,
   countPublishers,
@@ -68,9 +69,6 @@ import { log } from './logger.js';
 
 type OnLog = (level: 'info' | 'warn' | 'error' | 'debug', msg: string) => void;
 
-/** Country used for country-agnostic crawls (similar, developer catalogs). */
-const CRAWL_COUNTRY = 'us';
-
 export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
   markJobRunning(job.id);
   const onLog: OnLog = (level, msg) => {
@@ -87,6 +85,8 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
         `charts=play:${params.playCharts.join('+')}/apple:${params.appleCharts.join('+')} ` +
         `similarCap=${params.similarMaxAppsPerRun} searchTerms/vert=${params.searchTermsLimit ?? 'all'} confirmBudget=${params.confirmationMaxApiCalls}`,
     );
+
+    purgeUsEraGeoStamps(onLog);
 
     // ── Phase 1: chart harvest ───────────────────────────────────────────────
     setJobPhase(job.id, 'scraping', 'charts');
@@ -166,10 +166,16 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
         // a barren or blocked seed must go to the BACK of the queue rather than
         // re-consuming the budget ahead of seeds never tried.
         markSimilarCrawled('google_play', seed.app_id);
-        const sims = await playSimilar(seed.app_id, CRAWL_COUNTRY, onLog);
+        // Queried in the seed's own storefront (us-preferred, from the markets
+        // it was sighted in): a geo-restricted seed resolves ONLY there, and a
+        // us query would return nothing — stamped above as crawled, the seed
+        // would then contribute zero graph edges forever.
+        const sims = await playSimilar(seed.app_id, seed.country, onLog);
         for (const a of sims) {
           const { inserted } = upsertDiscoveredApp({
-            store: 'google_play', app_id: a.appId, title: a.title, country: CRAWL_COUNTRY,
+            // Sighted in the storefront the similar query ran against — see the
+            // same choice on developer-catalog upserts below.
+            store: 'google_play', app_id: a.appId, title: a.title, country: seed.country,
             // Inherit the seed's vertical so the next depth level can find these
             // apps as seeds and so rollup keeps vertical attribution.
             vertical: seed.vertical,
@@ -373,24 +379,88 @@ function markCatalogExpanded(store: StoreKind, developerId: string): void {
 }
 
 /**
- * Order one store's candidates so the run's budget makes MONOTONIC progress:
- * never-expanded developers first — in the DB layer's value order, since the
- * sort is stable — then the already-expanded, least-recently first. Successive
- * runs therefore walk the whole eligible set instead of re-walking its head,
- * while re-expansion stays reachable once the backlog drains (portfolios do
- * change) and can never overtake a developer that has never been expanded.
+ * ONE-SHOT purge of crawl/expansion stamps written while the fetches behind
+ * them were hard-coded to the us storefront. A geo-restricted developer or
+ * seed — one whose sightings never include us — was fetched against a market
+ * it does not resolve in, yielded [], and was stamped anyway. That stamp is a
+ * lie, and under the never-visited-first ordering the correct per-market
+ * re-fetch would only come round after the entire never-visited backlog
+ * drains. Deleting the stamp makes the row "never visited" again: it
+ * re-fetches promptly, now against its own storefront, at its value-order
+ * position. us-sighted rows keep their stamps — their fetches ran against the
+ * right storefront all along.
  *
- * Pure, so that guarantee is unit-testable without a database.
+ * Marker-guarded like backfillDiscoveryDepth (and for the same reason a plain
+ * predicate cannot be): post-fix stamps on non-us rows mean "fetched in the
+ * RIGHT market" and must never be purged. The settings table is created by
+ * initDb, which always precedes a pipeline run. Exported for tests.
  */
-export function orderByCatalogExpansion(ids: string[], expandedAt: ReadonlyMap<string, number>): string[] {
-  return orderByProgress(ids, (id) => id, expandedAt);
+const GEO_STAMP_PURGE_MARKER = 'store_discovery.geo_stamp_purge_v1';
+
+export function purgeUsEraGeoStamps(onLog: OnLog): void {
+  const db = getDb();
+  if (db.prepare(`SELECT value FROM settings WHERE key = ?`).get(GEO_STAMP_PURGE_MARKER)) return;
+  // Both stamp tables must exist before the DELETEs reference them: on a fresh
+  // database (nothing to purge) they may not have been created yet.
+  ensureSimilarCrawlTable();
+  ensureCatalogExpansionTable();
+  const nonUs = (col: string) => `${sightedCountrySql(col)} <> 'us'`;
+  const seeds = db
+    .prepare(
+      `DELETE FROM similar_crawl_seed
+        WHERE store = 'google_play'
+          AND app_id IN (SELECT app_id FROM discovered_apps
+                          WHERE store = 'google_play'
+                          GROUP BY app_id HAVING ${nonUs('country')})`,
+    )
+    .run();
+  // The developer subqueries deliberately skip the contact filter the
+  // expansion sets apply: a stamp for a developer outside those sets is never
+  // consulted, so over-deleting is harmless while under-deleting leaves the
+  // us-era latency in place.
+  const purgeCatalog = (store: string, idCol: string) =>
+    db
+      .prepare(
+        `DELETE FROM developer_catalog_expansion
+          WHERE store = '${store}'
+            AND developer_id IN (
+              SELECT d.${idCol}
+                FROM store_app_detail d
+                LEFT JOIN discovered_apps a
+                  ON a.store = d.store AND a.app_id = d.app_id
+               WHERE d.store = '${store}' AND d.${idCol} IS NOT NULL
+               GROUP BY d.${idCol}
+              HAVING ${nonUs('a.country')})`,
+      )
+      .run();
+  const play = purgeCatalog('google_play', 'developer_id');
+  const apple = purgeCatalog('app_store', 'artist_id');
+  db.prepare(
+    `INSERT INTO settings (key, value, updated_at) VALUES (?, '1', ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+  ).run(GEO_STAMP_PURGE_MARKER, Date.now());
+  const n = seeds.changes + play.changes + apple.changes;
+  if (n > 0) {
+    onLog(
+      'info',
+      `purged ${n} us-era stamps on geo-restricted rows ` +
+        `(${seeds.changes} similar seeds, ${play.changes} Play catalogs, ${apple.changes} Apple catalogs) — they re-fetch in their own storefront`,
+    );
+  }
 }
 
 /**
- * The same never-visited-first ordering, for records identified by a field rather
- * than being bare ids. Both the developer-catalog phase and the similar crawl need
- * it, and they must not drift apart: any phase that walks a growing candidate set
+ * Order a phase's candidates so the run's budget makes MONOTONIC progress:
+ * never-visited records first — in the caller's value order, since the sort is
+ * stable — then the already-visited, least-recently first. Successive runs
+ * therefore walk the whole eligible set instead of re-walking its head, while
+ * re-visits stay reachable once the backlog drains (portfolios and similar
+ * graphs do change) and can never overtake a record never visited at all.
+ * Both the developer-catalog phase and the similar crawl budget through this,
+ * and they must not drift apart: any phase that walks a growing candidate set
  * under a per-run budget re-walks the same prefix forever without it.
+ *
+ * Pure, so that guarantee is unit-testable without a database.
  */
 export function orderByProgress<T>(
   items: readonly T[],
@@ -412,25 +482,34 @@ async function expandDeveloperCatalogs(onLog: OnLog): Promise<number> {
 
   /** Fetch up to `budget` catalogs for one store. Returns catalogs actually fetched. */
   const runStore = async (
-    ids: string[],
+    devs: Array<{ id: string; country: string }>,
     budget: number,
-    fetch: (id: string) => Promise<Array<{ appId: string; title: string | null }>>,
+    fetch: (id: string, country: string) => Promise<Array<{ appId: string; title: string | null }>>,
     store: 'google_play' | 'app_store',
   ): Promise<number> => {
     let used = 0;
-    for (const id of orderByCatalogExpansion(ids, catalogExpansionTimes(store))) {
+    for (const dev of orderByProgress(devs, (d) => d.id, catalogExpansionTimes(store))) {
       if (used >= budget) break;
       if (newApps >= DEV_CATALOG_MAX_APPS_PER_RUN) break;
       used++;
-      const apps = await fetch(id);
+      // Fetched against the developer's own storefront (us-preferred, from the
+      // markets its apps were sighted in): catalogs are storefront-listings, so
+      // a geo-restricted developer queried in us yields an EMPTY catalog that
+      // the stamp below would record as expanded — the portfolio (app_count,
+      // both_stores, portfolio score) then stays understated forever, for
+      // exactly the publishers the per-market enrichment newly unlocks.
+      const apps = await fetch(dev.id, dev.country);
       // Stamped whether or not the catalog yielded anything: the budget slot was
       // spent either way, and a blocked fetch goes to the BACK of the queue to be
       // retried on a later run rather than re-consuming the budget ahead of the
       // developers behind it (store calls degrade to [] instead of throwing).
-      markCatalogExpanded(store, id);
+      markCatalogExpanded(store, dev.id);
       for (const a of apps) {
         const { inserted } = upsertDiscoveredApp({
-          store, app_id: a.appId, title: a.title, country: CRAWL_COUNTRY,
+          // Sighted in the storefront the catalog was fetched from, NOT
+          // CRAWL_COUNTRY: recording us for a de-fetched catalog would point
+          // the app's own detail fetch at a storefront it may not exist in.
+          store, app_id: a.appId, title: a.title, country: dev.country,
           // NO explicit depth: a developer_catalog app is not in the similar
           // graph, so it must take NON_GRAPH_DEPTH. Passing 1 here made every
           // catalog app a depth-1 crawl seed — exactly what the sentinel exists
@@ -447,8 +526,8 @@ async function expandDeveloperCatalogs(onLog: OnLog): Promise<number> {
   // counter, so with more Play developers than the budget the Apple loop never
   // executed a single request. Play gets half; whatever it leaves flows to Apple.
   const playShare = Math.ceil(total / 2);
-  const playUsed = await runStore(playDevelopersWithContact(), playShare, (id) => playDeveloper(id, CRAWL_COUNTRY, onLog), 'google_play');
-  const appleUsed = await runStore(appleArtistsWithContact(), total - playUsed, (id) => appleDeveloper(id, CRAWL_COUNTRY, onLog), 'app_store');
+  const playUsed = await runStore(playDevelopersWithContact(), playShare, (id, cc) => playDeveloper(id, cc, onLog), 'google_play');
+  const appleUsed = await runStore(appleArtistsWithContact(), total - playUsed, (id, cc) => appleDeveloper(id, cc, onLog), 'app_store');
 
   onLog('info', `dev-catalog: ${playUsed} Play + ${appleUsed} Apple catalogs → +${newApps} new apps`);
   if (playUsed + appleUsed >= total) {
@@ -517,27 +596,40 @@ export function runStoreDiscoveryPipelineTests(): { passed: number; failed: numb
   };
 
   // Step-8 budget ordering. The DB layer hands the candidates over in value
-  // order, so an untouched list must come back untouched.
+  // order as {id, country} records, so an untouched list must come back
+  // untouched — and each developer's storefront must ride along with it, since
+  // runStore reads the country straight off the ordered record.
+  const dev = (id: string, country = 'us') => ({ id, country });
+  const devOrder = (devs: Array<{ id: string; country: string }>, times: ReadonlyMap<string, number>) =>
+    orderByProgress(devs, (d) => d.id, times).map((d) => d.id).join(',');
   check(
-    orderByCatalogExpansion(['a', 'b', 'c'], new Map()).join(',') === 'a,b,c',
+    devOrder([dev('a'), dev('b'), dev('c')], new Map()) === 'a,b,c',
     'catalog order: never-expanded candidates keep the value order they arrived in',
   );
   check(
-    orderByCatalogExpansion(['a', 'b', 'c'], new Map([['a', 500]])).join(',') === 'b,c,a',
+    devOrder([dev('a'), dev('b'), dev('c')], new Map([['a', 500]])) === 'b,c,a',
     'catalog order: an already-expanded developer yields the budget to never-expanded ones',
   );
   check(
-    orderByCatalogExpansion(['a', 'b'], new Map([['a', 900], ['b', 100]])).join(',') === 'b,a',
+    devOrder([dev('a'), dev('b')], new Map([['a', 900], ['b', 100]])) === 'b,a',
     'catalog order: with nothing left un-expanded, the least-recently-expanded goes first',
+  );
+  check(
+    orderByProgress([dev('x', 'de'), dev('y', 'us')], (d) => d.id, new Map([['x', 9]]))
+      .map((d) => `${d.id}:${d.country}`)
+      .join(',') === 'y:us,x:de',
+    'catalog order: each developer keeps its own storefront through the ordering',
   );
 
   // The regression itself: consecutive runs must ADVANCE through the eligible
   // set. Before the marker existed every run re-fetched the same prefix, so
   // 'c'..'e' below were never expanded no matter how often the job ran.
-  const candidates = ['a', 'b', 'c', 'd', 'e'];
+  const candidates = ['a', 'b', 'c', 'd', 'e'].map((id) => dev(id));
   const expandedAt = new Map<string, number>();
   const simulateRun = (clock: number): string[] => {
-    const picked = orderByCatalogExpansion(candidates, expandedAt).slice(0, 2); // budget of 2
+    const picked = orderByProgress(candidates, (d) => d.id, expandedAt)
+      .slice(0, 2) // budget of 2
+      .map((d) => d.id);
     picked.forEach((id, i) => expandedAt.set(id, clock + i));
     return picked;
   };

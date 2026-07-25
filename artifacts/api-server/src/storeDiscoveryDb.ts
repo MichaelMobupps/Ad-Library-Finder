@@ -430,15 +430,25 @@ export function getDiscoveredApp(store: StoreKind, appId: string, country: strin
   );
 }
 
+/** SQL fragment (aggregated per GROUP BY group): the storefront a store fetch
+ *  for this group must run against — 'us' when it was sighted there (the least
+ *  geo-restricted market and the historical default, so cached rows keep
+ *  meaning the same thing), otherwise the alphabetically-first market it WAS
+ *  sighted in. A geo-restricted app or developer (e.g. a German bank charting
+ *  only in de) resolves ONLY in its own market: querying us for it returns
+ *  nothing, indistinguishable from a real miss. Shared by the enrichment
+ *  worklist and both developer-catalog sets so the preference cannot drift
+ *  between phases; the trailing 'us' covers LEFT-JOINed groups with no
+ *  sighting row at all. Exported for the pipeline's one-shot stamp purge,
+ *  which must select geo-restricted rows by the SAME preference. */
+export const sightedCountrySql = (col: string): string =>
+  `COALESCE(MAX(CASE WHEN ${col} = 'us' THEN ${col} END), MIN(${col}), 'us')`;
+
 /** Distinct (store, app_id) pairs for a store, most-charted first. Used as the
- *  similar-crawl seed set and the enrichment worklist source.
- *
- *  `country` is the market the detail fetch should run against: 'us' when the
- *  app was sighted there (the least geo-restricted market and the historical
- *  default, so cached details keep meaning the same thing), otherwise the
- *  alphabetically-first market it WAS sighted in — a geo-restricted app (e.g. a
- *  German bank charting only in de) 404s on a us detail lookup and would be
- *  permanently marked failed after MAX_ENRICH_ATTEMPTS. */
+ *  similar-crawl seed set and the enrichment worklist source. `country` is the
+ *  storefront the detail fetch must run against (see sightedCountrySql) —
+ *  fetching a geo-restricted app elsewhere 404s it into a permanent 'failed'
+ *  after MAX_ENRICH_ATTEMPTS. */
 export function distinctAppsForStore(
   store: StoreKind,
 ): Array<{ app_id: string; min_depth: number; is_chart: number; country: string }> {
@@ -447,7 +457,7 @@ export function distinctAppsForStore(
       `SELECT app_id,
               MIN(discovery_depth) AS min_depth,
               MAX(CASE WHEN source = 'chart' THEN 1 ELSE 0 END) AS is_chart,
-              COALESCE(MAX(CASE WHEN country = 'us' THEN country END), MIN(country)) AS country
+              ${sightedCountrySql('country')} AS country
          FROM discovered_apps
         WHERE store = ?
         GROUP BY app_id`,
@@ -465,12 +475,17 @@ export function distinctAppsForStore(
  *
  * The vertical filter is on the app's own sightings, so a chart app harvested for
  * a vertical that is not active this run does not seed this run's crawl.
+ *
+ * `country` is the storefront the similar query must run against (see
+ * sightedCountrySql): similar results are storefront-listings too, so a
+ * geo-restricted seed queried in us yields nothing and contributes zero graph
+ * edges — the same silent loss the enrichment and catalog phases guard against.
  */
 export function similarSeedApps(
   store: StoreKind,
   depth: number,
   verticals: string[],
-): Array<{ app_id: string; vertical: string | null }> {
+): Array<{ app_id: string; vertical: string | null; country: string }> {
   if (verticals.length === 0) return [];
   const placeholders = verticals.map(() => '?').join(',');
   // MIN(vertical) just picks one deterministic vertical for an app sighted under
@@ -478,14 +493,16 @@ export function similarSeedApps(
   // survives the crawl (a depth-1 app has no chart vertical of its own).
   return getDb()
     .prepare(
-      `SELECT app_id, MIN(vertical) AS vertical
+      `SELECT app_id,
+              MIN(vertical) AS vertical,
+              ${sightedCountrySql('country')} AS country
          FROM discovered_apps
         WHERE store = ?
           AND vertical IN (${placeholders})
         GROUP BY app_id
        HAVING MIN(discovery_depth) = ?`,
     )
-    .all(store, ...verticals, depth) as Array<{ app_id: string; vertical: string | null }>;
+    .all(store, ...verticals, depth) as Array<{ app_id: string; vertical: string | null; country: string }>;
 }
 
 export function countDiscoveredApps(): number {
@@ -873,51 +890,52 @@ export function countPublishersWithEmail(): number {
 
 /**
  * Distinct Play developerIds whose enriched detail carries a website or email —
- * the step-8 developer-catalog expansion set (Play).
+ * the step-8 developer-catalog expansion set (Play). `country` is the storefront
+ * the catalog fetch must run against (see sightedCountrySql): a developer whose
+ * apps were only ever sighted in de lists a catalog only in de, and a us fetch
+ * would return an empty catalog that gets stamped as expanded anyway.
  *
  * ORDERED by value, because DEV_CATALOG_MAX_PER_RUN cuts this list off: charted
  * developers first, then in-band ones, then by install size. Unordered, the
  * budget was spent in SQLite insertion order and could be exhausted entirely on
  * out-of-band tail developers before a single charted one was reached.
  */
-export function playDevelopersWithContact(): string[] {
-  return (
-    getDb()
-      .prepare(
-        `SELECT d.developer_id AS developer_id
-           FROM store_app_detail d
-           LEFT JOIN discovered_apps a
-             ON a.store = d.store AND a.app_id = d.app_id
-          WHERE d.store = 'google_play' AND d.developer_id IS NOT NULL
-            AND (d.developer_website IS NOT NULL OR d.developer_email IS NOT NULL)
-          GROUP BY d.developer_id
-          ORDER BY MAX(CASE WHEN a.source = 'chart' THEN 1 ELSE 0 END) DESC,
-                   MAX(CASE WHEN d.min_installs BETWEEN @min AND @max THEN 1 ELSE 0 END) DESC,
-                   MAX(COALESCE(d.min_installs, 0)) DESC`,
-      )
-      .all({ min: TAIL_MIN_INSTALLS, max: TAIL_MAX_INSTALLS }) as Array<{ developer_id: string }>
-  ).map((r) => r.developer_id);
+export function playDevelopersWithContact(): Array<{ id: string; country: string }> {
+  return getDb()
+    .prepare(
+      `SELECT d.developer_id AS id,
+              ${sightedCountrySql('a.country')} AS country
+         FROM store_app_detail d
+         LEFT JOIN discovered_apps a
+           ON a.store = d.store AND a.app_id = d.app_id
+        WHERE d.store = 'google_play' AND d.developer_id IS NOT NULL
+          AND (d.developer_website IS NOT NULL OR d.developer_email IS NOT NULL)
+        GROUP BY d.developer_id
+        ORDER BY MAX(CASE WHEN a.source = 'chart' THEN 1 ELSE 0 END) DESC,
+                 MAX(CASE WHEN d.min_installs BETWEEN @min AND @max THEN 1 ELSE 0 END) DESC,
+                 MAX(COALESCE(d.min_installs, 0)) DESC`,
+    )
+    .all({ min: TAIL_MIN_INSTALLS, max: TAIL_MAX_INSTALLS }) as Array<{ id: string; country: string }>;
 }
 
 /** Distinct Apple artistIds whose enriched detail carries a seller URL — the
  *  step-8 developer-catalog expansion set (Apple). Charted artists first, for
- *  the same budget reason as the Play list above. */
-export function appleArtistsWithContact(): string[] {
-  return (
-    getDb()
-      .prepare(
-        `SELECT d.artist_id AS artist_id
-           FROM store_app_detail d
-           LEFT JOIN discovered_apps a
-             ON a.store = d.store AND a.app_id = d.app_id
-          WHERE d.store = 'app_store' AND d.artist_id IS NOT NULL
-            AND d.developer_website IS NOT NULL
-          GROUP BY d.artist_id
-          ORDER BY MAX(CASE WHEN a.source = 'chart' THEN 1 ELSE 0 END) DESC,
-                   MIN(COALESCE(a.rank, 9999)) ASC`,
-      )
-      .all() as Array<{ artist_id: string }>
-  ).map((r) => r.artist_id);
+ *  the same budget reason as the Play list above; `country` as there. */
+export function appleArtistsWithContact(): Array<{ id: string; country: string }> {
+  return getDb()
+    .prepare(
+      `SELECT d.artist_id AS id,
+              ${sightedCountrySql('a.country')} AS country
+         FROM store_app_detail d
+         LEFT JOIN discovered_apps a
+           ON a.store = d.store AND a.app_id = d.app_id
+        WHERE d.store = 'app_store' AND d.artist_id IS NOT NULL
+          AND d.developer_website IS NOT NULL
+        GROUP BY d.artist_id
+        ORDER BY MAX(CASE WHEN a.source = 'chart' THEN 1 ELSE 0 END) DESC,
+                 MIN(COALESCE(a.rank, 9999)) ASC`,
+    )
+    .all() as Array<{ id: string; country: string }>;
 }
 
 // ── rollup / confirmation read helpers ───────────────────────────────────────
