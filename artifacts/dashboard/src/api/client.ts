@@ -1,6 +1,6 @@
 export type ProductType = 'mobile' | 'cps';
 export type JobStatus = 'pending' | 'running' | 'completed' | 'failed' | 'deferred';
-export type JobSource = 'meta' | 'affplus' | 'appgoblin' | 'google_ads';
+export type JobSource = 'meta' | 'affplus' | 'appgoblin' | 'google_ads' | 'store_first';
 export type JobPhase =
   | 'queued'
   | 'starting'
@@ -97,6 +97,83 @@ export interface GoogleAdsOptions {
   region?: string | null;
 }
 
+// ---- store-first discovery (app stores are the discovery engine; GATC/Meta confirm) ----
+
+export interface StoreVertical {
+  id: string;
+  label: string;
+}
+
+export interface StoreFirstConfig {
+  verticals: StoreVertical[];
+  markets: string[];
+  defaults: { verticals: string[]; markets: string[] };
+  charts: { play: string[]; apple: string[] };
+  installBand: { min: number; max: number };
+}
+
+export interface StoreFirstOptions {
+  verticals?: string[] | null;
+  markets?: string[] | null;
+  similarMaxAppsPerRun?: number | null;
+  searchTermsLimit?: number | null;
+  confirmationMaxApiCalls?: number | null;
+}
+
+/** One row of the publisher table — the primary store-first view. */
+export interface Publisher {
+  id: number;
+  name: string;
+  email: string | null;
+  website: string | null;
+  previewUrl: string | null;
+  previewTitle: string | null;
+  verticals: string[];
+  /** Every country this publisher's apps were sighted in (chart or long tail). */
+  markets: string[];
+  /** Subset of `markets` where an app actually charted (drives the rank score). */
+  marketsCharted: string[];
+  /** discovery source → app count, e.g. { chart: 3, similar: 11, search: 2 }. */
+  sourceMix: Record<string, number>;
+  chartedAppCount: number;
+  appCount: number;
+  bestRank: number | null;
+  bothStores: boolean;
+  inBand: boolean;
+  isCharted: boolean;
+  gatcAdsCount: number | null;
+  gatcAdvertiserId: string | null;
+  metaActiveAds: number | null;
+  confirmed: boolean;
+  isGame: boolean;
+  score: number;
+}
+
+/** Counts for the discovery-funnel widget. */
+export interface DiscoveryFunnel {
+  bySource: Record<string, number>;
+  totalApps: number;
+  enriched: number;
+  inBand: number;
+  publishers: number;
+  confirmed: number;
+}
+
+export interface PublishersResponse {
+  /**
+   * The matching publishers, score desc — capped server-side to bound the
+   * payload, so this is a page, NOT the whole match set. Use `total` for counts.
+   */
+  publishers: Publisher[];
+  /** Publishers matching the active filters, across the whole table. */
+  total: number;
+  /** Publishers in the whole table, filters ignored — the honest grand total. */
+  totalUnfiltered: number;
+  /** Dropdown options, derived server-side from the unfiltered table. */
+  facets: { verticals: string[]; markets: string[] };
+  funnel: DiscoveryFunnel;
+}
+
 export interface CreateJobOptions {
   countries: string[];
   productTypes: ProductType[];
@@ -105,6 +182,7 @@ export interface CreateJobOptions {
   appgoblinCategory?: string | null;
   appgoblinAdNetwork?: string | null;
   googleAds?: GoogleAdsOptions | null;
+  storeFirst?: StoreFirstOptions | null;
 }
 
 export class AuthRequiredError extends Error {
@@ -155,6 +233,21 @@ export const api = {
 
   // ---- google ads ----
   googleAdsMeta: () => fetchJson<GoogleAdsMeta>('/api/jobs/google-ads-verticals'),
+
+  // ---- store-first discovery ----
+  storeFirstConfig: () => fetchJson<StoreFirstConfig>('/api/jobs/store-first-config'),
+
+  /**
+   * `params` is a pre-encoded query string of the active Publishers filters —
+   * the same ones the CSV export takes. Filtering is server-side because the row
+   * list is capped: filtering the returned page would hide every publisher that
+   * sits below the cap by score.
+   */
+  publishers: (params = '') =>
+    fetchJson<PublishersResponse>(`/api/jobs/publishers${params ? `?${params}` : ''}`),
+
+  /** `params` is a pre-encoded query string of the active Publishers filters. */
+  publishersCsvUrl: (params = '') => `/api/jobs/publishers.csv${params ? `?${params}` : ''}`,
 
   // ---- settings ----
   getSettings: () => fetchJson<Settings>('/api/settings'),

@@ -1,6 +1,15 @@
 /**
  * Google Ads Transparency Center job pipeline.
  *
+ * DEMOTED (store-first migration, spec step 14): GATC is no longer the discovery
+ * engine — the `store_first` pipeline discovers publishers from app-store data and
+ * GATC/Meta only CONFIRM ad activity (see storeConfirm.ts, which reuses this
+ * module's SearchSuggestions/SearchCreatives RPCs). This keyword-driven discovery
+ * pipeline is kept intact as a SECONDARY/legacy advertiser view: domain-token
+ * matches structurally resolve domain OWNERS only and cannot enumerate app
+ * advertisers, which is exactly why discovery moved to the stores. No rows are
+ * deleted; the source stays available but is surfaced as secondary in the UI.
+ *
  * Parallel path to affplusPipeline.ts / appgoblinPipeline.ts. For a google_ads job:
  *
  *   1. Build a keyword set from the multilingual exemplar bank
@@ -51,7 +60,7 @@ import {
   assertProxyUrlUsable,
   type GoogleAdsAdvertiser,
 } from './googleAdsScraper.js';
-import { keywordsForJob, keywordStats } from './googleAdsKeywords.js';
+import { keywordsForJob, keywordStats, GOOGLE_ADS_VERTICALS } from './googleAdsKeywords.js';
 import { sanitizeStoreUrl } from './classifier.js';
 import { makeSearchBudget, searchAdvertiserWebsite } from './webResolver.js';
 import { buildCsv } from './csv.js';
@@ -73,6 +82,10 @@ const MAX_CREATIVE_LOOKUPS = Number(process.env.GOOGLE_ADS_MAX_LOOKUPS) || 100;
 const MAX_ADVERTISERS = Number(process.env.GOOGLE_ADS_MAX_ADVERTISERS) || 1000;
 /** Default keyword sample size when the job doesn't specify one. */
 const DEFAULT_MAX_KEYWORDS = Number(process.env.GOOGLE_ADS_DEFAULT_MAX_KEYWORDS) || 40;
+/** Vertical ids demoted by the store-first migration (spec step 14): the
+ *  legal-entity NAME-TOKEN batteries ('game studio', 'games ltd', 'pte ltd',
+ *  'fintech', …). Kept in the bank, excluded from the DEFAULT draw. */
+const DEMOTED_VERTICAL_IDS = ['apps', 'apps_nongame'];
 /** CPS jobs skip SearchCreatives/GetCreativeById entirely by default: the lead
  *  is the advertiser's own site (verified domain, else name→web-search), and the
  *  creative endpoint is what gets a proxy/host IP flagged. Set
@@ -145,6 +158,27 @@ function parseParams(job: JobRow): GoogleAdsSourceParams {
   }
 }
 
+/**
+ * The vertical set a job actually searches (spec step 14 — name-token batteries
+ * INACTIVE BY DEFAULT).
+ *
+ * An explicit pin wins untouched: demotion is a default, not a prohibition, so an
+ * operator who asks for 'apps'/'apps_nongame' still gets them.
+ *
+ * With nothing pinned we must NAME every surviving vertical instead of passing
+ * null. `keywordsForJob` reads null as "ALL verticals" and applies no filter at
+ * all, so the demoted batteries were round-robined into the very first interleave
+ * pass — they ran on every unpinned job while the job log told the operator they
+ * were inactive. Naming the survivors is the only way to express "everything
+ * except these" with the selection shape the keyword bank accepts; its one cost
+ * is that a filtered selection also drops the cross-vertical 'cta' intent words,
+ * which are the weakest advertiser-name tokens in the bank.
+ */
+export function verticalsForJob(pinned: string[] | null | undefined): string[] {
+  if (pinned && pinned.length > 0) return pinned;
+  return GOOGLE_ADS_VERTICALS.map((v) => v.id).filter((id) => !DEMOTED_VERTICAL_IDS.includes(id));
+}
+
 export async function runGoogleAdsJob(job: JobRow): Promise<void> {
   markJobRunning(job.id);
   const onLog = (level: 'info' | 'warn' | 'error' | 'debug', msg: string) => {
@@ -205,38 +239,47 @@ export async function runGoogleAdsJob(job: JobRow): Promise<void> {
       onLog('info', `google-ads: using ${keywords.length} custom keywords`);
     } else {
       const limit = params.maxKeywords && params.maxKeywords > 0 ? params.maxKeywords : DEFAULT_MAX_KEYWORDS;
-      // A MOBILE lead requires a store destination, which only appears in the ads
-      // of app/game publishers. Those advertisers are surfaced by app-name and
-      // app-category tokens — the 'apps' (game-heavy) and 'apps_nongame' (fintech,
-      // delivery, health, productivity…) verticals — NOT by the web-CPS verticals
-      // (casino, betting, dating…) that dominate the bank. So when a mobile job
-      // doesn't pin its own verticals, default it to both app verticals for
-      // full-spectrum app coverage instead of sampling the whole (web-oriented)
-      // bank. An explicit vertical selection always wins; CPS/web jobs keep the
-      // full-bank default.
-      const mobileJob = job.product_type === 'mobile';
+      // DEMOTED (store-first migration, spec step 14): NAME-TOKEN batteries are
+      // now INACTIVE BY DEFAULT.
+      //
+      // The 'apps' and 'apps_nongame' verticals are legal-entity name tokens
+      // ('game studio', 'games ltd', 'pte ltd', 'apps inc'). They used to be the
+      // automatic default for every mobile job, on the theory that a mobile lead
+      // needs a store destination and only app publishers have one. That theory
+      // is structurally unsound: a name-token search enumerates whoever happens to
+      // put a studio token in their advertiser NAME, which is not the same set as
+      // "app advertisers" and cannot be made into it — GATC caps at 100
+      // advertisers per query and hides unverified advertisers outside the EU.
+      // Store-first discovery owns app-publisher discovery now.
+      //
+      // The batteries are KEPT, not deleted: an explicit vertical selection still
+      // activates them (verticalsForJob). A job simply no longer opts into them
+      // silently — which is why the unpinned case names every OTHER vertical
+      // rather than passing null, the "all verticals" shorthand that kept the
+      // demoted batteries in the draw.
       const pinnedVerticals = !!(params.verticals && params.verticals.length > 0);
-      let defaulted = mobileJob && !pinnedVerticals;
-      let effectiveVerticals = pinnedVerticals ? params.verticals! : defaulted ? ['apps', 'apps_nongame'] : null;
+      const effectiveVerticals = verticalsForJob(params.verticals);
       keywords = keywordsForJob({
         verticals: effectiveVerticals,
         languages: params.languages || null,
         limit,
       });
-      // The 'apps' vertical is English-only, so a mobile default combined with a
-      // non-English language filter can yield nothing. Rather than run a 0-lead
-      // job, fall back to the full bank under the same language filter.
-      if (defaulted && keywords.length === 0) {
-        keywords = keywordsForJob({ verticals: null, languages: params.languages || null, limit });
-        defaulted = false;
-        effectiveVerticals = null;
-        onLog('info', "google-ads: 'apps' vertical had no keywords for the requested language(s) — falling back to the full keyword bank");
+      if (!pinnedVerticals) {
+        onLog(
+          'info',
+          "google-ads: name-token app batteries ('apps','apps_nongame') are inactive by default since the store-first migration " +
+            '— structural: name search resolves advertiser-name matches only. Pin those verticals explicitly to re-enable them, ' +
+            'or use Store-First Discovery, which is the supported path for app publishers.',
+        );
       }
       const stats = keywordStats();
       onLog(
         'info',
         `google-ads: drew ${keywords.length} keywords from the exemplar bank (${stats.total} total, ${stats.languages} languages, ${stats.verticals} verticals)` +
-          `${effectiveVerticals?.length ? `; verticals=${effectiveVerticals.join(',')}${defaulted ? ' (mobile default)' : ''}` : ''}` +
+          // Only echo the verticals the OPERATOR chose: unpinned jobs now carry the
+          // full survivor list (every vertical bar the demoted ones), and printing
+          // 20-odd ids would read as a selection nobody made.
+          `${pinnedVerticals ? `; verticals=${effectiveVerticals.join(',')}` : ''}` +
           `${params.languages?.length ? `; languages=${params.languages.join(',')}` : ''}`,
       );
     }
@@ -620,6 +663,31 @@ export function runGoogleAdsPipelineTests(): { passed: number; failed: number; f
 
   const notUrl = classifyGoogleAdsUrl('ftp://weird');
   check(notUrl.classification === 'unknown', 'non-http scheme → unknown');
+
+  // Spec step 14: the demoted name-token batteries must be INACTIVE BY DEFAULT.
+  // Passing null (the old "all verticals" shorthand) applied no filter at all, so
+  // interleave round-robined 'apps'/'apps_nongame' into the first pass and their
+  // keywords were actually searched — the exact opposite of what the job log said.
+  const defaultVerticals = verticalsForJob(null);
+  check(
+    !defaultVerticals.includes('apps') && !defaultVerticals.includes('apps_nongame'),
+    'verticals: unpinned job excludes the demoted name-token batteries',
+  );
+  check(defaultVerticals.includes('igaming'), 'verticals: unpinned job still draws the live verticals');
+  // 'games' and 'fintech' are owned by 'apps' / 'apps_nongame' (the bank dedupes
+  // case-insensitively in VERTICAL_DEFS order, and those two batteries are last),
+  // so their absence proves the batteries contributed nothing to the draw.
+  const defaultKeywords = keywordsForJob({ verticals: defaultVerticals, limit: DEFAULT_MAX_KEYWORDS });
+  check(
+    !defaultKeywords.includes('games') && !defaultKeywords.includes('fintech'),
+    'verticals: default keyword draw issues no name-token battery queries',
+  );
+  // Demotion is a default, not a prohibition — an explicit pin still activates them.
+  check(
+    verticalsForJob(['apps']).join(',') === 'apps' &&
+      keywordsForJob({ verticals: verticalsForJob(['apps']) }).includes('games'),
+    'verticals: an explicitly pinned battery still runs',
+  );
 
   return { passed, failed: failures.length, failures };
 }

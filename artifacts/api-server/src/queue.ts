@@ -26,6 +26,7 @@ import { notifyJobCompleted, notifyJobFailed } from './notifier.js';
 import { runAffplusJob } from './affplusPipeline.js';
 import { runAppgoblinJob } from './appgoblinPipeline.js';
 import { runGoogleAdsJob } from './googleAdsPipeline.js';
+import { runStoreDiscoveryJob } from './storeDiscoveryPipeline.js';
 import { runHqSplit } from './hqSplit.js';
 import { log } from './logger.js';
 
@@ -48,7 +49,11 @@ async function tick() {
         // would scrape (non-LLM) and then defer at the first LLM call, churning
         // the whole queue. Leave jobs untouched and wait for the Jerusalem-day
         // reset, at which point spend resets and dispatch resumes.
-        if (spentTodayUsd() >= DAILY_CAP_USD) {
+        //
+        // store_first is EXEMPT: its pipeline makes no LLM calls at all (stores
+        // are free, GATC/Meta confirmation is HTTP), so it can never defer on
+        // spend and holding it back just stalls discovery for a whole day.
+        if (job.source !== 'store_first' && spentTodayUsd() >= DAILY_CAP_USD) {
           await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
           continue;
         }
@@ -58,6 +63,8 @@ async function tick() {
           await runAppgoblinJob(job);
         } else if (job.source === 'google_ads') {
           await runGoogleAdsJob(job);
+        } else if (job.source === 'store_first') {
+          await runStoreDiscoveryJob(job);
         } else {
           await runMetaJob(job);
         }

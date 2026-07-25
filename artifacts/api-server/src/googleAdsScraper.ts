@@ -1441,6 +1441,65 @@ export async function resolveAdvertiserDestination(
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// Store-first CONFIRMATION primitives.
+//
+// The store-first pipeline discovers publishers from app-store data, then
+// CONFIRMS ad activity through GATC. These two primitives expose exactly what
+// confirmation needs on top of the same RPC machinery discovery uses:
+//
+//   • searchAdvertisersOnce(query) — ONE SearchSuggestions call (no warm-up /
+//     cooldown wrapper of its own; the caller warms the session once with
+//     warmUpSession() and gates on googleAdsCooldownRemainingMs()). Used to look
+//     an advertiser up by a publisher's NAME and, separately, its DOMAIN.
+//   • countAdvertiserAds(advertiserId) — ONE SearchCreatives page; the creative
+//     count is the confirmation signal (>0 ⇒ active advertiser) and feeds the
+//     scaled GATC score. Bounded to CONFIRM_CREATIVE_LIMIT so an advertiser with
+//     thousands of ads still costs a single request.
+//
+// Both reuse rpcPost (shared cookie session + backoff) and never throw.
+// ───────────────────────────────────────────────────────────────────────────
+
+/** SearchCreatives page size used for ad-counting during confirmation. Large
+ *  enough to saturate the scaled GATC score component in a single request. */
+const CONFIRM_CREATIVE_LIMIT = clampInt(process.env.GOOGLE_ADS_CONFIRM_CREATIVE_LIMIT, 40, 1, 100);
+
+/**
+ * `ok` means a response was actually received and parsed — NOT merely that the
+ * request was issued and was not a hard block. rpcPost reports blocked=true only
+ * for 429/403 and a 200 with an unparseable body; a 5xx that outlives the retries,
+ * a timeout, and any DNS/proxy/socket error all come back blocked=FALSE with an
+ * error set. Callers that write a measured zero on "no advertiser matched" must be
+ * able to tell that apart from "the lookup never answered", or a transient network
+ * failure gets recorded as a real zero and erases a stored ads_count.
+ */
+export async function searchAdvertisersOnce(
+  query: string,
+  onLog?: LogFn,
+): Promise<{ advertisers: GoogleAdsAdvertiser[]; blocked: boolean; ok: boolean }> {
+  const q = (query || '').trim();
+  if (!q) return { advertisers: [], blocked: false, ok: false };
+  const payload: Record<string, unknown> = { '1': q, '2': SUGGEST_LIMIT, '3': SUGGEST_LIMIT };
+  const res = await rpcPost('SearchService/SearchSuggestions', payload, `confirm-suggest "${q.slice(0, 40)}"`, onLog);
+  if (!res.json) return { advertisers: [], blocked: res.blocked, ok: false };
+  return { advertisers: parseAdvertiserSuggestions(res.json, q), blocked: res.blocked, ok: true };
+}
+
+export async function countAdvertiserAds(
+  advertiserId: string,
+  opts: { onLog?: LogFn; region?: string | null } = {},
+): Promise<{ adsCount: number; blocked: boolean; hasMore: boolean }> {
+  const id = (advertiserId || '').trim();
+  if (!looksLikeAdvertiserId(id)) return { adsCount: 0, blocked: false, hasMore: false };
+  const creativeFilter: Record<string, unknown> = { '12': { '1': '', '2': true }, '13': { '1': [id] } };
+  if (SEND_REGION && opts.region) creativeFilter['8'] = opts.region;
+  const payload: Record<string, unknown> = { '2': CONFIRM_CREATIVE_LIMIT, '3': creativeFilter, '7': { '1': 1 } };
+  const res = await rpcPost('SearchService/SearchCreatives', payload, `confirm-ads ${id}`, opts.onLog);
+  if (!res.json) return { adsCount: 0, blocked: res.blocked, hasMore: false };
+  const { creatives, nextToken } = parseCreativesResponse(res.json);
+  return { adsCount: creatives.length, blocked: res.blocked, hasMore: !!nextToken };
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // Offline unit tests (no network). Run via `node dist/googleAdsScraper.js`.
 // ───────────────────────────────────────────────────────────────────────────
 
