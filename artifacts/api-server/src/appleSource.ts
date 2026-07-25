@@ -193,6 +193,46 @@ export async function appleLookup(ids: string[], country: string, onLog?: LogFn)
   return out;
 }
 
+/**
+ * Whether each id is still listed in `country`'s App Store.
+ *
+ * Cheap and unambiguous, unlike the Play equivalent: /lookup answers HTTP 200 with
+ * the found entries and simply OMITS ids that are not in the store, 100 ids per
+ * request. The critical distinction is a FAILED request — getJson returns null on
+ * timeout/5xx/rate-limit — where every id in that batch is unknown rather than
+ * gone. Ids absent from a SUCCESSFUL response are reported 'gone'; ids in a failed
+ * batch are omitted from the result map entirely, so a caller that iterates the
+ * map can never mistake a network problem for a delisting.
+ */
+export async function appleLiveness(
+  ids: string[],
+  country: string,
+  onLog?: LogFn,
+): Promise<Map<string, 'live' | 'gone'>> {
+  const out = new Map<string, 'live' | 'gone'>();
+  const cc = (country || 'us').toLowerCase();
+  const unique = [...new Set(ids.filter(Boolean))];
+  for (let i = 0; i < unique.length; i += ITUNES_LOOKUP_BATCH) {
+    const batch = unique.slice(i, i + ITUNES_LOOKUP_BATCH);
+    const url = `https://itunes.apple.com/lookup?id=${batch.map(encodeURIComponent).join(',')}&country=${encodeURIComponent(cc)}`;
+    // eslint-disable-next-line no-await-in-loop
+    const json = (await itunesLimiter.schedule(() => getJson(url, STORE_FETCH_TIMEOUT_MS, onLog))) as
+      | { results?: ItunesRaw[] }
+      | null;
+    if (!json) {
+      onLog?.('debug', `apple liveness: batch of ${batch.length} inconclusive (request failed) — left unknown`);
+      continue; // whole batch unknown; never inferred as gone
+    }
+    const found = new Set<string>();
+    for (const r of json.results ?? []) {
+      const d = coerceDetail(r);
+      if (d) found.add(d.appId);
+    }
+    for (const id of batch) out.set(id, found.has(id) ? 'live' : 'gone');
+  }
+  return out;
+}
+
 /** iTunes developer catalog for an artistId: the software apps (drops the leading
  *  artist entry) as listed in `country`'s storefront. Returns [] on failure. */
 export async function appleDeveloper(artistId: string, country: string, onLog?: LogFn): Promise<AppleAppDetail[]> {

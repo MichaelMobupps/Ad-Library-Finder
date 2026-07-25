@@ -50,9 +50,12 @@ async function tick() {
       // the whole queue. Leave it untouched and wait for the Jerusalem-day
       // reset, at which point spend resets and dispatch resumes.
       //
-      // store_first is EXEMPT: its pipeline makes no LLM calls at all (stores
-      // are free, GATC/Meta confirmation is HTTP), so it can never defer on
-      // spend and holding it back just stalls discovery for a whole day. The
+      // store_first is EXEMPT: discovery, enrichment and GATC/Meta confirmation
+      // are all plain HTTP, so the job cannot defer on spend and holding it back
+      // just stalls discovery for a whole day. Its ONE LLM-spending step is the
+      // trailing HQ split that builds the Excel bundle, and that step checks the
+      // cap itself and skips (buildExcelBundle) — so the exemption cannot be used
+      // to spend past the cap, it only lets the free 99% of the job run. The
       // exemption must not depend on the exempt job being the HEAD: the blocked
       // head never leaves 'pending', so a store_first job queued behind it
       // would otherwise be head-of-line blocked until midnight. When the head

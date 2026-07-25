@@ -13,10 +13,16 @@
  *   4. Enrichment           — cache-first detail + install-band gate (storeEnrich).
  *   5. Dev-catalog expand    — full Play/Apple portfolios for publishers with a
  *                             contact, then a second enrichment pass.
+ *  5b. Liveness sweep       — re-checks least-recently-verified known apps and
+ *                             tombstones the ones the stores no longer list, so a
+ *                             permanent never-re-fetched catalog cannot drift.
  *   6. Rollup               — publishers + portfolio aggregates.
  *   7. Confirmation         — GATC (RPC) + optional Meta, budgeted.
  *   8. Scoring              — charted vs tail-only profiles.
  *   9. Leads + CSV          — one lead per publisher, Prospector export.
+ *  10. HQ split             — the per-HQ-country .xlsx bundle every other source
+ *                             emits, so one run yields one Excel with no second
+ *                             search and no separate confirmation step.
  *
  * Store calls are free and internally throttled; the only paid surface is GATC
  * confirmation (residential proxy). Everything degrades gracefully — a blocked
@@ -31,14 +37,23 @@ import {
   appendLog,
   getJob,
   getDb,
+  getResults,
+  setJobHqZipPath,
   type JobRow,
 } from './db.js';
+import { runHqSplit } from './hqSplit.js';
+import { BudgetExceededError, spentTodayUsd, DAILY_CAP_USD } from './llmBudget.js';
 import {
   resolveStoreParams,
   verticalById,
   tailSearchTerms,
   SIMILAR_MAX_DEPTH,
   SIMILAR_MAX_REQUESTS_PER_RUN,
+  SEARCH_MAX_REQUESTS_PER_RUN,
+  EXPORT_CONFIRMED_ONLY,
+  LIVENESS_MAX_PLAY_PER_RUN,
+  LIVENESS_MAX_APPLE_PER_RUN,
+  LIVENESS_RECHECK_AFTER_DAYS,
   DEV_CATALOG_MAX_PER_RUN,
   DEV_CATALOG_MAX_APPS_PER_RUN,
 } from './storeDiscoveryConfig.js';
@@ -55,10 +70,13 @@ import {
   playDevelopersWithContact,
   appleArtistsWithContact,
   listPublishersByScore,
+  listLivenessCandidates,
+  markAppLiveness,
+  countDelistedApps,
   type StoreKind,
 } from './storeDiscoveryDb.js';
-import { expandPlayCategories, playChart, playSimilar, playDeveloper, playSearch } from './playSource.js';
-import { appleChart, appleDeveloper, appleSearch } from './appleSource.js';
+import { expandPlayCategories, playChart, playSimilar, playDeveloper, playSearch, playAppLiveness } from './playSource.js';
+import { appleChart, appleDeveloper, appleSearch, appleLiveness } from './appleSource.js';
 import { enrichApps, type EnrichWorkItem, type EnrichSummary } from './storeEnrich.js';
 import { rollupPublishers } from './publisherRollup.js';
 import { confirmPublishers } from './storeConfirm.js';
@@ -194,28 +212,58 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
     onLog('info', `similar crawl done: +${newSimilar} new apps from ${similarRequests} requests`);
 
     // ── Phase 3: search battery ──────────────────────────────────────────────
+    // One cell per (vertical, market, term) — 9 x 12 x 15 = 1620 at full scope.
+    // Bounded by SEARCH_MAX_REQUESTS_PER_RUN and rotated least-recently-searched
+    // first, so the cap defers cells to the next run instead of starving the tail
+    // of the grid forever (the guarantee the similar crawl and developer-catalog
+    // phases already carry).
     setJobPhase(job.id, 'scraping', 'search battery');
     let searchRows = 0;
+    let searchRequests = 0;
+    let searchCellsRun = 0;
+    ensureSearchBatteryTable();
+    const searchedAt = searchCellTimes();
+    const searchCells: SearchCell[] = [];
     for (const vId of params.verticals) {
       let terms = tailSearchTerms(vId);
       if (params.searchTermsLimit != null) terms = terms.slice(0, params.searchTermsLimit);
       for (const market of params.markets) {
-        for (const term of terms) {
-          const [playApps, appleApps] = await Promise.all([
-            playSearch(term, market, onLog),
-            appleSearch(term, market, onLog),
-          ]);
-          for (const a of playApps) {
-            upsertDiscoveredApp({ store: 'google_play', app_id: a.appId, title: a.title, vertical: vId, country: market, source: 'search' });
-          }
-          for (const a of appleApps) {
-            upsertDiscoveredApp({ store: 'app_store', app_id: a.appId, title: a.title, vertical: vId, country: market, source: 'search' });
-          }
-          searchRows += playApps.length + appleApps.length;
-        }
+        for (const term of terms) searchCells.push({ vertical: vId, market, term });
       }
     }
-    onLog('info', `search battery done: ${searchRows} sightings; ${countDiscoveredApps()} distinct rows total`);
+    const orderedCells = orderByProgress(searchCells, searchCellKey, searchedAt);
+    for (const cell of orderedCells) {
+      if (searchRequests >= SEARCH_MAX_REQUESTS_PER_RUN) break;
+      // Both requests are spent whether or not they yield, and the cell is
+      // stamped either way — a barren or blocked cell must go to the BACK of the
+      // rotation rather than re-consuming the budget ahead of never-run cells.
+      searchRequests += 2;
+      markSearchCell(cell);
+      searchCellsRun++;
+      const [playApps, appleApps] = await Promise.all([
+        playSearch(cell.term, cell.market, onLog),
+        appleSearch(cell.term, cell.market, onLog),
+      ]);
+      for (const a of playApps) {
+        upsertDiscoveredApp({ store: 'google_play', app_id: a.appId, title: a.title, vertical: cell.vertical, country: cell.market, source: 'search' });
+      }
+      for (const a of appleApps) {
+        upsertDiscoveredApp({ store: 'app_store', app_id: a.appId, title: a.title, vertical: cell.vertical, country: cell.market, source: 'search' });
+      }
+      searchRows += playApps.length + appleApps.length;
+    }
+    onLog(
+      'info',
+      `search battery done: ${searchCellsRun}/${orderedCells.length} cells, ${searchRequests} requests, ` +
+        `${searchRows} sightings; ${countDiscoveredApps()} distinct rows total`,
+    );
+    if (searchCellsRun < orderedCells.length) {
+      onLog(
+        'warn',
+        `search battery capped at ${SEARCH_MAX_REQUESTS_PER_RUN} requests — ` +
+          `${orderedCells.length - searchCellsRun} cells deferred to the next run (least-recently-searched first)`,
+      );
+    }
 
     // ── Phase 4: enrichment (+ install-band gate) ────────────────────────────
     setJobPhase(job.id, 'enriching', 'app detail');
@@ -231,6 +279,13 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
       logEnrich(onLog, 're-enrichment', enrichSummary);
     }
 
+    // ── Phase 5b: liveness sweep — drop apps the stores no longer list ───────
+    // The catalog is permanent and never re-fetched, which is what makes repeat
+    // runs fast; this is the counterweight that keeps it honest. Runs BEFORE the
+    // rollup so a delisting is reflected in this run's publishers, not next run's.
+    setJobPhase(job.id, 'enriching', 'liveness sweep');
+    const liveness = await sweepLiveness(onLog);
+
     // ── Phase 6: publisher rollup ────────────────────────────────────────────
     setJobPhase(job.id, 'classifying', 'publisher rollup');
     rollupPublishers(onLog);
@@ -245,7 +300,23 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
 
     // ── Phase 9: leads + Prospector CSV ──────────────────────────────────────
     setJobPhase(job.id, 'building_csv', 'publisher CSV');
-    const publishers = listPublishersByScore(1_000_000);
+    const discovered = listPublishersByScore(1_000_000);
+    // The deliverable is app companies that PROVABLY advertise, so unconfirmed
+    // publishers are held back from the export (they stay in the Publishers table
+    // and become exportable the run their verdict comes back positive). Reported
+    // explicitly rather than silently: at any finite confirmation budget most of a
+    // large corpus is "not checked yet", and that must not read as "not advertising".
+    const publishers = EXPORT_CONFIRMED_ONLY
+      ? discovered.filter((p) => p.confirmed_advertiser === 1)
+      : discovered;
+    if (EXPORT_CONFIRMED_ONLY) {
+      const unchecked = discovered.filter((p) => p.last_confirm_at == null).length;
+      onLog(
+        'info',
+        `export filter: ${publishers.length}/${discovered.length} publishers confirmed advertising ` +
+          `(${discovered.length - publishers.length} held back — of those ${unchecked} not yet checked by the confirmation budget)`,
+      );
+    }
     // Dedupe against leads earlier jobs already exported, then persist the
     // survivors into the shared lead store (spec step 12).
     const { path: csvPath, rowsWritten, exported } = buildPublisherCsv(job.id, publishers, leadHistorySeed());
@@ -254,6 +325,9 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
       'info',
       `CSV written: ${csvPath} (${rowsWritten} publisher leads, ${publishers.length - rowsWritten} deduped against existing leads; ${persisted} saved)`,
     );
+
+    // ── Phase 10: per-HQ-country .xlsx bundle ────────────────────────────────
+    await buildExcelBundle(job.id, rowsWritten, onLog);
 
     // ── Run summary ──────────────────────────────────────────────────────────
     printRunSummary(onLog, { confirm, enrichSummary, publishers: publishers.length });
@@ -341,6 +415,176 @@ function catalogExpansionTimes(store: StoreKind): Map<string, number> {
  * from the crawl, while the job still logged success. Stamping each seed as crawled
  * makes successive runs advance through the level instead of restarting it.
  */
+/**
+ * Re-check the least-recently-verified known apps against their store and
+ * tombstone the ones that are gone (spec-adjacent: keeps the permanent catalog
+ * honest without re-scraping it).
+ *
+ * The invariant that matters: ONLY an unambiguous store "not found" tombstones an
+ * app. playAppLiveness returns 'unknown' for a rate-limit or a network error and
+ * appleLiveness omits a failed batch entirely, and neither is treated as gone —
+ * otherwise one throttled afternoon would wipe live apps out of every publisher's
+ * portfolio, and nothing in the pipeline would ever put them back.
+ */
+/**
+ * The per-HQ-country .xlsx bundle every other source produces (spec: one run, one
+ * Excel). persistPublisherLeads has already written job_results rows classified
+ * mobile_google_play/mobile_app_store with a store_url — exactly the shape
+ * runHqSplit consumes — so this is one call, not a parallel export path.
+ *
+ * Two rules, both about not destroying finished work:
+ *
+ * BUDGET — HQ resolution is the ONLY LLM spend in this pipeline, and the queue
+ * dispatches store_first CAP-EXEMPT (on the rationale that store discovery and
+ * GATC confirmation are plain HTTP). The cap therefore has to be honoured here,
+ * or an exempt job would quietly spend past it. Checked up front so a capped day
+ * skips the split cleanly rather than dying part-way through it.
+ *
+ * NON-FATAL — unlike the appgoblin/affplus pipelines, a failure here is never
+ * re-thrown. There the CSV and the split share one outcome; here discovery,
+ * enrichment, rollup, confirmation and the CSV have all already succeeded and are
+ * on disk. Failing the job over an optional trailing bundle would report hours of
+ * completed work as a failure and hide a good CSV behind a 'failed' status.
+ */
+async function buildExcelBundle(jobId: string, rowsWritten: number, onLog: OnLog): Promise<void> {
+  const spent = spentTodayUsd();
+  if (spent >= DAILY_CAP_USD) {
+    onLog(
+      'warn',
+      `hq-split skipped: daily LLM cap reached ($${spent.toFixed(2)} of $${DAILY_CAP_USD.toFixed(2)}) — ` +
+        `the CSV is complete; the Excel bundle will be produced by the next run after the cap resets`,
+    );
+    return;
+  }
+  setJobPhase(jobId, 'hq_splitting', `resolving HQ for ${rowsWritten} publishers`);
+  try {
+    const outcome = await runHqSplit({ jobId, results: getResults(jobId), onLog });
+    if (outcome.zipPath) {
+      setJobHqZipPath(jobId, outcome.zipPath);
+      const summary = Object.entries(outcome.perCountryCounts)
+        .sort(([, a], [, b]) => b - a)
+        .map(([c, n]) => `${c}=${n}`)
+        .join(', ');
+      onLog('info', `hq-split: Excel bundle ready (${summary})`);
+    } else {
+      onLog('warn', 'hq-split: no Excel bundle produced (no resolvable mobile rows)');
+    }
+    if (outcome.playBlocked) {
+      onLog('warn', 'hq-split: Play page-fetch was blocked/rate-limited — Android HQ resolution may be degraded');
+    }
+  } catch (err) {
+    const why = err instanceof BudgetExceededError ? 'daily LLM cap reached mid-split' : (err as Error).message;
+    onLog('warn', `hq-split failed (non-fatal, CSV unaffected): ${why}`);
+  }
+}
+
+export function livenessAction(verdict: 'live' | 'gone' | 'unknown'): 'skip' | 'mark_live' | 'mark_gone' {
+  // The whole safety property of the sweep, in one place: only a definitive
+  // store answer is actionable. 'unknown' (rate-limit, timeout, 5xx) means ask
+  // again next run — never a tombstone.
+  if (verdict === 'unknown') return 'skip';
+  return verdict === 'gone' ? 'mark_gone' : 'mark_live';
+}
+
+async function sweepLiveness(onLog: OnLog): Promise<{ checked: number; delisted: number }> {
+  const staleBefore = Date.now() - LIVENESS_RECHECK_AFTER_DAYS * 86_400_000;
+  let checked = 0;
+  let delisted = 0;
+
+  // Play: one throttled request per app, so the budget is small.
+  const playCandidates = listLivenessCandidates('google_play', staleBefore, LIVENESS_MAX_PLAY_PER_RUN);
+  for (const c of playCandidates) {
+    const action = livenessAction(await playAppLiveness(c.app_id, c.country, onLog));
+    if (action === 'skip') continue; // inconclusive: ask again next run
+    markAppLiveness('google_play', c.app_id, action === 'mark_gone');
+    checked++;
+    if (action === 'mark_gone') delisted++;
+  }
+
+  // Apple: 100 ids per request, so a much larger slice fits the same wall-clock.
+  // Grouped by storefront because a listing is per-country: an app pulled from one
+  // market may still be live in another, and asking in the wrong one is a false
+  // delisting. Same country preference the enrichment worklist uses.
+  const appleCandidates = listLivenessCandidates('app_store', staleBefore, LIVENESS_MAX_APPLE_PER_RUN);
+  const byCountry = new Map<string, string[]>();
+  for (const c of appleCandidates) {
+    const cc = (c.country || 'us').toLowerCase();
+    if (!byCountry.has(cc)) byCountry.set(cc, []);
+    byCountry.get(cc)!.push(c.app_id);
+  }
+  for (const [cc, ids] of byCountry) {
+    const verdicts = await appleLiveness(ids, cc, onLog);
+    for (const [appId, verdict] of verdicts) {
+      const action = livenessAction(verdict);
+      if (action === 'skip') continue;
+      markAppLiveness('app_store', appId, action === 'mark_gone');
+      checked++;
+      if (action === 'mark_gone') delisted++;
+    }
+  }
+
+  if (checked > 0) {
+    onLog(
+      'info',
+      `liveness: re-checked ${checked} known apps, ${delisted} newly delisted and dropped from rollup ` +
+        `(${countDelistedApps()} delisted in total)`,
+    );
+  } else {
+    onLog('info', 'liveness: nothing due for re-check this run');
+  }
+  return { checked, delisted };
+}
+
+/** One search-battery cell: a (vertical, market, term) triple. */
+export interface SearchCell {
+  vertical: string;
+  market: string;
+  term: string;
+}
+
+/** Rotation key for a search cell. Stable across runs — it IS the primary key. */
+export function searchCellKey(cell: SearchCell): string {
+  return `${cell.vertical}|${cell.market}|${cell.term}`;
+}
+
+/**
+ * Per-cell "this (vertical, market, term) search has already run" marker.
+ *
+ * The same starvation guard similar_crawl_seed and developer_catalog_expansion
+ * carry, and for the same reason: SEARCH_MAX_REQUESTS_PER_RUN truncates a list
+ * that is otherwise built vertical-then-market-then-term, so with no marker every
+ * run would re-search the identical prefix (finance/us/...) and the cells past the
+ * cut — at full scope that is most of the grid — would never be searched at all.
+ */
+function ensureSearchBatteryTable(): void {
+  getDb().exec(`
+    CREATE TABLE IF NOT EXISTS search_battery_cell (
+      vertical TEXT NOT NULL,
+      market TEXT NOT NULL,
+      term TEXT NOT NULL,
+      last_searched_at INTEGER NOT NULL,
+      PRIMARY KEY (vertical, market, term)
+    );
+  `);
+}
+
+/** cell key → ms epoch of its last search. */
+function searchCellTimes(): Map<string, number> {
+  const rows = getDb()
+    .prepare(`SELECT vertical, market, term, last_searched_at FROM search_battery_cell`)
+    .all() as Array<SearchCell & { last_searched_at: number }>;
+  return new Map(rows.map((r) => [searchCellKey(r), r.last_searched_at]));
+}
+
+function markSearchCell(cell: SearchCell): void {
+  getDb()
+    .prepare(
+      `INSERT INTO search_battery_cell (vertical, market, term, last_searched_at) VALUES (?, ?, ?, ?)
+       ON CONFLICT(vertical, market, term) DO UPDATE SET last_searched_at = excluded.last_searched_at`,
+    )
+    .run(cell.vertical, cell.market, cell.term, Date.now());
+}
+
 function ensureSimilarCrawlTable(): void {
   getDb().exec(`
     CREATE TABLE IF NOT EXISTS similar_crawl_seed (
@@ -679,6 +923,63 @@ export function runStoreDiscoveryPipelineTests(): { passed: number; failed: numb
       .map((x) => x.id)
       .join(',') === 'a,b',
     'orderByProgress: a never-visited record outranks a visited one regardless of input order',
+  );
+
+  // ── Search battery: the cap must defer cells, never starve them ────────────
+  // At the full default scope the grid is 9 verticals x 12 markets x 15 terms =
+  // 1620 cells against a 600-request (300-cell) budget, so MOST of the grid is
+  // deferred on any one run. That is only correct if the deferred cells are the
+  // ones that run next time.
+  const cell = (vertical: string, market: string, term: string): SearchCell => ({ vertical, market, term });
+  check(
+    searchCellKey(cell('finance', 'us', 'loan app')) === 'finance|us|loan app',
+    'search key: (vertical, market, term) triple is the rotation key',
+  );
+  check(
+    searchCellKey(cell('finance', 'us', 'a')) !== searchCellKey(cell('finance', 'gb', 'a')),
+    'search key: same term in two markets is two distinct cells',
+  );
+  check(
+    searchCellKey(cell('games', 'us', 'a')) !== searchCellKey(cell('finance', 'us', 'a')),
+    'search key: same term under two verticals is two distinct cells',
+  );
+
+  // Build a miniature grid and sweep it with a budget far below its size.
+  const grid: SearchCell[] = [];
+  for (const v of ['finance', 'games']) {
+    for (const m of ['us', 'gb', 'de']) {
+      for (const t of ['t1', 't2']) grid.push(cell(v, m, t));
+    }
+  }
+  const searchedTimes = new Map<string, number>();
+  const sweep = (clock: number, budgetCells: number): string[] => {
+    const picked = orderByProgress(grid, searchCellKey, searchedTimes)
+      .slice(0, budgetCells)
+      .map(searchCellKey);
+    picked.forEach((k, i) => searchedTimes.set(k, clock + i));
+    return picked;
+  };
+  const s1 = sweep(1_000, 4);
+  const s2 = sweep(2_000, 4);
+  const s3 = sweep(3_000, 4);
+  check(grid.length === 12, 'search grid: 2 verticals x 3 markets x 2 terms = 12 cells');
+  check(new Set([...s1, ...s2, ...s3]).size === 12, 'search rotation: three capped runs cover the whole grid exactly once');
+  check(s1.every((k) => !s2.includes(k)), 'search rotation: run 2 repeats nothing from run 1');
+  check(s2.every((k) => !s3.includes(k)), 'search rotation: run 3 repeats nothing from run 2');
+  // A fourth run wraps around to the oldest cells rather than stalling.
+  const s4 = sweep(4_000, 4);
+  check(s4.join(',') === s1.join(','), 'search rotation: a swept grid comes round again oldest-first');
+  // Every market and every vertical is reached — the starvation this guards.
+  const reached = new Set([...s1, ...s2, ...s3].map((k) => k.split('|').slice(0, 2).join('|')));
+  check(reached.size === 6, 'search rotation: every (vertical, market) pair is reached, none starved');
+
+  // ── Liveness sweep: an inconclusive answer must never tombstone an app ─────
+  check(livenessAction('gone') === 'mark_gone', 'liveness: a definitive not-found tombstones the app');
+  check(livenessAction('live') === 'mark_live', 'liveness: a definitive hit refreshes the checked-at stamp');
+  check(livenessAction('unknown') === 'skip', 'liveness: an inconclusive answer is never a tombstone');
+  check(
+    (['live', 'gone', 'unknown'] as const).filter((v) => livenessAction(v) === 'mark_gone').length === 1,
+    'liveness: exactly one verdict can delist — a rate-limit cannot wipe live apps',
   );
 
   return { passed, failed: failures.length, failures };

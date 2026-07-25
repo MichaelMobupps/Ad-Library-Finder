@@ -186,8 +186,8 @@ export default function Publishers({ onAuthError }: { onAuthError: (err: unknown
               </>
             ) : (
               <>
-                Run a <strong>Store-First Discovery</strong> job to harvest app-store charts, crawl the long
-                tail, and roll the results up into publishers.
+                Run a <strong>Google Ads - Mobile</strong> job to harvest app-store charts, crawl the long
+                tail, roll the results up into publishers and check each against Ads Transparency.
               </>
             )}
           </p>
