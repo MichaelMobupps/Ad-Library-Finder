@@ -30,12 +30,10 @@ artifacts/api-server/data/
 csv-output/
 artifacts/api-server/csv-output/
 
-# node_modules is fully rebuilt by the deployment build step
-# (`pnpm install && pnpm install:playwright`), so shipping the local 1.1GB copy
-# only inflates the push and increases exposure to registry errors.
-node_modules
-artifacts/api-server/node_modules
-artifacts/dashboard/node_modules
+# Do NOT exclude node_modules here. .replitignore is applied when packaging the
+# final deployment image (after the build step), so excluding it strips the
+# runtime dependencies the build just installed and the server crash-loops with
+# ERR_MODULE_NOT_FOUND at boot.
 
 # Verification sandboxes (scripts/smoke-store-first.mjs, verify-tail-confirm.mjs).
 # Same rule as above — the patterns there match those two literal paths only, so
