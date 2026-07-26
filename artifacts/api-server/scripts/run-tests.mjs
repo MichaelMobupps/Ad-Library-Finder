@@ -15,8 +15,9 @@
  * are listed in NETWORK_MODULES and skipped by default (pass --all to include).
  */
 
-import { readdirSync, readFileSync, existsSync } from 'node:fs';
+import { readdirSync, readFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -83,6 +84,40 @@ console.log(
   `${failedModules.length === 0 ? '✓' : '✗'} ${selected.length - missing.length} modules, ` +
     `${totalPassed} assertions passed, ${totalFailed} failed`,
 );
+
+// Fast-lane gate: needs a REAL sqlite database, so it runs in a throwaway cwd
+// (db.ts resolves data/ relative to the working directory) — that keeps the
+// dev database untouched while still exercising the actual rollup/merge code.
+const flDir = mkdtempSync(path.join(tmpdir(), 'fastlane-'));
+const fastLane = spawnSync(process.execPath, [path.join(ROOT, 'scripts', 'check-fast-lane.mjs')], {
+  cwd: flDir,
+  encoding: 'utf8',
+});
+rmSync(flDir, { recursive: true, force: true });
+if (fastLane.status === 0) {
+  console.log('  ✓ fast lane (provisional publisher ↔ full rollup) invariants hold');
+} else {
+  console.log('  ✗ fast lane INVARIANTS BROKEN');
+  for (const line of `${fastLane.stdout || ''}${fastLane.stderr || ''}`.trim().split('\n')) {
+    if (!/^\[\d{4}-/.test(line)) console.log(`      ${line}`);
+  }
+  failedModules.push('fast-lane');
+}
+
+// Cross-package mirror gate: constants/validators duplicated into the dashboard
+// must behave identically to the server's copy. A unit suite cannot see across
+// the package boundary, so this runs as its own step.
+const mirror = spawnSync(process.execPath, [path.join(ROOT, 'scripts', 'check-lead-mirror.mjs')], {
+  cwd: ROOT,
+  encoding: 'utf8',
+});
+if (mirror.status === 0) {
+  console.log('  ✓ lead-cap mirror (dashboard ↔ server) in sync');
+} else {
+  console.log('  ✗ lead-cap mirror OUT OF SYNC');
+  for (const line of `${mirror.stdout || ''}${mirror.stderr || ''}`.trim().split('\n')) console.log(`      ${line}`);
+  failedModules.push('lead-cap-mirror');
+}
 
 if (failedModules.length > 0) {
   console.error(`✗ failing modules: ${failedModules.join(', ')}`);

@@ -91,6 +91,8 @@ import {
   DEV_CATALOG_MAX_PER_RUN,
   DEV_CATALOG_MAX_APPS_PER_RUN,
   ENRICH_MAX_APPS_PER_RUN,
+  WINNER_ENRICH_MAX_PUBLISHERS,
+  WINNER_ENRICH_APPS_PER_PUBLISHER,
 } from './storeDiscoveryConfig.js';
 import {
   upsertDiscoveredApp,
@@ -106,6 +108,8 @@ import {
   appleArtistsWithContact,
   listPublishersByScore,
   listPublishersForConfirmation,
+  countDoneAppDetails,
+  unenrichedAppsForPlayDevelopers,
   listLivenessCandidates,
   markAppLiveness,
   countDelistedApps,
@@ -114,7 +118,7 @@ import {
 import { expandPlayCategories, playChart, playSimilar, playDeveloper, playSearch, playAppLiveness } from './playSource.js';
 import { appleChart, appleDeveloper, appleSearch, appleLiveness } from './appleSource.js';
 import { enrichApps, type EnrichWorkItem, type EnrichSummary } from './storeEnrich.js';
-import { rollupPublishers } from './publisherRollup.js';
+import { rollupPublishers, rollupProvisionalPlayPublishers, resetFastLaneCache } from './publisherRollup.js';
 import { confirmPublishers, filterUncheckedSince, type ConfirmSummary } from './storeConfirm.js';
 import { scoreAllPublishers } from './publisherScore.js';
 import {
@@ -152,6 +156,9 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
     );
 
     purgeUsEraGeoStamps(onLog);
+    // The fast lane's change detector is module state; clear it so THIS run
+    // never inherits the previous job's "nothing new" verdict.
+    resetFastLaneCache();
 
     // Resume-safety: a STOPPED run may have exported partial leads under this
     // job id (finalizeCancelledStoreJob persists them so the partial CSV is
@@ -285,7 +292,19 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
       quiet = false,
     ): Promise<boolean> => {
       if (!quiet) setJobPhase(job.id, phase, `finding advertisers — ${label}`);
-      rollupPublishers(onLog);
+      // rollup/scoring log at INFO unconditionally. On a 15-second pump that is
+      // two lines a tick forever ("rollup: 0 publishers" x hundreds), which
+      // buries the run's real story. Background passes therefore pass a silent
+      // logger; barrier passes keep the full output.
+      const passLog: OnLog = quiet ? () => {} : onLog;
+      // FAST LANE FIRST. rollupPublishers() only sees ENRICHED apps, so on a cold
+      // corpus it returns 0 publishers however much has been discovered — which
+      // is exactly why a production run sat at "rollup: 0 publishers" for minutes
+      // after harvesting 8,105 apps. This turns Play list-payload identity
+      // (developer + developerId, already in hand) into confirmable publishers
+      // immediately. It merges into the same rows the full rollup produces.
+      rollupProvisionalPlayPublishers(passLog);
+      rollupPublishers(passLog);
 
       const budgetLeft = Math.max(0, params.confirmationMaxApiCalls - confirmSpent);
       const seed = leadHistorySeed();
@@ -368,9 +387,19 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
         confirmTotals.note = confirm.note;
       }
 
+      // ── ENRICH ONLY THE WINNERS ──────────────────────────────────────────
+      // The funnel inversion. A confirmed publisher is a LEAD, and a lead needs
+      // contact details (email/website) that only a detail page carries — but
+      // that is now a handful of fetches for the publishers that actually made
+      // it, instead of ~8,000 for a corpus of which ~20 ever become leads.
+      await enrichConfirmedWinners(passLog);
+      // Re-roll so the freshly fetched emails/websites land on the rows before
+      // they are scored and exported.
+      rollupPublishers(passLog);
+
       // Export EVERY time, so a stop (or a crash) at any later point still has a
       // complete, downloadable CSV sitting on disk for this job.
-      scoreAllPublishers(onLog);
+      scoreAllPublishers(passLog);
       leadsOnTable = exportLeadsSoFar();
       setJobLeadsFound(job.id, leadsOnTable);
       if (!quiet) setJobProgress(job.id, progressBase + progressWidth);
@@ -396,6 +425,54 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
      * and the result is idempotent, so the file on disk is always the complete
      * current answer instead of a partial that a later crash would freeze.
      */
+    /**
+     * Fetch detail pages for CONFIRMED publishers that still have none.
+     *
+     * This is the payoff of the fast lane: confirmation can now happen on
+     * list-payload identity alone, so the expensive 1.2 MB-per-app detail fetch
+     * is spent only on publishers that already proved they advertise. A lead
+     * still needs its email/website, so those apps are enriched here, on demand,
+     * capped per pass so one checkpoint cannot turn into a full enrichment run.
+     *
+     * Draws on the run's SHARED enrichment budget, so this never increases a
+     * run's total fetch count — it re-prioritises it toward leads.
+     */
+    async function enrichConfirmedWinners(passLog: OnLog): Promise<void> {
+      if (enrichSummary.budgetLeft <= 0) return;
+      // A confirmed publisher with no contact details is a lead we cannot ship.
+      // Provisional (fast-lane) rows are exactly these: identity + chart facts
+      // from the list payload, no detail page yet.
+      const needy = leadEligiblePublishers()
+        .filter((p) => p.name && !p.email && !p.website)
+        .slice(0, WINNER_ENRICH_MAX_PUBLISHERS);
+      if (needy.length === 0) return;
+
+      const work: EnrichWorkItem[] = [];
+      const seen = new Set<string>();
+      for (const p of needy) {
+        // Match on the publisher's own name — the same string the list payload
+        // stored in discovered_apps.list_developer.
+        for (const a of unenrichedAppsForPlayDevelopers([p.name], WINNER_ENRICH_APPS_PER_PUBLISHER)) {
+          const k = `${a.app_id}|${a.country}`;
+          if (seen.has(k)) continue;
+          seen.add(k);
+          work.push({ store: 'google_play', app_id: a.app_id, is_chart: false, country: a.country });
+        }
+      }
+      if (work.length === 0) return;
+
+      const budget = Math.min(work.length, enrichSummary.budgetLeft);
+      passLog('info', `winners: enriching ${budget} app(s) across ${needy.length} confirmed publisher(s) for contact details`);
+      const res = await enrichApps(work, passLog, {
+        shouldStop: () => isCancelRequested(job.id),
+        fetchBudget: budget,
+      });
+      // Spend comes out of the run's single pool.
+      enrichSummary.budgetLeft = Math.max(0, enrichSummary.budgetLeft - (budget - res.budgetLeft));
+      enrichSummary.enriched += res.enriched;
+      enrichSummary.requests += res.requests;
+    }
+
     function exportLeadsSoFar(): number {
       const out = rebuildJobLeadExport(job.id, params.maxLeads);
       const firstExport = csvPath == null;
@@ -420,6 +497,7 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
     // IDENTICAL to the old single terminal pass, only the timing moves.
     const PUMP_INTERVAL_MS = 15_000;
     let pumpShutdown = false;
+    let lastEnrichedSeen = -1;
     const pumpDone = (async () => {
       while (!pumpShutdown) {
         // Sleep in 1s slices so cancel/target/shutdown react promptly.
@@ -428,6 +506,14 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
         }
         if (pumpShutdown || leadTargetMet || isCancelRequested(job.id)) break;
         if (confirmSpent >= params.confirmationMaxApiCalls) break; // budget dry — barriers handle the rest
+        // Nothing new enriched AND nothing new to confirm ⇒ a rollup would
+        // reach the identical answer, so skip the tick entirely. One indexed
+        // COUNT instead of loading the whole corpus every 15 seconds.
+        const enrichedNow = countDoneAppDetails();
+        const uncheckedNow = filterUncheckedSince(listPublishersForConfirmation(), runStartTs).length;
+        if (enrichedNow === lastEnrichedSeen && uncheckedNow === 0) continue;
+        lastEnrichedSeen = enrichedNow;
+
         const before = leadsOnTable;
         await queueHarvest('live', 'scraping', 0, 0, true); // quiet: no phase/progress writes
         if (leadsOnTable > before) {
@@ -479,6 +565,10 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
               upsertDiscoveredApp({
                 store: 'google_play', app_id: a.appId, title: a.title, vertical: v.id, country: market,
                 source: 'chart', discovery_depth: 0, chart, rank: i + 1,
+                // Publisher identity rides along in the list payload we already
+                // paid for — this is what the fast lane rolls up, so a charted
+                // publisher is confirmable before any detail page is fetched.
+                list_developer: a.developer, list_developer_id: a.developerId,
               });
             });
             chartRows += apps.length;
@@ -573,7 +663,13 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
             : await appleSearch(cell.term, cell.market, onLog);
         p23tick();
         for (const a of apps) {
-          upsertDiscoveredApp({ store, app_id: a.appId, title: a.title, vertical: cell.vertical, country: cell.market, source: 'search' });
+          upsertDiscoveredApp({
+            store, app_id: a.appId, title: a.title, vertical: cell.vertical, country: cell.market, source: 'search',
+            // Only the Play half carries a stable developerId; the Apple search
+            // shape has no equivalent, and the fast lane is Play-only by design.
+            list_developer: store === 'google_play' ? (a as { developer?: string }).developer : null,
+            list_developer_id: store === 'google_play' ? (a as { developerId?: string }).developerId : null,
+          });
         }
         rows += apps.length;
       }
@@ -625,6 +721,7 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
               // Inherit the seed's vertical so deeper levels stay attributable.
               vertical: seed.vertical,
               source: 'similar', discovery_depth: depth + 1,
+              list_developer: a.developer, list_developer_id: a.developerId,
             });
             if (inserted) {
               newSimilar++;
@@ -1315,6 +1412,10 @@ async function expandDeveloperCatalogs(onLog: OnLog, jobId?: string): Promise<nu
           // CRAWL_COUNTRY: recording us for a de-fetched catalog would point
           // the app's own detail fetch at a storefront it may not exist in.
           store, app_id: a.appId, title: a.title, country: dev.country,
+          // The catalog was fetched FOR this developer, so identity is known
+          // without trusting the row's own (often absent) developer field.
+          list_developer: store === 'google_play' ? (a as { developer?: string }).developer ?? null : null,
+          list_developer_id: store === 'google_play' ? dev.id : null,
           // NO explicit depth: a developer_catalog app is not in the similar
           // graph, so it must take NON_GRAPH_DEPTH. Passing 1 here made every
           // catalog app a depth-1 crawl seed — exactly what the sentinel exists
