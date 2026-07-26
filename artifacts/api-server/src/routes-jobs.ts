@@ -6,13 +6,15 @@ import {
   createJob,
   getJob,
   listJobsForUser,
+  listAllJobsWithUsers,
+  requestJobCancel,
   getLogs,
   getResults,
   ProductType,
   JobSource,
 } from './db.js';
 import { buildCsv, normalizeMaxLeads, LEAD_LIMIT_CHOICES } from './csv.js';
-import { RequestWithUser } from './auth.js';
+import { RequestWithUser, requireAdmin, isAdminUser } from './auth.js';
 import { fetchAppgoblinCategoryList } from './appgoblinScraper.js';
 import {
   GOOGLE_ADS_VERTICALS,
@@ -423,6 +425,31 @@ jobsRouter.get('/', (req, res) => {
   res.json({ jobs: listJobsForUser(user.id) });
 });
 
+// GET /api/jobs/activity — ADMIN ONLY: every user's jobs (running + history) with
+// the creator's identity, for the Activity view. Defined BEFORE /:id so Express
+// does not match "activity" as a job id.
+jobsRouter.get('/activity', requireAdmin, (_req: Request, res: Response) => {
+  res.json({ jobs: listAllJobsWithUsers(200) });
+});
+
+// POST /api/jobs/:id/stop — request a mid-run stop. The job's owner can stop
+// their own job; an admin can stop anyone's. Partial results are kept: a pending
+// job cancels instantly, a running one finishes its current step and finalizes
+// with whatever it scraped so far.
+jobsRouter.post('/:id/stop', (req, res) => {
+  const user = (req as RequestWithUser).user!;
+  const job = getJob(req.params.id);
+  if (!job) return res.status(404).json({ error: 'not found' });
+  if (job.created_by_user_id && job.created_by_user_id !== user.id && !isAdminUser(user)) {
+    return res.status(404).json({ error: 'not found' });
+  }
+  const ok = requestJobCancel(job.id);
+  if (!ok) {
+    return res.status(409).json({ error: `job is already ${job.status} — nothing to stop` });
+  }
+  res.json({ job: getJob(job.id) });
+});
+
 // GET /api/jobs/appgoblin-categories — list the real AppGoblin category slugs.
 // Cached for 1h in the scraper module. Returns [{id,name,android,ios,total_apps}].
 // Defined BEFORE /:id so Express does not match "appgoblin-categories" as an id.
@@ -469,13 +496,14 @@ jobsRouter.get('/store-first-config', (_req: Request, res: Response) => {
 // store_app_detail / publishers are a SHARED corpus with no owner column, and the
 // whole point is that every run enriches one accumulating graph (the enrichment
 // cache, the publisher merge and the lead dedupe all depend on it being shared).
-// The router is behind requireAuth, so this is staff-only, not public.
+// ADMIN-ONLY since the UI simplification: the Publishers view is an admin tool,
+// so the data endpoints behind it are locked to admins too (requireAdmin).
 //
 // Filters arrive as query params and are applied to the FULL table by
 // buildPublishersPage; `publishers` is the capped top slice of the matches,
 // `total`/`totalUnfiltered` are the real counts. Callers that pass no params
 // still get the top PUBLISHERS_PAGE_LIMIT rows by score, as before.
-jobsRouter.get('/publishers', (req: Request, res: Response) => {
+jobsRouter.get('/publishers', requireAdmin, (req: Request, res: Response) => {
   const page = buildPublishersPage(listPublishersByScore(1_000_000), req.query);
   res.json({
     ...page,
@@ -492,7 +520,7 @@ jobsRouter.get('/publishers', (req: Request, res: Response) => {
 
 // GET /api/jobs/publishers.csv — Prospector export of the publisher table
 // (score desc), honouring the same filter query params as the Publishers view.
-jobsRouter.get('/publishers.csv', (req: Request, res: Response) => {
+jobsRouter.get('/publishers.csv', requireAdmin, (req: Request, res: Response) => {
   // Deliberately NO dedupe of any kind here — neither the lead-history seed (the
   // pipeline persists everything it exports into job_results, so seeding history
   // would make this download empty) nor the batch dedupe (two distinct publisher

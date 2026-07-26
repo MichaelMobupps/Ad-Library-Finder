@@ -33,12 +33,15 @@ import {
   markJobRunning,
   markJobCompleted,
   markJobFailed,
+  markJobCancelled,
   setJobPhase,
   setJobHqZipPath,
+  setJobLeadsFound,
   getJob,
   deferJob,
   type JobRow,
 } from './db.js';
+import { JobCancelledError, throwIfCancelled } from './jobControl.js';
 import { BudgetExceededError, nextJerusalemMidnightMs, DAILY_CAP_USD } from './llmBudget.js';
 import { scrapeAppgoblin, type AppgoblinApp } from './appgoblinScraper.js';
 import { buildCsv } from './csv.js';
@@ -137,6 +140,7 @@ export async function runAppgoblinJob(job: JobRow): Promise<void> {
       onLog('warn', 'appgoblin: 0 apps discovered; check the category slug or ad-network domain');
     }
 
+    throwIfCancelled(job.id);
     setJobPhase(job.id, 'classifying', `${scrape.apps.length} apps to classify`);
 
     let inserted = 0;
@@ -158,7 +162,9 @@ export async function runAppgoblinJob(job: JobRow): Promise<void> {
         country: informationalCountry,
       });
       inserted++;
+      if (inserted % 10 === 0) setJobLeadsFound(job.id, inserted); // live counter
     }
+    setJobLeadsFound(job.id, inserted);
     onLog('info', `appgoblin: inserted ${inserted} rows (skipped ${skippedNoStore} with unknown store)`);
 
     setJobPhase(job.id, 'building_csv', `writing CSV (${inserted} rows)`);
@@ -202,6 +208,18 @@ export async function runAppgoblinJob(job: JobRow): Promise<void> {
         .catch((e) => onLog('warn', `notification error: ${(e as Error).message}`));
     }
   } catch (err) {
+    if (err instanceof JobCancelledError) {
+      let csvPath: string | null = null;
+      let kept = 0;
+      try {
+        const partial = buildCsv({ jobId: job.id, productType: job.product_type, results: getResults(job.id) });
+        csvPath = partial.path;
+        kept = partial.rowsWritten;
+      } catch { /* best-effort */ }
+      markJobCancelled(job.id, `stopped by user — ${kept} lead(s) kept`, csvPath);
+      onLog('warn', `appgoblin job stopped by user — ${kept} partial lead(s) exported`);
+      return;
+    }
     if (err instanceof BudgetExceededError) {
       const runAfter = nextJerusalemMidnightMs();
       const when = new Date(runAfter).toISOString();

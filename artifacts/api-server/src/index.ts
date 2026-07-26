@@ -14,6 +14,7 @@ import { log } from './logger.js';
 import {
   userContextMiddleware,
   requireAuth,
+  isAdminUser,
   RequestWithUser,
 } from './auth.js';
 
@@ -56,6 +57,7 @@ async function main() {
       id: user.id,
       email: user.email,
       name: user.name,
+      isAdmin: isAdminUser(user),
     });
   });
 

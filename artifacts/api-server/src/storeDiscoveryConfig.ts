@@ -28,21 +28,48 @@ function clampInt(v: string | undefined, def: number, min: number, max: number):
 // Markets
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** The full market universe (ISO-3166 alpha-2, lower-case — Apple RSS wants
- *  lower-case; Play/iTunes are case-insensitive). */
-export const ALL_MARKETS = ['us', 'gb', 'de', 'fr', 'in', 'br', 'mx', 'id', 'jp', 'kr', 'tr', 'il'] as const;
+/**
+ * The full market universe (ISO-3166 alpha-2, lower-case — Apple RSS wants
+ * lower-case; Play/iTunes are case-insensitive): ALL global geos except the
+ * obviously irrelevant/embargoed — North Korea, Iran, Syria, Cuba, Antarctica
+ * and uninhabited/micro territories. A market one store does not serve degrades
+ * gracefully (its fetch returns [] and the run moves on), so breadth here is a
+ * SELECTABLE universe, not a promise both stores serve every code.
+ */
+export const ALL_MARKETS = [
+  // Americas
+  'us', 'ca', 'mx', 'gt', 'bz', 'hn', 'sv', 'ni', 'cr', 'pa', 'do', 'ht', 'jm', 'tt', 'bs', 'bb',
+  'ar', 'bo', 'br', 'cl', 'co', 'ec', 'gy', 'py', 'pe', 'sr', 'uy', 've',
+  // Europe
+  'gb', 'ie', 'fr', 'de', 'at', 'ch', 'be', 'nl', 'lu', 'es', 'pt', 'it', 'mt', 'gr', 'cy',
+  'dk', 'se', 'no', 'fi', 'is', 'ee', 'lv', 'lt', 'pl', 'cz', 'sk', 'hu', 'si', 'hr', 'ba',
+  'rs', 'me', 'mk', 'al', 'ro', 'bg', 'md', 'ua', 'by', 'ru',
+  // Middle East
+  'il', 'tr', 'sa', 'ae', 'qa', 'kw', 'bh', 'om', 'jo', 'lb', 'iq', 'eg', 'ye',
+  // Africa
+  'za', 'ng', 'ke', 'gh', 'tz', 'ug', 'ci', 'sn', 'cm', 'ma', 'dz', 'tn', 'ly', 'et', 'zm',
+  'zw', 'mu', 'mz', 'ao', 'bw', 'na', 'rw', 'cd',
+  // Asia
+  'in', 'pk', 'bd', 'lk', 'np', 'af', 'mm', 'th', 'vn', 'kh', 'la', 'my', 'sg', 'id', 'ph',
+  'bn', 'cn', 'hk', 'tw', 'mo', 'jp', 'kr', 'kz', 'uz', 'kg', 'mn', 'ge', 'am', 'az',
+  // Oceania
+  'au', 'nz', 'fj', 'pg',
+] as const;
 export type Market = (typeof ALL_MARKETS)[number];
 
 /**
- * Markets a run touches when the job does not name its own — the FULL universe.
+ * Markets a run touches when the job does not name its own — a CURATED
+ * high-value default, NOT the full universe.
  *
- * Every phase downstream is either request-capped (similar crawl, search battery,
- * enrichment, developer catalogs, confirmation) or cheap enough to run in full
- * (charts), and each capped phase rotates least-recently-visited work to the
- * front, so widening the default market set widens COVERAGE without widening any
- * single run's cost. A narrower set is still available per job via source_params.
+ * The capped phases (similar crawl, search battery, enrichment, catalogs,
+ * confirmation) rotate least-recently-visited first, so widening only widens
+ * coverage there — but the CHART harvest runs in full per (vertical x market),
+ * and at ~60 throttled store requests per market the full 130+ market universe
+ * would turn the chart phase alone into hours. The default therefore stays the
+ * original 12-market core; a job that names its own markets (the UI country
+ * picker) can select ANY subset of ALL_MARKETS, accepting the longer run.
  */
-export const DEFAULT_ACTIVE_MARKETS: Market[] = [...ALL_MARKETS];
+export const DEFAULT_ACTIVE_MARKETS: Market[] = ['us', 'gb', 'de', 'fr', 'in', 'br', 'mx', 'id', 'jp', 'kr', 'tr', 'il'];
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Vertical map — Play category token + Apple genre id
@@ -472,7 +499,13 @@ export function runStoreConfigTests(): { passed: number; failed: number; failure
     else failures.push(`FAIL: ${desc}`);
   };
 
-  check(ALL_MARKETS.length === 12, 'markets: 12 in universe');
+  // Global universe: all geos minus the embargoed/irrelevant exclusions.
+  check(ALL_MARKETS.length >= 100, `markets: global universe (got ${ALL_MARKETS.length})`);
+  check(new Set(ALL_MARKETS).size === ALL_MARKETS.length, 'markets: no duplicate codes');
+  check(ALL_MARKETS.every((m) => /^[a-z]{2}$/.test(m)), 'markets: all lower-case ISO alpha-2');
+  for (const excluded of ['kp', 'ir', 'sy', 'cu', 'aq']) {
+    check(!(ALL_MARKETS as readonly string[]).includes(excluded), `markets: ${excluded} stays excluded (embargoed/irrelevant)`);
+  }
   check(DEFAULT_ACTIVE_MARKETS.every((m) => (ALL_MARKETS as readonly string[]).includes(m)), 'default markets ⊆ universe');
   check(VERTICALS.length === 9, 'verticals: 9 defined');
   check(verticalById('finance')?.appleGenre === '6015', 'finance apple genre 6015');
@@ -493,9 +526,13 @@ export function runStoreConfigTests(): { passed: number; failed: number; failure
   // means every retune breaks a test that was not testing the retune.
   check(d.verticals.join(',') === DEFAULT_ACTIVE_VERTICALS.join(','), 'params: absent verticals → configured default');
   check(d.markets.join(',') === DEFAULT_ACTIVE_MARKETS.join(','), 'params: absent markets → configured default');
-  // The scope itself is pinned separately, because "all geos, all verticals" is
-  // the intent and a silent narrowing of it is a real regression.
-  check(DEFAULT_ACTIVE_MARKETS.length === ALL_MARKETS.length, 'scope: every market is active by default');
+  // The scope itself is pinned separately. Markets: the default is deliberately
+  // the curated 12-market core (the chart harvest is uncapped per market, so
+  // "all 130+ by default" would make every unpinned run take hours) while the
+  // UNIVERSE is global — the UI picker exposes all of it per job. Verticals:
+  // all of them, unchanged.
+  check(DEFAULT_ACTIVE_MARKETS.length === 12, 'scope: default markets stay the curated 12-market core');
+  check(ALL_MARKETS.length > DEFAULT_ACTIVE_MARKETS.length, 'scope: the selectable universe is wider than the default');
   check(DEFAULT_ACTIVE_VERTICALS.length === VERTICALS.length, 'scope: every vertical is active by default');
   check(DEFAULT_ACTIVE_VERTICALS.includes('games'), 'scope: games (and its GAME_* subcategories) is active by default');
   check(

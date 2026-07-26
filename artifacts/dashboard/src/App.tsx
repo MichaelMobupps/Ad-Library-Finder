@@ -1,30 +1,28 @@
 import { useEffect, useState, useCallback } from 'react';
 import {
   api,
-  LEAD_LIMIT_CHOICES,
   Job,
   JobLog,
-  ProductType,
-  JobSource,
+  ActivityJob,
   JobPhase,
   Settings,
   Me,
-  AppgoblinCategory,
-  GoogleAdsMeta,
-  StoreFirstConfig,
-  CreateJobOptions,
   AuthRequiredError,
   derivePhase,
   phaseLabel,
+  jobIsStoppable,
+  jobMaxLeads,
   PHASE_STEPS,
 } from './api/client';
 import Publishers from './Publishers';
+import GoogleAdsForm from './GoogleAdsForm';
 
 type View =
   | { kind: 'publishers' }
   | { kind: 'list' }
   | { kind: 'new' }
   | { kind: 'detail'; id: string }
+  | { kind: 'activity' }
   | { kind: 'settings' };
 type AuthState = { kind: 'loading' } | { kind: 'anon' } | { kind: 'signed-in'; me: Me };
 
@@ -81,8 +79,9 @@ function LoginScreen() {
 // -------- Authed app shell --------
 
 function AuthedApp({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
-  // Publishers is the primary view (store-first is the discovery engine).
-  const [view, setView] = useState<View>({ kind: 'publishers' });
+  // The unified Google Ads form is the landing view — the one thing every user
+  // needs. Publishers (the admin corpus browser) moved behind the admin flag.
+  const [view, setView] = useState<View>({ kind: 'new' });
   const [jobs, setJobs] = useState<Job[]>([]);
   const [settings, setSettings] = useState<Settings | null>(null);
 
@@ -144,20 +143,35 @@ function AuthedApp({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
         </div>
         <nav>
           <button
-            className={`nav-btn ${view.kind === 'publishers' ? 'active' : ''}`}
-            onClick={() => setView({ kind: 'publishers' })}
-            title="Google Ads - Mobile results — the primary view"
+            className={`nav-btn ${view.kind === 'new' ? 'active' : ''}`}
+            onClick={() => setView({ kind: 'new' })}
+            title="Find Mobile or CPS leads from Google Ads — the one unified search"
           >
-            Publishers
+            Google Ads
           </button>
           <button className={`nav-btn ${view.kind === 'list' ? 'active' : ''}`} onClick={() => setView({ kind: 'list' })}>
-            Jobs
+            My Jobs
           </button>
+          {me.isAdmin && (
+            <button
+              className={`nav-btn ${view.kind === 'publishers' ? 'active' : ''}`}
+              onClick={() => setView({ kind: 'publishers' })}
+              title="The discovered-publisher corpus (admin only)"
+            >
+              Publishers
+            </button>
+          )}
+          {me.isAdmin && (
+            <button
+              className={`nav-btn ${view.kind === 'activity' ? 'active' : ''}`}
+              onClick={() => setView({ kind: 'activity' })}
+              title="All users' scraping jobs — running and past (admin only)"
+            >
+              Activity
+            </button>
+          )}
           <button className={`nav-btn ${view.kind === 'settings' ? 'active' : ''}`} onClick={() => setView({ kind: 'settings' })}>
             Settings
-          </button>
-          <button className={`nav-btn primary ${view.kind === 'new' ? 'active' : ''}`} onClick={() => setView({ kind: 'new' })}>
-            + New Job
           </button>
           <span className="nav-user" style={{ marginLeft: 16, color: 'var(--text-mute)', fontSize: 13 }}>
             {me.email}
@@ -167,22 +181,23 @@ function AuthedApp({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
       </header>
 
       <main>
-        {view.kind === 'publishers' && <Publishers onAuthError={handleAuthError} />}
+        {view.kind === 'publishers' && me.isAdmin && <Publishers onAuthError={handleAuthError} />}
         {view.kind === 'list' && (
           <JobsList
             jobs={jobs}
             onSelect={(id) => setView({ kind: 'detail', id })}
             onNew={() => setView({ kind: 'new' })}
+            onChanged={refresh}
           />
         )}
+        {view.kind === 'activity' && me.isAdmin && <ActivityView onAuthError={handleAuthError} />}
         {view.kind === 'new' && (
-          <NewJob
+          <GoogleAdsForm
             settings={settings}
             onCreated={() => {
               refresh();
               setView({ kind: 'list' });
             }}
-            onCancel={() => setView({ kind: 'list' })}
           />
         )}
         {view.kind === 'detail' && <JobDetail id={view.id} onBack={() => setView({ kind: 'list' })} />}
@@ -206,15 +221,70 @@ function sourceLabel(source: string | null | undefined): string {
   return SOURCE_LABELS[s] || s.toUpperCase();
 }
 
+// -------- Stop button (shared by Jobs list, Job detail, Activity) --------
+
+function StopButton({ job, onStopped, small }: { job: Job; onStopped: () => void; small?: boolean }) {
+  const [stopping, setStopping] = useState(false);
+  if (!jobIsStoppable(job)) return null;
+  const stop = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!confirm('Stop this scraping job? Everything found so far is kept and exported.')) return;
+    setStopping(true);
+    try {
+      await api.stopJob(job.id);
+      onStopped();
+    } catch (err) {
+      alert(`Could not stop the job: ${(err as Error).message}`);
+    } finally {
+      setStopping(false);
+    }
+  };
+  return (
+    <button
+      className={`btn danger ${small ? 'small' : ''}`}
+      onClick={stop}
+      disabled={stopping}
+      title="Stop this job — leads found so far are kept"
+    >
+      {stopping ? 'Stopping…' : '■ Stop'}
+    </button>
+  );
+}
+
+/** Live "leads so far" cell: counter while running, final count when done. */
+function LeadsCell({ job }: { job: Job }) {
+  const active = job.status === 'pending' || job.status === 'running';
+  const n = active ? job.leads_found : job.total_advertisers || job.leads_found;
+  const cap = jobMaxLeads(job);
+  if (!active) return <>{n || '—'}</>;
+  return (
+    <span className="leads-live" title="Leads found so far — updates live">
+      <span className="leads-live-dot" />
+      {n}
+      {cap ? <span className="muted"> / {cap}</span> : null}
+    </span>
+  );
+}
+
 // -------- Jobs List --------
 
-function JobsList({ jobs, onSelect, onNew }: { jobs: Job[]; onSelect: (id: string) => void; onNew: () => void }) {
+function JobsList({
+  jobs,
+  onSelect,
+  onNew,
+  onChanged,
+}: {
+  jobs: Job[];
+  onSelect: (id: string) => void;
+  onNew: () => void;
+  onChanged: () => void;
+}) {
   if (jobs.length === 0) {
     return (
       <div className="empty">
-        <p className="empty-title">No jobs yet</p>
-        <p className="empty-sub">Run Google Ads - Mobile, or a scrape from Meta Ad Library, Affplus, AppGoblin, or Google Ads Transparency.</p>
-        <button className="btn primary" onClick={onNew}>+ New Job</button>
+        <p className="empty-title">No searches yet</p>
+        <p className="empty-sub">Start a Google Ads search — pick Mobile or CPS, your countries and how many leads you want.</p>
+        <button className="btn primary" onClick={onNew}>🔍 New search</button>
       </div>
     );
   }
@@ -234,7 +304,7 @@ function JobsList({ jobs, onSelect, onNew }: { jobs: Job[]; onSelect: (id: strin
             <th>Countries</th>
             <th>Status</th>
             <th>Phase</th>
-            <th>Found</th>
+            <th>Leads</th>
             <th>Recipient</th>
             <th>Created</th>
             <th></th>
@@ -251,15 +321,16 @@ function JobsList({ jobs, onSelect, onNew }: { jobs: Job[]; onSelect: (id: strin
               <td className="small">
                 <RowPhaseCell job={j} />
               </td>
-              <td className="mono">{j.total_advertisers || '—'}</td>
+              <td className="mono"><LeadsCell job={j} /></td>
               <td className="small muted">{j.recipient_email || '(default)'}</td>
               <td className="small">{new Date(j.created_at).toLocaleString()}</td>
-              <td>
-                {j.status === 'completed' && (
-                  <a href={api.csvUrl(j.id)} className="btn small" onClick={(e) => e.stopPropagation()}>
+              <td onClick={(e) => e.stopPropagation()}>
+                {(j.status === 'completed' || j.status === 'cancelled') && j.csv_path && (
+                  <a href={api.csvUrl(j.id)} className="btn small">
                     Download CSV
                   </a>
                 )}
+                <StopButton job={j} onStopped={onChanged} small />
               </td>
             </tr>
           ))}
@@ -283,586 +354,6 @@ function RowPhaseCell({ job }: { job: Job }) {
       <span className="phase-pill-dot" />
       <span className="phase-pill-label">{phaseLabel(phase)}</span>
     </span>
-  );
-}
-
-// -------- New Job --------
-
-function NewJob({
-  settings,
-  onCreated,
-  onCancel,
-}: {
-  settings: Settings | null;
-  onCreated: () => void;
-  onCancel: () => void;
-}) {
-  const [source, setSource] = useState<JobSource>('meta');
-  const [countriesText, setCountriesText] = useState('US, BR, IN');
-  const [productTypes, setProductTypes] = useState<ProductType[]>(['mobile']);
-  const [recipientEmail, setRecipientEmail] = useState('');
-  // Lead cap for the two high-volume sources. null = "as many as found".
-  const [maxLeads, setMaxLeads] = useState<number | null>(null);
-  // Only the two Google Ads sources routinely return hundreds of leads; the
-  // others are already small, so offering a cap there would be noise.
-  const leadCapApplies = source === 'google_ads' || source === 'store_first';
-  const [submitting, setSubmitting] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  // AppGoblin discovery state
-  const [appgoblinCategory, setAppgoblinCategory] = useState<string>('');
-  const [appgoblinAdNetwork, setAppgoblinAdNetwork] = useState<string>('');
-  const [agCategories, setAgCategories] = useState<AppgoblinCategory[] | null>(null);
-  const [agCategoriesError, setAgCategoriesError] = useState<string | null>(null);
-  const [agCategoriesLoading, setAgCategoriesLoading] = useState(false);
-
-  // Store-first discovery state. Markets come from the store config (not the
-  // Countries field, which is only CSV metadata for this source).
-  const [sfVerticals, setSfVerticals] = useState<string[]>([]);
-  const [sfMarkets, setSfMarkets] = useState<string[]>([]);
-  const [sfSimilarMax, setSfSimilarMax] = useState<number>(5000);
-  const [sfSearchTerms, setSfSearchTerms] = useState<number>(15);
-  const [sfConfirmMax, setSfConfirmMax] = useState<number>(200);
-  const [sfConfig, setSfConfig] = useState<StoreFirstConfig | null>(null);
-  const [sfConfigError, setSfConfigError] = useState<string | null>(null);
-  const [sfConfigLoading, setSfConfigLoading] = useState(false);
-
-  // Google Ads Transparency discovery state
-  const [gaVerticals, setGaVerticals] = useState<string[]>([]);
-  const [gaLanguages, setGaLanguages] = useState<string[]>([]); // empty = all languages
-  const [gaMaxKeywords, setGaMaxKeywords] = useState<number>(40);
-  const [gaCustomKeywords, setGaCustomKeywords] = useState<string>('');
-  const [gaMeta, setGaMeta] = useState<GoogleAdsMeta | null>(null);
-  const [gaMetaError, setGaMetaError] = useState<string | null>(null);
-  const [gaMetaLoading, setGaMetaLoading] = useState(false);
-
-  // Lazy-load AppGoblin category list when user picks AppGoblin source.
-  useEffect(() => {
-    if (source !== 'appgoblin') return;
-    if (agCategories !== null) return; // already loaded
-    setAgCategoriesLoading(true);
-    setAgCategoriesError(null);
-    api.appgoblinCategories()
-      .then((cats) => {
-        setAgCategories(cats);
-        // Default to game_casino if present (the recon-confirmed slug); else first.
-        if (cats.length > 0 && !appgoblinCategory) {
-          const def = cats.find((c) => c.id === 'game_casino') || cats[0];
-          setAppgoblinCategory(def.id);
-        }
-      })
-      .catch((err) => setAgCategoriesError((err as Error).message))
-      .finally(() => setAgCategoriesLoading(false));
-  }, [source, agCategories, appgoblinCategory]);
-
-  // Lazy-load Google Ads vertical/language metadata when that source is picked.
-  useEffect(() => {
-    if (source !== 'google_ads') return;
-    if (gaMeta !== null) return;
-    setGaMetaLoading(true);
-    setGaMetaError(null);
-    api.googleAdsMeta()
-      .then((m) => setGaMeta(m))
-      .catch((err) => setGaMetaError((err as Error).message))
-      .finally(() => setGaMetaLoading(false));
-  }, [source, gaMeta]);
-
-  // Lazy-load the store-first vertical/market config when that source is picked,
-  // and seed the form with the spec's default active vertical + markets.
-  useEffect(() => {
-    if (source !== 'store_first') return;
-    if (sfConfig !== null) return;
-    setSfConfigLoading(true);
-    setSfConfigError(null);
-    api.storeFirstConfig()
-      .then((c) => {
-        setSfConfig(c);
-        setSfVerticals((prev) => (prev.length ? prev : c.defaults.verticals));
-        setSfMarkets((prev) => (prev.length ? prev : c.defaults.markets));
-      })
-      .catch((err) => setSfConfigError((err as Error).message))
-      .finally(() => setSfConfigLoading(false));
-  }, [source, sfConfig]);
-
-  const toggleSfVertical = (id: string) => {
-    setSfVerticals((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
-  };
-  const toggleSfMarket = (m: string) => {
-    setSfMarkets((prev) => (prev.includes(m) ? prev.filter((x) => x !== m) : [...prev, m]));
-  };
-
-  const toggleType = (pt: ProductType) => {
-    setProductTypes((prev) => (prev.includes(pt) ? prev.filter((x) => x !== pt) : [...prev, pt]));
-  };
-
-  const toggleGaVertical = (id: string) => {
-    setGaVerticals((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
-  };
-  const toggleGaLanguage = (code: string) => {
-    setGaLanguages((prev) => (prev.includes(code) ? prev.filter((x) => x !== code) : [...prev, code]));
-  };
-
-  // Product type is not a free choice per source: AppGoblin and Google Ads -
-  // Mobile (store_first) are mobile-only, Google Ads Transparency is CPS-only.
-  // Forcing it here keeps the form from submitting a combination the API rejects.
-  const handleSourceChange = (s: JobSource) => {
-    setSource(s);
-    if (s === 'appgoblin' || s === 'store_first') setProductTypes(['mobile']);
-    else if (s === 'google_ads') setProductTypes(['cps']);
-  };
-
-  const submit = async () => {
-    setError(null);
-    const countries = countriesText.split(/[,\s]+/).map((s) => s.trim().toUpperCase()).filter(Boolean);
-    if (countries.length === 0) {
-      setError('Add at least one country code');
-      return;
-    }
-    if (productTypes.length === 0) {
-      setError('Pick at least one product type');
-      return;
-    }
-    if (source === 'appgoblin') {
-      if (productTypes.some((pt) => pt !== 'mobile')) {
-        setError('AppGoblin source supports Mobile only');
-        return;
-      }
-      const cat = appgoblinCategory.trim();
-      const adn = appgoblinAdNetwork.trim();
-      if (!cat && !adn) {
-        setError('AppGoblin: pick a category and/or enter an ad-network domain');
-        return;
-      }
-      if (adn && !/^[a-z0-9.-]+\.[a-z]{2,}$/i.test(adn)) {
-        setError('AppGoblin ad-network must be a domain like "appsflyer.com"');
-        return;
-      }
-    }
-    let storeFirst: CreateJobOptions['storeFirst'] = undefined;
-    if (source === 'store_first') {
-      if (productTypes.some((pt) => pt !== 'mobile')) {
-        setError('Google Ads - Mobile supports Mobile only');
-        return;
-      }
-      if (sfVerticals.length === 0) {
-        setError('Google Ads - Mobile: pick at least one vertical');
-        return;
-      }
-      if (sfMarkets.length === 0) {
-        setError('Google Ads - Mobile: pick at least one market');
-        return;
-      }
-      storeFirst = {
-        verticals: sfVerticals,
-        markets: sfMarkets,
-        similarMaxAppsPerRun: sfSimilarMax,
-        searchTermsLimit: sfSearchTerms,
-        confirmationMaxApiCalls: sfConfirmMax,
-      };
-    }
-    let googleAds: CreateJobOptions['googleAds'] = undefined;
-    if (source === 'google_ads') {
-      const custom = gaCustomKeywords
-        .split(/[\n,]+/)
-        .map((k) => k.trim())
-        .filter(Boolean);
-      googleAds = {
-        verticals: gaVerticals.length ? gaVerticals : null,
-        languages: gaLanguages.length ? gaLanguages : null,
-        maxKeywords: gaMaxKeywords > 0 ? gaMaxKeywords : null,
-        customKeywords: custom.length ? custom : null,
-        region: null,
-      };
-    }
-
-    setSubmitting(true);
-    try {
-      await api.createJobs({
-        countries,
-        productTypes,
-        recipientEmail: recipientEmail.trim() || null,
-        source,
-        appgoblinCategory: source === 'appgoblin' ? (appgoblinCategory.trim() || null) : undefined,
-        appgoblinAdNetwork: source === 'appgoblin' ? (appgoblinAdNetwork.trim() || null) : undefined,
-        googleAds,
-        storeFirst,
-        maxLeads: leadCapApplies ? maxLeads : null,
-      });
-      onCreated();
-    } catch (err) {
-      setError((err as Error).message);
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  const effectiveRecipient = recipientEmail.trim() || settings?.defaultRecipient || '(none configured)';
-
-  return (
-    <div className="panel form-panel">
-      <div className="panel-head">
-        <h2>New Job</h2>
-        <button className="btn ghost" onClick={onCancel}>Cancel</button>
-      </div>
-
-      <div className="form-row">
-        <label>Source</label>
-        <div className="checkbox-row">
-          <label className="checkbox">
-            <input
-              type="radio"
-              name="source"
-              checked={source === 'store_first'}
-              onChange={() => handleSourceChange('store_first')}
-            />
-            <span>
-              Google Ads - Mobile{' '}
-              <span className="muted">(app publishers + Ads Transparency check, one run → Excel)</span>
-            </span>
-          </label>
-          <label className="checkbox">
-            <input
-              type="radio"
-              name="source"
-              checked={source === 'meta'}
-              onChange={() => handleSourceChange('meta')}
-            />
-            <span>Meta Ad Library <span className="muted">(Facebook ads → landing URLs)</span></span>
-          </label>
-          <label className="checkbox">
-            <input
-              type="radio"
-              name="source"
-              checked={source === 'affplus'}
-              onChange={() => handleSourceChange('affplus')}
-            />
-            <span>Affplus <span className="muted">(affiliate offer directory)</span></span>
-          </label>
-          <label className="checkbox">
-            <input
-              type="radio"
-              name="source"
-              checked={source === 'appgoblin'}
-              onChange={() => handleSourceChange('appgoblin')}
-            />
-            <span>AppGoblin <span className="muted">(apps by category / ad-network; Mobile only)</span></span>
-          </label>
-          <label className="checkbox">
-            <input
-              type="radio"
-              name="source"
-              checked={source === 'google_ads'}
-              onChange={() => handleSourceChange('google_ads')}
-            />
-            <span>
-              Google Ads Transparency{' '}
-              <span className="muted">(secondary — advertiser search by keyword; Mobile + CPS)</span>
-            </span>
-          </label>
-        </div>
-        <p className="form-hint">
-          <strong>Google Ads - Mobile</strong> is one search, end to end: it harvests Play + App Store charts,
-          crawls the long tail via similar-apps, developer catalogs and store search, rolls the apps up into
-          publishers with the contact email the Play listing publishes, then <em>automatically</em> checks each
-          publisher against Google Ads Transparency (and Meta, when configured) to prove it is actively
-          advertising — and writes the CSV and the per-country Excel. One click, one Excel; no second search.
-        </p>
-        <p className="form-hint">
-          Meta scrapes the Facebook Ad Library and classifies landing pages. Affplus lists CPA/CPI mobile
-          offers and verifies each against the Google Play / App Store. AppGoblin discovers real apps by
-          category or by which ad-network/MMP SDK they integrate. Google Ads Transparency is kept as a
-          secondary advertiser view: its search matches advertiser names and verified domains only, caps at
-          100 advertisers per query, and structurally cannot enumerate app advertisers — which is why
-          discovery moved to the stores.
-        </p>
-      </div>
-
-      {source === 'store_first' && (
-        <div className="form-row">
-          <label>Google Ads - Mobile</label>
-          {sfConfigLoading && <div className="muted small">Loading store config…</div>}
-          {sfConfigError && <div className="error" style={{ marginBottom: 6 }}>Store config failed to load: {sfConfigError}</div>}
-          {sfConfig && (
-            <p className="form-hint" style={{ marginTop: 0 }}>
-              Charts: Play <code>{sfConfig.charts.play.join(' + ')}</code>, Apple{' '}
-              <code>{sfConfig.charts.apple.join(' + ')}</code>. Long-tail apps outside the install band{' '}
-              <code>{sfConfig.installBand.min.toLocaleString()}–{sfConfig.installBand.max.toLocaleString()}</code>{' '}
-              are stored but skip enrichment and confirmation; charted apps are exempt.
-            </p>
-          )}
-
-          <div className="muted small" style={{ margin: '8px 0 4px' }}>
-            Verticals ({sfVerticals.length} selected)
-          </div>
-          <div className="checkbox-row" style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8 }}>
-            {(sfConfig?.verticals || []).map((v) => (
-              <label key={v.id} className="checkbox" style={{ marginRight: 10 }}>
-                <input type="checkbox" checked={sfVerticals.includes(v.id)} onChange={() => toggleSfVertical(v.id)} />
-                <span>{v.label}</span>
-              </label>
-            ))}
-          </div>
-
-          <div className="muted small" style={{ margin: '12px 0 4px' }}>
-            Markets ({sfMarkets.length} selected)
-          </div>
-          <div className="checkbox-row" style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6 }}>
-            {(sfConfig?.markets || []).map((m) => (
-              <label key={m} className="checkbox" style={{ marginRight: 8 }}>
-                <input type="checkbox" checked={sfMarkets.includes(m)} onChange={() => toggleSfMarket(m)} />
-                <span className="mono">{m.toUpperCase()}</span>
-              </label>
-            ))}
-          </div>
-
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 12, marginTop: 12 }}>
-            <div>
-              <div className="muted small" style={{ marginBottom: 4 }}>Similar-apps cap / run</div>
-              <input
-                className="input"
-                type="number"
-                min={0}
-                max={50000}
-                value={sfSimilarMax}
-                onChange={(e) => setSfSimilarMax(Math.max(0, Math.min(50000, Number(e.target.value) || 0)))}
-              />
-            </div>
-            <div>
-              <div className="muted small" style={{ marginBottom: 4 }}>Search terms / vertical</div>
-              <input
-                className="input"
-                type="number"
-                min={0}
-                max={15}
-                value={sfSearchTerms}
-                onChange={(e) => setSfSearchTerms(Math.max(0, Math.min(15, Number(e.target.value) || 0)))}
-              />
-            </div>
-            <div>
-              <div className="muted small" style={{ marginBottom: 4 }}>Confirmation API calls / run</div>
-              <input
-                className="input"
-                type="number"
-                min={0}
-                max={10000}
-                value={sfConfirmMax}
-                onChange={(e) => setSfConfirmMax(Math.max(0, Math.min(10000, Number(e.target.value) || 0)))}
-              />
-            </div>
-          </div>
-          <p className="form-hint">
-            The similar-apps crawl expands outward from chart apps up to depth 2. The search battery runs each
-            term against both Play and iTunes search. Confirmation spends paid GATC (and Meta, if the key is
-            set) calls in priority order: charted publishers first, then in-band tail publishers with an email,
-            then the rest. Results land in the <strong>Publishers</strong> tab.
-          </p>
-        </div>
-      )}
-
-      {source === 'appgoblin' && (
-        <div className="form-row">
-          <label>AppGoblin discovery</label>
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
-            <div>
-              <div className="muted small" style={{ marginBottom: 4 }}>Category</div>
-              {agCategoriesLoading && <div className="muted small">Loading categories…</div>}
-              {agCategoriesError && <div className="error" style={{ marginBottom: 6 }}>Category list failed to load: {agCategoriesError}</div>}
-              <select
-                className="input"
-                value={appgoblinCategory}
-                onChange={(e) => setAppgoblinCategory(e.target.value)}
-                disabled={agCategoriesLoading}
-              >
-                <option value="">(no category filter)</option>
-                {(agCategories || []).map((c) => (
-                  <option key={c.id} value={c.id}>
-                    {c.name} ({c.id}) · {c.total_apps.toLocaleString()} apps
-                  </option>
-                ))}
-              </select>
-            </div>
-            <div>
-              <div className="muted small" style={{ marginBottom: 4 }}>Ad-network / MMP domain (optional)</div>
-              <input
-                className="input"
-                value={appgoblinAdNetwork}
-                onChange={(e) => setAppgoblinAdNetwork(e.target.value)}
-                placeholder="e.g. appsflyer.com, adjust.com"
-              />
-            </div>
-          </div>
-          <p className="form-hint">
-            Pick a <strong>category</strong> to discover top ad-network companies in that vertical and pull their top apps.
-            Optionally narrow by an <strong>ad-network domain</strong> (e.g. <code>appsflyer.com</code>) to get apps integrating that
-            specific SDK. If you set the ad-network domain alone, the job returns that company's top iOS+Android apps directly.
-          </p>
-        </div>
-      )}
-
-      {source === 'google_ads' && (
-        <div className="form-row">
-          <label>Google Ads discovery</label>
-          {gaMetaLoading && <div className="muted small">Loading keyword bank…</div>}
-          {gaMetaError && <div className="error" style={{ marginBottom: 6 }}>Keyword bank failed to load: {gaMetaError}</div>}
-          {gaMeta && (
-            <p className="form-hint" style={{ marginTop: 0 }}>
-              Exemplar bank: <strong>{gaMeta.stats.total.toLocaleString()}</strong> keywords across{' '}
-              <strong>{gaMeta.stats.languages}</strong> languages and <strong>{gaMeta.stats.verticals}</strong> verticals.
-              A job draws a well-spread sample (default 40). Leave verticals/languages empty to search across everything.
-            </p>
-          )}
-
-          <div className="muted small" style={{ margin: '8px 0 4px' }}>Verticals ({gaVerticals.length ? `${gaVerticals.length} selected` : 'all'})</div>
-          <div className="checkbox-row" style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8 }}>
-            {(gaMeta?.verticals || []).map((v) => (
-              <label key={v.id} className="checkbox" title={v.hint} style={{ marginRight: 10 }}>
-                <input type="checkbox" checked={gaVerticals.includes(v.id)} onChange={() => toggleGaVertical(v.id)} />
-                <span>{v.label}</span>
-              </label>
-            ))}
-          </div>
-
-          <div className="muted small" style={{ margin: '12px 0 4px' }}>Languages ({gaLanguages.length ? `${gaLanguages.length} selected` : 'all'})</div>
-          <div className="checkbox-row" style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6, maxHeight: 120, overflowY: 'auto' }}>
-            {(gaMeta?.languages || []).map((l) => (
-              <label key={l.code} className="checkbox" style={{ marginRight: 8 }}>
-                <input type="checkbox" checked={gaLanguages.includes(l.code)} onChange={() => toggleGaLanguage(l.code)} />
-                <span>{l.label} <span className="muted">{l.native}</span></span>
-              </label>
-            ))}
-          </div>
-
-          <div style={{ display: 'grid', gridTemplateColumns: '160px 1fr', gap: 12, marginTop: 12, alignItems: 'start' }}>
-            <div>
-              <div className="muted small" style={{ marginBottom: 4 }}>Max keywords / job</div>
-              <input
-                className="input"
-                type="number"
-                min={1}
-                max={500}
-                value={gaMaxKeywords}
-                onChange={(e) => setGaMaxKeywords(Math.max(1, Math.min(500, Number(e.target.value) || 1)))}
-              />
-            </div>
-            <div>
-              <div className="muted small" style={{ marginBottom: 4 }}>Custom keywords (optional — overrides the bank)</div>
-              <textarea
-                className="input"
-                rows={2}
-                value={gaCustomKeywords}
-                onChange={(e) => setGaCustomKeywords(e.target.value)}
-                placeholder="comma or newline separated, e.g. casino, prestamo rapido, 仮想通貨"
-              />
-            </div>
-          </div>
-          <p className="form-hint">
-            Each keyword is one Transparency Center search that returns matching advertisers. More keywords = more
-            leads but a longer job. A keyword does <strong>not</strong> guarantee Mobile vs CPS — the advertiser's
-            ad destination decides that, and both CSVs are HQ-split by country.
-          </p>
-        </div>
-      )}
-
-      <div className="form-row">
-        <label>Countries (ISO 2-letter, comma-separated)</label>
-        <input
-          className="input"
-          value={countriesText}
-          onChange={(e) => setCountriesText(e.target.value)}
-          placeholder="US, BR, IN, ID, MX"
-        />
-        <p className="form-hint">
-          {source === 'store_first'
-            ? 'Google Ads - Mobile ignores this list for discovery — the Markets checkboxes above choose which store fronts are harvested. The country list here is only metadata on the CSV rows.'
-            : source === 'appgoblin'
-            ? 'AppGoblin returns the same apps regardless of country — the country list here is informational metadata on the CSV rows.'
-            : source === 'google_ads'
-              ? 'Google Ads Transparency treats region as metadata, not a hard filter — the country list here tags CSV rows and seeds the informational region. Leads are split by resolved HQ country, not by this list.'
-              : 'Each country is searched independently. More countries = longer job.'}
-        </p>
-      </div>
-
-      <div className="form-row">
-        <label>Product Type</label>
-        <div className="checkbox-row">
-          <label className="checkbox">
-            <input
-              type="checkbox"
-              checked={productTypes.includes('mobile')}
-              onChange={() => toggleType('mobile')}
-              disabled={source === 'google_ads'}
-            />
-            <span>Mobile <span className="muted">(Google Play / iTunes preview URLs)</span></span>
-          </label>
-          <label className="checkbox">
-            <input
-              type="checkbox"
-              checked={productTypes.includes('cps')}
-              onChange={() => toggleType('cps')}
-              disabled={source === 'appgoblin' || source === 'store_first'}
-            />
-            <span>CPS <span className="muted">(web product, website URLs)</span></span>
-          </label>
-        </div>
-        <p className="form-hint">
-          {source === 'appgoblin'
-            ? 'AppGoblin supports Mobile only.'
-            : source === 'store_first'
-              ? 'Google Ads - Mobile discovers app publishers, so it supports Mobile only.'
-              : source === 'google_ads'
-                ? 'Google Ads Transparency is CPS only. For apps use Google Ads - Mobile, which finds the publishers AND checks Ads Transparency in one run.'
-                : 'Selecting both creates two separate jobs (one CSV per type).'}
-        </p>
-      </div>
-
-      {leadCapApplies && (
-        <div className="form-row">
-          <label>How many leads?</label>
-          <div className="checkbox-row">
-            {LEAD_LIMIT_CHOICES.map((n) => (
-              <label className="checkbox" key={n}>
-                <input type="radio" name="maxLeads" checked={maxLeads === n} onChange={() => setMaxLeads(n)} />
-                <span>{n}</span>
-              </label>
-            ))}
-            <label className="checkbox">
-              <input type="radio" name="maxLeads" checked={maxLeads === null} onChange={() => setMaxLeads(null)} />
-              <span>As many as found</span>
-            </label>
-          </div>
-          <p className="form-hint">
-            {source === 'store_first'
-              ? 'Caps the CSV and the Excel to the highest-scoring publishers — best rank, most countries, most Ads Transparency activity first. Discovery still runs in full, so the rest stay in the Publishers tab.'
-              : 'Caps the CSV and the Excel to the first leads found. The scrape still runs in full, so nothing discovered is lost.'}
-          </p>
-        </div>
-      )}
-
-      <div className="form-row">
-        <label>Notification recipient (optional)</label>
-        <input
-          className="input"
-          value={recipientEmail}
-          onChange={(e) => setRecipientEmail(e.target.value)}
-          placeholder={settings?.defaultRecipient || 'leave empty to use default'}
-          type="email"
-        />
-        <p className="form-hint">
-          Email will be sent here when job completes. Effective: <code>{effectiveRecipient}</code>
-          {!settings?.gmailConnected && (
-            <> · <span style={{ color: '#d97706' }}>Your Gmail is not connected — no email will be sent. Connect in Settings.</span></>
-          )}
-        </p>
-      </div>
-
-      {error && <div className="error">{error}</div>}
-
-      <div className="form-actions">
-        <button className="btn primary" onClick={submit} disabled={submitting}>
-          {submitting ? 'Submitting…' : 'Start Job'}
-        </button>
-      </div>
-    </div>
   );
 }
 
@@ -930,6 +421,9 @@ function JobDetail({ id, onBack }: { id: string; onBack: () => void }) {
         <button className="btn ghost" onClick={onBack}>← Back</button>
         <h2 className="mono">{job.id}</h2>
         <StatusBadge status={job.status} />
+        <span style={{ marginLeft: 'auto' }}>
+          <StopButton job={job} onStopped={() => { /* next poll shows the new state */ }} />
+        </span>
       </div>
 
       <PhaseProgress job={job} latestLog={latestLog} isActive={isActive} />
@@ -948,11 +442,16 @@ function JobDetail({ id, onBack }: { id: string; onBack: () => void }) {
         <Field label="Advertisers (CSV)">{job.total_advertisers}</Field>
       </div>
 
-      {job.status === 'completed' && (
+      {(job.status === 'completed' || (job.status === 'cancelled' && job.csv_path)) && (
         <div className="cta-row">
           <a href={api.csvUrl(job.id)} className="btn primary">⬇ Download CSV</a>
           {job.hq_zip_path && (
             <a href={api.hqZipUrl(job.id)} className="btn" style={{ marginLeft: 8 }}>⬇ Excel (by HQ country)</a>
+          )}
+          {job.status === 'cancelled' && (
+            <span className="muted small" style={{ marginLeft: 12 }}>
+              Stopped early — the download contains everything found up to the stop.
+            </span>
           )}
         </div>
       )}
@@ -987,18 +486,24 @@ function PhaseProgress({
 }) {
   const currentPhase: JobPhase = derivePhase(job);
   const isFailed = currentPhase === 'failed';
-  const currentIdx = isFailed ? -1 : PHASE_STEPS.indexOf(currentPhase);
+  const isCancelled = currentPhase === 'cancelled';
+  const currentIdx = isFailed || isCancelled ? -1 : PHASE_STEPS.indexOf(currentPhase);
 
   const description =
     job.phase_detail ||
     (latestLog ? latestLog.message : phaseLabel(currentPhase));
+
+  // Lead progress: leads found so far, against the chosen cap when there is one.
+  const leads = isActive ? job.leads_found : job.total_advertisers || job.leads_found;
+  const cap = jobMaxLeads(job);
+  const pct = cap ? Math.min(100, Math.round((leads / cap) * 100)) : null;
 
   return (
     <div className={`phase-progress ${isActive ? 'phase-active' : ''} ${isFailed ? 'phase-failed' : ''}`}>
       <div className="phase-stepper">
         {PHASE_STEPS.map((step, idx) => {
           const state =
-            isFailed
+            isFailed || isCancelled
               ? 'pending'
               : idx < currentIdx
                 ? 'complete'
@@ -1018,6 +523,21 @@ function PhaseProgress({
           );
         })}
       </div>
+
+      {/* The number the user actually cares about: leads so far, live. */}
+      <div className="leads-progress">
+        <span className="leads-progress-count">
+          {isActive && <span className="leads-live-dot" />}
+          <strong>{leads}</strong>&nbsp;lead{leads === 1 ? '' : 's'}
+          {cap ? <span className="muted"> of {cap} requested</span> : isActive ? <span className="muted"> so far</span> : null}
+        </span>
+        {pct != null && (
+          <span className="leadbar" title={`${pct}% of the requested leads`}>
+            <span className="leadbar-fill" style={{ width: `${pct}%` }} />
+          </span>
+        )}
+      </div>
+
       <div className="phase-description">
         {isActive && <span className="phase-spinner" aria-hidden="true" />}
         <span className="phase-description-label">
@@ -1035,6 +555,122 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
       <span className="field-label">{label}</span>
       <span className="field-value">{children}</span>
     </div>
+  );
+}
+
+// -------- Activity (admin only) --------
+
+/**
+ * Cross-user job monitor: every scraping job on the system — who started it,
+ * what it's doing right now, how many leads it has produced — running jobs
+ * first. Admin can stop any job from here.
+ */
+function ActivityView({ onAuthError }: { onAuthError: (err: unknown) => boolean }) {
+  const [jobs, setJobs] = useState<ActivityJob[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      const list = await api.activity();
+      setJobs(list);
+      setError(null);
+    } catch (err) {
+      if (onAuthError(err)) return;
+      setError((err as Error).message);
+    }
+  }, [onAuthError]);
+
+  useEffect(() => {
+    load();
+    const t = setInterval(load, 5000);
+    return () => clearInterval(t);
+  }, [load]);
+
+  if (error && !jobs) return <div className="error">Could not load activity: {error}</div>;
+  if (!jobs) return <div className="empty"><p>Loading…</p></div>;
+
+  const active = jobs.filter((j) => j.status === 'running' || j.status === 'pending');
+  const past = jobs.filter((j) => j.status !== 'running' && j.status !== 'pending');
+
+  const durationOf = (j: Job): string => {
+    const start = j.started_at ?? j.created_at;
+    const end = j.completed_at ?? Date.now();
+    const mins = Math.max(0, Math.round((end - start) / 60000));
+    if (mins < 60) return `${mins}m`;
+    return `${Math.floor(mins / 60)}h ${mins % 60}m`;
+  };
+
+  const table = (rows: ActivityJob[], live: boolean) => (
+    <table className="jobs-table">
+      <thead>
+        <tr>
+          <th>Started by</th>
+          <th>ID</th>
+          <th>Source</th>
+          <th>Type</th>
+          <th>Status</th>
+          <th>Phase</th>
+          <th>Leads</th>
+          <th>{live ? 'Running for' : 'Duration'}</th>
+          <th>Created</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {rows.map((j) => (
+          <tr key={j.id}>
+            <td className="small">{j.creator_email || <span className="muted">unknown</span>}</td>
+            <td className="mono small">{j.id}</td>
+            <td><span className={`tag tag-${j.source || 'meta'}`}>{sourceLabel(j.source)}</span></td>
+            <td><span className={`tag tag-${j.product_type}`}>{j.product_type.toUpperCase()}</span></td>
+            <td><StatusBadge status={j.status} /></td>
+            <td className="small">
+              {j.status === 'running' ? (
+                <span className="phase-pill" title={j.phase_detail || ''}>
+                  <span className="phase-pill-dot" />
+                  <span className="phase-pill-label">{j.phase_detail || phaseLabel(derivePhase(j))}</span>
+                </span>
+              ) : (
+                <span className="muted">{phaseLabel(derivePhase(j))}</span>
+              )}
+            </td>
+            <td className="mono"><LeadsCell job={j} /></td>
+            <td className="small">{durationOf(j)}</td>
+            <td className="small">{new Date(j.created_at).toLocaleString()}</td>
+            <td><StopButton job={j} onStopped={load} small /></td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+
+  return (
+    <>
+      <div className="panel">
+        <div className="panel-head">
+          <h2>Running now</h2>
+          <span className="panel-meta">{active.length} active job(s) · all users</span>
+        </div>
+        {error && <div className="error">Refresh failed ({error}) — showing the last loaded data.</div>}
+        {active.length === 0 ? (
+          <div className="empty"><p className="empty-title">No scraping jobs are running right now</p></div>
+        ) : (
+          table(active, true)
+        )}
+      </div>
+
+      <div className="panel" style={{ marginTop: 16 }}>
+        <div className="panel-head">
+          <h2>History</h2>
+          <span className="panel-meta">{past.length} past job(s)</span>
+        </div>
+        {past.length === 0 ? (
+          <div className="empty"><p className="empty-title">No past jobs yet</p></div>
+        ) : (
+          table(past, false)
+        )}
+      </div>
+    </>
   );
 }
 

@@ -42,14 +42,17 @@ import {
   markJobRunning,
   markJobCompleted,
   markJobFailed,
+  markJobCancelled,
   setJobPhase,
   setJobHqZipPath,
   setJobCsvPath,
+  setJobLeadsFound,
   setResultCategory,
   getJob,
   deferJob,
   type JobRow,
 } from './db.js';
+import { JobCancelledError, throwIfCancelled, isCancelRequested } from './jobControl.js';
 import { enrichStoreUrls } from './appCategory.js';
 import { BudgetExceededError, nextJerusalemMidnightMs, DAILY_CAP_USD } from './llmBudget.js';
 import {
@@ -363,6 +366,9 @@ export async function runGoogleAdsJob(job: JobRow): Promise<void> {
     let nameSearchDisabled = false;
 
     const processAdvertiser = async (adv: GoogleAdsAdvertiser): Promise<void> => {
+      // Stop button: don't start work on further advertisers — the CSV already
+      // holds everything inserted so far; discovery's shouldStop ends the run.
+      if (isCancelRequested(job.id)) return;
       if (processed >= MAX_ADVERTISERS) return;
       processed++;
       if (processed === 1) setJobPhase(job.id, 'classifying', 'resolving as discovered…');
@@ -449,6 +455,7 @@ export async function runGoogleAdsJob(job: JobRow): Promise<void> {
             country: adv.region || informationalCountry,
           });
           inserted++;
+          setJobLeadsFound(job.id, inserted); // live counter for the UI
           if (cls.classification === 'cps_web') webCount++;
           else mobileCount++;
           flushCsv(); // real-time: the file reflects every lead the moment it lands
@@ -479,8 +486,11 @@ export async function runGoogleAdsJob(job: JobRow): Promise<void> {
         }
       },
       onAdvertiser: processAdvertiser,
-      shouldStop: () => processed >= MAX_ADVERTISERS,
+      shouldStop: () => processed >= MAX_ADVERTISERS || isCancelRequested(job.id),
     });
+    // Stop button pressed mid-discovery: unwind now. The catch below finalizes
+    // with everything already inserted (the CSV is flushed on every insert).
+    throwIfCancelled(job.id);
 
     onLog(
       'info',
@@ -515,6 +525,7 @@ export async function runGoogleAdsJob(job: JobRow): Promise<void> {
     // re-runs make zero store requests. Best-effort: a failure never fails the
     // job (leads still ship, just Unclassified). Runs BEFORE the CSV so the
     // app_category / is_game columns are populated in the exported file.
+    throwIfCancelled(job.id);
     if (job.product_type === 'mobile') {
       try {
         const mobileRows = getResults(job.id).filter(
@@ -581,6 +592,7 @@ export async function runGoogleAdsJob(job: JobRow): Promise<void> {
     }
 
     // ── 6. HQ split (mobile → store-page HQ; cps → web/domain HQ) ──
+    throwIfCancelled(job.id);
     setJobPhase(job.id, 'hq_splitting', `resolving HQ for ${rowsWritten} leads`);
     try {
       if (job.product_type === 'mobile') {
@@ -629,6 +641,26 @@ export async function runGoogleAdsJob(job: JobRow): Promise<void> {
     // the one whose traffic cost you want on record. Best-effort and fail-open;
     // instant no-op when the monitor is off or the before-snapshot never landed.
     await logProxyTrafficAfterJob(trafficBefore, onLog);
+    if (err instanceof JobCancelledError) {
+      // Stop button: the CSV was flushed on every insert, so everything found up
+      // to the stop is already on disk. Rebuild once for a clean final file and
+      // finalize as cancelled — NOT failed.
+      let csvPath: string | null = null;
+      let kept = 0;
+      try {
+        const cap = normalizeMaxLeads(
+          job.source_params ? (JSON.parse(job.source_params) as Record<string, unknown>).maxLeads : null,
+        );
+        const partial = buildCsv({ jobId: job.id, productType: job.product_type, results: getResults(job.id), maxRows: cap });
+        csvPath = partial.path;
+        kept = partial.rowsWritten;
+      } catch {
+        /* best-effort — the incrementally-flushed file (if any) remains */
+      }
+      markJobCancelled(job.id, `stopped by user — ${kept} lead(s) kept`, csvPath);
+      onLog('warn', `google-ads job stopped by user — ${kept} partial lead(s) exported`);
+      return;
+    }
     if (err instanceof BudgetExceededError) {
       const runAfter = nextJerusalemMidnightMs();
       const when = new Date(runAfter).toISOString();
