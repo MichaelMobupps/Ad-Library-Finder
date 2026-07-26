@@ -63,6 +63,14 @@ export interface JobRow {
    * On completion markJobCompleted syncs it to the final total_advertisers.
    */
   leads_found: number;
+  /**
+   * Overall progress 0..100 covering EVERY task the pipeline performs — each
+   * pipeline reports its own weighted phase spans (charts, crawls, enrichment,
+   * confirmation, CSV, HQ split, …), not just lead counts. Monotonic within a
+   * run (setJobProgress takes MAX); reset to 0 by markJobRunning, pinned to 100
+   * by markJobCompleted.
+   */
+  progress_pct: number;
 }
 
 export interface JobLogRow {
@@ -259,6 +267,10 @@ export async function initDb() {
     // Backfill finished jobs so old rows don't show 0 leads next to a non-zero total.
     db.exec(`UPDATE jobs SET leads_found = total_advertisers WHERE total_advertisers > 0`);
   }
+  if (!colNames.has('progress_pct')) {
+    db.exec(`ALTER TABLE jobs ADD COLUMN progress_pct REAL NOT NULL DEFAULT 0`);
+    db.exec(`UPDATE jobs SET progress_pct = 100 WHERE status = 'completed'`);
+  }
 
   // Idempotent additive migrations on job_results: app-category enrichment
   // (game vs non-game) for GATC mobile leads. Nullable, so every other pipeline
@@ -395,12 +407,12 @@ export function getNextPendingCapExemptJob(): JobRow | null {
 
 export function markJobRunning(id: string) {
   const now = Date.now();
-  // leads_found resets to 0: a deferred job replays from the top (pipelines
-  // clear/skip their partials), so a stale counter from the prior attempt would
-  // overstate progress until the first live update.
+  // leads_found and progress_pct reset to 0: a deferred/resumed job replays
+  // from the top (pipelines clear/skip their partials), so stale counters from
+  // the prior attempt would overstate progress until the first live update.
   getDb()
     .prepare(
-      `UPDATE jobs SET status='running', started_at=?, leads_found=0, phase='starting', phase_detail='launching browser', phase_updated_at=? WHERE id = ?`
+      `UPDATE jobs SET status='running', started_at=?, leads_found=0, progress_pct=0, phase='starting', phase_detail='launching browser', phase_updated_at=? WHERE id = ?`
     )
     .run(now, now, id);
 }
@@ -409,9 +421,43 @@ export function markJobCompleted(id: string, csvPath: string, counts: { ads: num
   const now = Date.now();
   getDb()
     .prepare(
-      `UPDATE jobs SET status='completed', csv_path=?, completed_at=?, total_ads_scraped=?, total_advertisers=?, leads_found=?, phase='done', phase_detail='complete', phase_updated_at=? WHERE id = ?`
+      `UPDATE jobs SET status='completed', csv_path=?, completed_at=?, total_ads_scraped=?, total_advertisers=?, leads_found=?, progress_pct=100, phase='done', phase_detail='complete', phase_updated_at=? WHERE id = ?`
     )
     .run(csvPath, now, counts.ads, counts.advertisers, counts.advertisers, now, id);
+}
+
+/**
+ * Report overall run progress (0..100 across ALL of the pipeline's tasks).
+ * Monotonic via MAX(): concurrent per-store streams update out of order and a
+ * lower estimate must never walk the bar backwards.
+ */
+export function setJobProgress(id: string, pct: number) {
+  const clamped = Math.max(0, Math.min(100, pct));
+  getDb()
+    .prepare(`UPDATE jobs SET progress_pct = MAX(progress_pct, ?) WHERE id = ?`)
+    .run(clamped, id);
+}
+
+/**
+ * Re-queue a stopped (or failed) job under its SAME id. The queue picks it up
+ * like any pending job; each pipeline's replay-safety decides what "resume"
+ * means: store_first continues exactly where it left off (its rotation stamps,
+ * enrichment cache and publisher corpus are durable), meta skips already-
+ * classified rows, the others replay from the top with deduped results.
+ * Returns false when the job isn't in a resumable state.
+ */
+export function resumeJob(id: string): boolean {
+  const job = getJob(id);
+  if (!job) return false;
+  if (job.status !== 'cancelled' && job.status !== 'failed') return false;
+  const now = Date.now();
+  getDb()
+    .prepare(
+      `UPDATE jobs SET status='pending', cancel_requested=0, error=NULL, completed_at=NULL, run_after=NULL,
+              phase='queued', phase_detail='resumed — waiting for worker', phase_updated_at=? WHERE id = ?`
+    )
+    .run(now, id);
+  return true;
 }
 
 /**

@@ -185,6 +185,39 @@ After each phase completes, before moving on:
 - REMINDER: leadfinder.mobupps.net still runs the previous deploy — republish to get the
   source-picker New Job menu + AppGoblin stop fix live.
 
+## Follow-up: Activity progress bars + click-through live logs (2026-07-26)  ☑
+
+- **Progress bar** on every active Activity row: `jobProgressPct` = max(pipeline-phase %, leads/cap %),
+  rendered as a mini bar + % (styles `.leadbar.mini` / `.activity-progress`).
+- **Click a job in Activity → full live view**: rows open the existing JobDetail (phase stepper, live
+  lead counter, and the complete step-by-step log, auto-refreshing every 3s). Back returns to Activity.
+- Backend: job detail/logs + CSV + HQ-zip reads are now **owner OR admin** (`canReadJob`) so the admin
+  click-through works; regular non-owners still get an indistinguishable 404 (smoke-verified 200/200 for
+  admin, 404/404 for another user). Builds ✓, 642 assertions ✓. Deploy to take live.
+
+## Follow-up: all-task progress + Resume (2026-07-26)  ☑
+
+- **Progress = every task, not just leads**: new `jobs.progress_pct` (0..100, monotonic via SQL MAX,
+  reset on run start, pinned 100 on completion). Every pipeline reports weighted phase spans:
+  store_first charts 0-15 / crawl+search 15-40 / enrichment 40-65 (per-fetch ticks via new
+  enrichApps onProgress) / catalogs 65-75 / liveness→79 / rollup 80 / confirmation 80-92 (per-publisher) /
+  scoring→93 / CSV→95 / HQ→100; google_ads keyword sweep 3-70 + phase marks; meta 0-50 scrape /
+  50-90 classify; affplus 0-30 list / 30-88 resolve; appgoblin 5-55 scrape / 55-85 classify.
+  UI: detail view bar + Activity bar now use server pct (lead-cap and phase-index as fallbacks for old rows).
+- **Resume stopped/failed jobs**: `resumeJob()` re-queues under the SAME id (pending, cancel flag
+  cleared, run_after/error cleared); POST /api/jobs/:id/resume (owner or admin); ▶ Resume / ↻ Retry
+  buttons in My Jobs, job detail, and Activity. Resume semantics per source: store_first continues via
+  its durable stamps/caches; meta skips already-classified rows; google_ads/affplus/appgoblin replay
+  with deduped results.
+- **Audit finding auto-fixed BEFORE smoke**: a stopped store_first job persisted its partial export into
+  lead history, so a resume would have deduped its OWN leads out of the final CSV — fixed by clearing
+  the job's own job_results at run start (no-op on fresh jobs; same pattern as the other pipelines).
+- Smoke on :3910 — full cycle live: progress climbed granularly (7.5% mid-charts → 40.4% during
+  enrichment ticks), resume-while-running 409, stop → cancelled at 40.5% (bar preserved), non-owner
+  resume 404, resume → "resumed — waiting for worker" → running again with progress reset+climbing,
+  final stop clean. Builds ✓, 642 assertions ✓. `.replit` smoke-port auto-adds reverted (x2).
+  Deploy to take live.
+
 ## Notes / decisions log
 
 - 2026-07-26: File created from user's request. Order chosen: background jobs first (user: "most important thing"), then UI unification, then speed.

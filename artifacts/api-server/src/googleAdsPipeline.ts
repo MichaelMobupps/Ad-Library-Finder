@@ -47,6 +47,7 @@ import {
   setJobHqZipPath,
   setJobCsvPath,
   setJobLeadsFound,
+  setJobProgress,
   setResultCategory,
   getJob,
   deferJob,
@@ -473,10 +474,13 @@ export async function runGoogleAdsJob(job: JobRow): Promise<void> {
       }
     };
 
+    setJobProgress(job.id, 3); // proxy checked, session warm — discovery starts
     const discovery = await discoverAdvertisers(keywords, {
       region,
       onLog,
       onProgress: (done, total, found) => {
+        // Keyword sweep dominates this pipeline's wall-clock: 3..70 of overall.
+        setJobProgress(job.id, 3 + 67 * (done / Math.max(1, total)));
         if (done % 5 === 0 || done === total) {
           setJobPhase(
             job.id,
@@ -526,6 +530,7 @@ export async function runGoogleAdsJob(job: JobRow): Promise<void> {
     // job (leads still ship, just Unclassified). Runs BEFORE the CSV so the
     // app_category / is_game columns are populated in the exported file.
     throwIfCancelled(job.id);
+    setJobProgress(job.id, 72); // discovery + resolution done
     if (job.product_type === 'mobile') {
       try {
         const mobileRows = getResults(job.id).filter(
@@ -553,6 +558,7 @@ export async function runGoogleAdsJob(job: JobRow): Promise<void> {
     }
 
     // ── 5. CSV (filters by product type) ──
+    setJobProgress(job.id, 78);
     setJobPhase(job.id, 'building_csv', `writing ${job.product_type} CSV`);
     const allResults = getResults(job.id);
     // Operator-chosen lead cap (20/50/100/all). Resolved once and used for BOTH
@@ -593,6 +599,7 @@ export async function runGoogleAdsJob(job: JobRow): Promise<void> {
 
     // ── 6. HQ split (mobile → store-page HQ; cps → web/domain HQ) ──
     throwIfCancelled(job.id);
+    setJobProgress(job.id, 82); // completion pins 100
     setJobPhase(job.id, 'hq_splitting', `resolving HQ for ${rowsWritten} leads`);
     try {
       if (job.product_type === 'mobile') {

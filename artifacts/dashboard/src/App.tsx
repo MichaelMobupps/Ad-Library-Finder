@@ -11,7 +11,9 @@ import {
   derivePhase,
   phaseLabel,
   jobIsStoppable,
+  jobIsResumable,
   jobMaxLeads,
+  jobProgressPct,
   PHASE_STEPS,
 } from './api/client';
 import Publishers from './Publishers';
@@ -21,7 +23,7 @@ type View =
   | { kind: 'publishers' }
   | { kind: 'list' }
   | { kind: 'new' }
-  | { kind: 'detail'; id: string }
+  | { kind: 'detail'; id: string; from?: 'list' | 'activity' }
   | { kind: 'activity' }
   | { kind: 'settings' };
 type AuthState = { kind: 'loading' } | { kind: 'anon' } | { kind: 'signed-in'; me: Me };
@@ -190,7 +192,12 @@ function AuthedApp({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
             onChanged={refresh}
           />
         )}
-        {view.kind === 'activity' && me.isAdmin && <ActivityView onAuthError={handleAuthError} />}
+        {view.kind === 'activity' && me.isAdmin && (
+          <ActivityView
+            onAuthError={handleAuthError}
+            onSelect={(id) => setView({ kind: 'detail', id, from: 'activity' })}
+          />
+        )}
         {view.kind === 'new' && (
           <NewJobForm
             settings={settings}
@@ -200,7 +207,12 @@ function AuthedApp({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
             }}
           />
         )}
-        {view.kind === 'detail' && <JobDetail id={view.id} onBack={() => setView({ kind: 'list' })} />}
+        {view.kind === 'detail' && (
+          <JobDetail
+            id={view.id}
+            onBack={() => setView({ kind: view.from === 'activity' ? 'activity' : 'list' })}
+          />
+        )}
         {view.kind === 'settings' && <SettingsView settings={settings} onChange={refreshSettings} />}
       </main>
     </div>
@@ -247,6 +259,39 @@ function StopButton({ job, onStopped, small }: { job: Job; onStopped: () => void
       title="Stop this job — leads found so far are kept"
     >
       {stopping ? 'Stopping…' : '■ Stop'}
+    </button>
+  );
+}
+
+/** Re-queue a stopped/failed job. It keeps its id and continues where the
+ *  durable state left off (store_first exactly; the others replay safely). */
+function ResumeButton({ job, onResumed, small }: { job: Job; onResumed: () => void; small?: boolean }) {
+  const [busy, setBusy] = useState(false);
+  if (!jobIsResumable(job)) return null;
+  const resume = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    setBusy(true);
+    try {
+      await api.resumeJob(job.id);
+      onResumed();
+    } catch (err) {
+      alert(`Could not resume the job: ${(err as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <button
+      className={`btn ${small ? 'small' : ''}`}
+      onClick={resume}
+      disabled={busy}
+      title={
+        job.status === 'cancelled'
+          ? 'Resume this job — it picks up where it stopped'
+          : 'Retry this job from where its durable state left off'
+      }
+    >
+      {busy ? 'Resuming…' : job.status === 'cancelled' ? '▶ Resume' : '↻ Retry'}
     </button>
   );
 }
@@ -331,6 +376,7 @@ function JobsList({
                   </a>
                 )}
                 <StopButton job={j} onStopped={onChanged} small />
+                <ResumeButton job={j} onResumed={onChanged} small />
               </td>
             </tr>
           ))}
@@ -421,8 +467,9 @@ function JobDetail({ id, onBack }: { id: string; onBack: () => void }) {
         <button className="btn ghost" onClick={onBack}>← Back</button>
         <h2 className="mono">{job.id}</h2>
         <StatusBadge status={job.status} />
-        <span style={{ marginLeft: 'auto' }}>
+        <span style={{ marginLeft: 'auto', display: 'inline-flex', gap: 8 }}>
           <StopButton job={job} onStopped={() => { /* next poll shows the new state */ }} />
+          <ResumeButton job={job} onResumed={() => { /* next poll shows the new state */ }} />
         </span>
       </div>
 
@@ -493,10 +540,12 @@ function PhaseProgress({
     job.phase_detail ||
     (latestLog ? latestLog.message : phaseLabel(currentPhase));
 
-  // Lead progress: leads found so far, against the chosen cap when there is one.
+  // Overall progress across EVERY task the pipeline performs (charts, crawls,
+  // enrichment, verification, CSV, HQ split…) — reported by the pipeline
+  // itself, with the lead counter shown alongside it.
   const leads = isActive ? job.leads_found : job.total_advertisers || job.leads_found;
   const cap = jobMaxLeads(job);
-  const pct = cap ? Math.min(100, Math.round((leads / cap) * 100)) : null;
+  const pct = jobProgressPct(job);
 
   return (
     <div className={`phase-progress ${isActive ? 'phase-active' : ''} ${isFailed ? 'phase-failed' : ''}`}>
@@ -524,18 +573,18 @@ function PhaseProgress({
         })}
       </div>
 
-      {/* The number the user actually cares about: leads so far, live. */}
+      {/* The numbers the user cares about: leads so far + overall progress
+          across all of the scraper's tasks, live. */}
       <div className="leads-progress">
         <span className="leads-progress-count">
           {isActive && <span className="leads-live-dot" />}
           <strong>{leads}</strong>&nbsp;lead{leads === 1 ? '' : 's'}
           {cap ? <span className="muted"> of {cap} requested</span> : isActive ? <span className="muted"> so far</span> : null}
         </span>
-        {pct != null && (
-          <span className="leadbar" title={`${pct}% of the requested leads`}>
-            <span className="leadbar-fill" style={{ width: `${pct}%` }} />
-          </span>
-        )}
+        <span className="leadbar" title="Overall progress — every step of the run: scanning, crawling, enrichment, ad verification, files">
+          <span className="leadbar-fill" style={{ width: `${pct}%` }} />
+        </span>
+        <span className="mono small muted">{pct}%</span>
       </div>
 
       <div className="phase-description">
@@ -565,7 +614,13 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
  * what it's doing right now, how many leads it has produced — running jobs
  * first. Admin can stop any job from here.
  */
-function ActivityView({ onAuthError }: { onAuthError: (err: unknown) => boolean }) {
+function ActivityView({
+  onAuthError,
+  onSelect,
+}: {
+  onAuthError: (err: unknown) => boolean;
+  onSelect: (id: string) => void;
+}) {
   const [jobs, setJobs] = useState<ActivityJob[] | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -610,6 +665,7 @@ function ActivityView({ onAuthError }: { onAuthError: (err: unknown) => boolean 
           <th>Type</th>
           <th>Status</th>
           <th>Phase</th>
+          {live && <th>Progress</th>}
           <th>Leads</th>
           <th>{live ? 'Running for' : 'Duration'}</th>
           <th>Created</th>
@@ -618,7 +674,12 @@ function ActivityView({ onAuthError }: { onAuthError: (err: unknown) => boolean 
       </thead>
       <tbody>
         {rows.map((j) => (
-          <tr key={j.id}>
+          <tr
+            key={j.id}
+            className="jobs-row"
+            onClick={() => onSelect(j.id)}
+            title="Open this job — live step-by-step log"
+          >
             <td className="small">{j.creator_email || <span className="muted">unknown</span>}</td>
             <td className="mono small">{j.id}</td>
             <td><span className={`tag tag-${j.source || 'meta'}`}>{sourceLabel(j.source)}</span></td>
@@ -634,10 +695,23 @@ function ActivityView({ onAuthError }: { onAuthError: (err: unknown) => boolean 
                 <span className="muted">{phaseLabel(derivePhase(j))}</span>
               )}
             </td>
+            {live && (
+              <td>
+                <span className="activity-progress" title="Overall progress — pipeline steps completed and leads collected">
+                  <span className="leadbar mini">
+                    <span className="leadbar-fill" style={{ width: `${jobProgressPct(j)}%` }} />
+                  </span>
+                  <span className="mono small muted">{jobProgressPct(j)}%</span>
+                </span>
+              </td>
+            )}
             <td className="mono"><LeadsCell job={j} /></td>
             <td className="small">{durationOf(j)}</td>
             <td className="small">{new Date(j.created_at).toLocaleString()}</td>
-            <td><StopButton job={j} onStopped={load} small /></td>
+            <td onClick={(e) => e.stopPropagation()}>
+              <StopButton job={j} onStopped={load} small />
+              <ResumeButton job={j} onResumed={load} small />
+            </td>
           </tr>
         ))}
       </tbody>

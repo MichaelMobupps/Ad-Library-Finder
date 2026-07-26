@@ -43,6 +43,9 @@ export interface Job {
   cancel_requested: number;
   /** LIVE "leads so far" counter — updates while the job runs. */
   leads_found: number;
+  /** Overall progress 0..100 across EVERY task the pipeline performs —
+   *  reported by the pipeline itself (weighted phase spans), live. */
+  progress_pct: number;
 }
 
 /** Admin Activity row: a job plus who started it. */
@@ -243,6 +246,11 @@ export const api = {
   stopJob: (id: string) =>
     fetchJson<{ job: Job }>(`/api/jobs/${id}/stop`, { method: 'POST' }).then((r) => r.job),
 
+  /** Re-queue a stopped/failed job under the same id — it continues where the
+   *  durable state left off (store_first resumes exactly; others replay safely). */
+  resumeJob: (id: string) =>
+    fetchJson<{ job: Job }>(`/api/jobs/${id}/resume`, { method: 'POST' }).then((r) => r.job),
+
   /** Admin only: every user's jobs, for the Activity view. */
   activity: () => fetchJson<{ jobs: ActivityJob[] }>('/api/jobs/activity').then((r) => r.jobs),
 
@@ -336,6 +344,31 @@ export function jobIsStoppable(job: Job): boolean {
     (job.status === 'pending' || job.status === 'running' || job.status === 'deferred') &&
     job.cancel_requested !== 1
   );
+}
+
+/**
+ * Overall progress of a job as 0..100.
+ *
+ * Primary signal: `progress_pct`, reported live by the pipeline itself and
+ * covering EVERY task it performs (charts, crawls, enrichment, verification,
+ * CSV, HQ split…). Fallbacks keep old rows honest: leads-vs-cap, and for jobs
+ * predating the column a coarse phase-index estimate. Completed pins to 100.
+ */
+export function jobProgressPct(job: Job): number {
+  if (job.status === 'completed') return 100;
+  const serverPct = Math.round(job.progress_pct || 0);
+  const cap = jobMaxLeads(job);
+  const leadPct = cap ? Math.min(100, Math.round((job.leads_found / cap) * 100)) : 0;
+  if (serverPct > 0) return Math.max(serverPct, leadPct);
+  // Old rows (or the first instants of a run): coarse phase-based estimate.
+  const idx = PHASE_ORDER.indexOf(derivePhase(job));
+  const phasePct = idx >= 0 ? Math.round((idx / (PHASE_ORDER.length - 1)) * 100) : 0;
+  return Math.max(phasePct, leadPct);
+}
+
+/** True when the job can be re-queued (Resume/Retry button). */
+export function jobIsResumable(job: Job): boolean {
+  return job.status === 'cancelled' || job.status === 'failed';
 }
 
 /** The job's lead cap (maxLeads) if one was chosen, else null. */

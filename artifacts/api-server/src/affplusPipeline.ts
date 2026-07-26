@@ -47,6 +47,7 @@ import {
   setJobPhase,
   setJobHqZipPath,
   setJobLeadsFound,
+  setJobProgress,
   getJob,
   deferJob,
   JobRow,
@@ -195,6 +196,8 @@ export async function runAffplusJob(job: JobRow): Promise<void> {
       for (const platform of platforms) {
         throwIfCancelled(job.id);
         listIdx++;
+        // Overall progress: offer listing is 0..30 of the run.
+        setJobProgress(job.id, 30 * (listIdx / Math.max(1, totalLists)));
         setJobPhase(
           job.id,
           'scraping',
@@ -374,6 +377,8 @@ export async function runAffplusJob(job: JobRow): Promise<void> {
           'classifying',
           `verifying ${processed}/${tagged.length} offers (${resolvedCount} matched)`
         );
+        // Overall progress: store verification is 30..88 of the run.
+        setJobProgress(job.id, 30 + 58 * (processed / Math.max(1, tagged.length)));
       }
 
       if (processed % 10 === 0) {
@@ -496,6 +501,8 @@ async function runAffplusWebJob(job: JobRow, countries: string[], onLog: WebLogF
     throwIfCancelled(job.id);
     idx++;
     setJobPhase(job.id, 'scraping', `Affplus Web / ${country} (${idx}/${countries.length})`);
+    // Overall progress: web listing is 0..30 of the run.
+    setJobProgress(job.id, 30 * (idx / Math.max(1, countries.length)));
     onLog('info', `affplus-web: listing Desktop / geo=${country}`);
     const { offers, pagesFetched } = await listOffers({
       platform: 'Web',
@@ -590,6 +597,8 @@ async function runAffplusWebJob(job: JobRow, countries: string[], onLog: WebLogF
 
     if (processed % 5 === 0 || processed === tagged.length) {
       setJobPhase(job.id, 'classifying', `resolving ${processed}/${tagged.length} web offers (${resolved} kept)`);
+      // Overall progress: web resolution is 30..88 of the run.
+      setJobProgress(job.id, 30 + 58 * (processed / Math.max(1, tagged.length)));
     }
     if (processed % 10 === 0) {
       onLog(
