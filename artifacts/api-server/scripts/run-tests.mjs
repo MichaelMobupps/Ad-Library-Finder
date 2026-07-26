@@ -119,6 +119,21 @@ if (mirror.status === 0) {
   failedModules.push('lead-cap-mirror');
 }
 
+// Form CSS gate: a broad selector must not silently resize a form control that
+// was added to the container later (see check-form-css.mjs for the shipped bug
+// this pins). Static scan of the dashboard stylesheet — no browser needed.
+const formCss = spawnSync(process.execPath, [path.join(ROOT, 'scripts', 'check-form-css.mjs')], {
+  cwd: ROOT,
+  encoding: 'utf8',
+});
+if (formCss.status === 0) {
+  console.log('  ✓ form CSS (no control silently resized by a broad selector)');
+} else {
+  console.log('  ✗ form CSS GATE BROKEN');
+  for (const line of `${formCss.stdout || ''}${formCss.stderr || ''}`.trim().split('\n')) console.log(`      ${line}`);
+  failedModules.push('form-css');
+}
+
 if (failedModules.length > 0) {
   console.error(`✗ failing modules: ${failedModules.join(', ')}`);
   process.exit(1);
