@@ -6,6 +6,37 @@ export const SESSION_COOKIE = 'als_session';
 export const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 
 /**
+ * Admin allowlist. Admins see the cross-user Activity view and the Publishers
+ * tab, and can stop any user's job. Everyone else is a regular user.
+ * Extendable via ADMIN_EMAILS env (comma-separated) without a code change.
+ */
+export const ADMIN_EMAILS: ReadonlySet<string> = new Set(
+  (process.env.ADMIN_EMAILS || 'michael@mobupps.com')
+    .split(',')
+    .map((e) => e.trim().toLowerCase())
+    .filter(Boolean),
+);
+
+export function isAdminUser(user: Pick<UserRow, 'email'> | null | undefined): boolean {
+  if (!user || !user.email) return false;
+  return ADMIN_EMAILS.has(user.email.trim().toLowerCase());
+}
+
+/** Require an authenticated ADMIN. 401 when anonymous, 403 for a non-admin. */
+export function requireAdmin(req: Request, res: Response, next: NextFunction) {
+  const user = (req as RequestWithUser).user;
+  if (!user) {
+    res.status(401).json({ error: 'authentication required' });
+    return;
+  }
+  if (!isAdminUser(user)) {
+    res.status(403).json({ error: 'admin only' });
+    return;
+  }
+  next();
+}
+
+/**
  * Strict domain check on a verified Google email.
  * Returns true ONLY if the email ends with "@<ALLOWED_DOMAIN>" exactly
  * (case-insensitive). Subdomains and other domains are refused.

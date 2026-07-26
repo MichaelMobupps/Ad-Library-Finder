@@ -122,8 +122,16 @@ function orderWorklist(items: EnrichWorkItem[]): EnrichWorkItem[] {
 /**
  * Enrich a worklist. Writes results onto store_app_detail (permanent cache).
  * Returns a summary for the run's discovery funnel.
+ *
+ * `opts.shouldStop` (job Stop button) is polled between store fetches; a stop
+ * ends the pass early and returns the partial summary — everything enriched so
+ * far is already in the permanent cache, so nothing is lost.
  */
-export async function enrichApps(items: EnrichWorkItem[], onLog?: LogFn): Promise<EnrichSummary> {
+export async function enrichApps(
+  items: EnrichWorkItem[],
+  onLog?: LogFn,
+  opts?: { shouldStop?: () => boolean },
+): Promise<EnrichSummary> {
   const summary: EnrichSummary = {
     apps: 0,
     enriched: 0,
@@ -186,57 +194,75 @@ export async function enrichApps(items: EnrichWorkItem[], onLog?: LogFn): Promis
     onLog?.('warn', `enrich: hit ENRICH_MAX_APPS_PER_RUN (${ENRICH_MAX_APPS_PER_RUN}); ${summary.cappedOut} apps deferred to a later run`);
   }
 
+  // The two stores throttle independently (Play 1 req/s, iTunes 1 req/6s), so
+  // their fetch streams run CONCURRENTLY — same requests, same politeness,
+  // wall-clock is max(streams) instead of their sum. Both streams mutate the
+  // shared summary; JS is single-threaded, so the counters stay coherent.
+
   // ── Play: one detail fetch per app (already throttled inside playSource). ──
-  for (const it of toFetchPlay) {
-    const prior = getAppDetail(it.store, it.app_id);
-    const attempts = (prior?.attempts ?? 0) + 1;
-    summary.requests++;
-    // eslint-disable-next-line no-await-in-loop
-    const d = await playAppDetail(it.app_id, it.country || 'us', onLog);
-    if (!d) {
-      upsertAppDetail(failedRow(it.store, it.app_id, prior, attempts));
-      summary.failed++;
-      continue;
+  const playStream = async () => {
+    for (const it of toFetchPlay) {
+      if (opts?.shouldStop?.()) {
+        onLog?.('warn', 'enrich: stop requested — ending Play enrichment early (cache keeps everything done so far)');
+        return;
+      }
+      const prior = getAppDetail(it.store, it.app_id);
+      const attempts = (prior?.attempts ?? 0) + 1;
+      summary.requests++;
+      // eslint-disable-next-line no-await-in-loop
+      const d = await playAppDetail(it.app_id, it.country || 'us', onLog);
+      if (!d) {
+        upsertAppDetail(failedRow(it.store, it.app_id, prior, attempts));
+        summary.failed++;
+        continue;
+      }
+      const isGame = playIsGame(d.genreId);
+      upsertAppDetail({
+        store: 'google_play',
+        app_id: d.appId,
+        title: d.title || null,
+        developer: d.developer || null,
+        developer_id: d.developerId,
+        developer_email: d.developerEmail,
+        developer_website: d.developerWebsite,
+        min_installs: d.minInstalls,
+        genre_id: d.genreId,
+        category_raw: d.genre ?? d.genreId,
+        is_game: isGame,
+        store_updated_at: d.updated,
+        artist_id: null,
+        seller_name: null,
+        bundle_id: null,
+        enrich_status: 'done',
+        attempts,
+      });
+      summary.enriched++;
+      tally(summary, isGame);
+      noteBand(it, d.minInstalls);
     }
-    const isGame = playIsGame(d.genreId);
-    upsertAppDetail({
-      store: 'google_play',
-      app_id: d.appId,
-      title: d.title || null,
-      developer: d.developer || null,
-      developer_id: d.developerId,
-      developer_email: d.developerEmail,
-      developer_website: d.developerWebsite,
-      min_installs: d.minInstalls,
-      genre_id: d.genreId,
-      category_raw: d.genre ?? d.genreId,
-      is_game: isGame,
-      store_updated_at: d.updated,
-      artist_id: null,
-      seller_name: null,
-      bundle_id: null,
-      enrich_status: 'done',
-      attempts,
-    });
-    summary.enriched++;
-    tally(summary, isGame);
-    noteBand(it, d.minInstalls);
-  }
+  };
 
   // ── Apple: batched /lookup, one storefront per batch. A geo-restricted app
   // resolves only in its own market (the same failure the Play path guards
   // against above), and /lookup takes a single country — so mixing markets in
   // one call would silently fail the minority-market apps into failedRow. ──
-  for (const [cc, group] of groupByEnrichCountry(toFetchApple)) {
-    for (let i = 0; i < group.length; i += ITUNES_LOOKUP_BATCH) {
-      const batch = group.slice(i, i + ITUNES_LOOKUP_BATCH);
-      summary.requests++;
-      // eslint-disable-next-line no-await-in-loop
-      const map = await appleLookup(batch.map((b) => b.app_id), cc, onLog);
-      enrichAppleBatch(batch, map, summary);
+  const appleStream = async () => {
+    for (const [cc, group] of groupByEnrichCountry(toFetchApple)) {
+      for (let i = 0; i < group.length; i += ITUNES_LOOKUP_BATCH) {
+        if (opts?.shouldStop?.()) {
+          onLog?.('warn', 'enrich: stop requested — ending Apple lookups early (cache keeps everything done so far)');
+          return;
+        }
+        const batch = group.slice(i, i + ITUNES_LOOKUP_BATCH);
+        summary.requests++;
+        // eslint-disable-next-line no-await-in-loop
+        const map = await appleLookup(batch.map((b) => b.app_id), cc, onLog);
+        enrichAppleBatch(batch, map, summary);
+      }
     }
-  }
+  };
 
+  await Promise.all([playStream(), appleStream()]);
   return summary;
 }
 

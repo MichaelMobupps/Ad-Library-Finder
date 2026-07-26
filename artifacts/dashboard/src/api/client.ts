@@ -1,5 +1,5 @@
 export type ProductType = 'mobile' | 'cps';
-export type JobStatus = 'pending' | 'running' | 'completed' | 'failed' | 'deferred';
+export type JobStatus = 'pending' | 'running' | 'completed' | 'failed' | 'deferred' | 'cancelled';
 export type JobSource = 'meta' | 'affplus' | 'appgoblin' | 'google_ads' | 'store_first';
 export type JobPhase =
   | 'queued'
@@ -11,7 +11,8 @@ export type JobPhase =
   | 'hq_splitting'
   | 'done'
   | 'failed'
-  | 'deferred';
+  | 'deferred'
+  | 'cancelled';
 
 export interface Job {
   id: string;
@@ -38,7 +39,14 @@ export interface Job {
   // Per-HQ-country .zip bundle path (mobile jobs, and Google Ads web jobs).
   // Presence (not just product_type) gates the HQ-split download button.
   hq_zip_path: string | null;
+  /** 1 when a Stop was requested; the pipeline is unwinding. */
+  cancel_requested: number;
+  /** LIVE "leads so far" counter — updates while the job runs. */
+  leads_found: number;
 }
+
+/** Admin Activity row: a job plus who started it. */
+export type ActivityJob = Job & { creator_email: string | null; creator_name: string | null };
 
 export interface JobLog {
   id: number;
@@ -52,6 +60,8 @@ export interface Me {
   id: string;
   email: string;
   name: string | null;
+  /** Admin sees the cross-user Activity view + Publishers, and can stop any job. */
+  isAdmin: boolean;
 }
 
 export interface Settings {
@@ -229,6 +239,13 @@ export const api = {
       body: JSON.stringify(opts),
     }),
 
+  /** Stop a running/pending job. Partial results are kept. */
+  stopJob: (id: string) =>
+    fetchJson<{ job: Job }>(`/api/jobs/${id}/stop`, { method: 'POST' }).then((r) => r.job),
+
+  /** Admin only: every user's jobs, for the Activity view. */
+  activity: () => fetchJson<{ jobs: ActivityJob[] }>('/api/jobs/activity').then((r) => r.jobs),
+
   csvUrl: (id: string) => `/api/jobs/${id}/csv`,
   hqZipUrl: (id: string) => `/api/jobs/${id}/hq-zip`,
 
@@ -293,6 +310,7 @@ const PHASE_LABEL: Record<JobPhase, string> = {
   done: 'Done',
   failed: 'Failed',
   deferred: 'Deferred',
+  cancelled: 'Stopped',
 };
 
 /**
@@ -308,6 +326,27 @@ export function derivePhase(job: Job): JobPhase {
     case 'completed': return 'done';
     case 'failed': return 'failed';
     case 'deferred': return 'deferred'; // LLM daily cap; resumes after Jerusalem midnight
+    case 'cancelled': return 'cancelled'; // user pressed Stop
+  }
+}
+
+/** True while the job can still be stopped. */
+export function jobIsStoppable(job: Job): boolean {
+  return (
+    (job.status === 'pending' || job.status === 'running' || job.status === 'deferred') &&
+    job.cancel_requested !== 1
+  );
+}
+
+/** The job's lead cap (maxLeads) if one was chosen, else null. */
+export function jobMaxLeads(job: Job): number | null {
+  if (!job.source_params) return null;
+  try {
+    const p = JSON.parse(job.source_params) as Record<string, unknown>;
+    const n = Number(p.maxLeads);
+    return Number.isFinite(n) && n > 0 ? Math.floor(n) : null;
+  } catch {
+    return null;
   }
 }
 

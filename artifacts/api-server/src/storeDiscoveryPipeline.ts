@@ -33,7 +33,9 @@ import {
   markJobRunning,
   markJobCompleted,
   markJobFailed,
+  markJobCancelled,
   setJobPhase,
+  setJobLeadsFound,
   appendLog,
   getJob,
   getDb,
@@ -41,6 +43,7 @@ import {
   setJobHqZipPath,
   type JobRow,
 } from './db.js';
+import { JobCancelledError, throwIfCancelled, isCancelRequested } from './jobControl.js';
 import { runHqSplit } from './hqSplit.js';
 import { BudgetExceededError, spentTodayUsd, DAILY_CAP_USD } from './llmBudget.js';
 import {
@@ -106,123 +109,83 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
 
     purgeUsEraGeoStamps(onLog);
 
-    // ── Phase 1: chart harvest ───────────────────────────────────────────────
+    // ── Phase 1: chart harvest — Play and Apple streams CONCURRENTLY ─────────
+    // The two stores have independent rate limiters (Play 1 req/s, iTunes
+    // 1 req/6s), so running them serially paid Play-time PLUS Apple-time for no
+    // reason. Two streams over the same (vertical x market) grid, each behind
+    // its own limiter, finish in max() instead of sum() — the same requests,
+    // the same politeness, roughly half the wall-clock.
     setJobPhase(job.id, 'scraping', 'charts');
     let chartRows = 0;
-    const cellTotal = params.verticals.length * params.markets.length;
-    let cell = 0;
+    const chartCells: Array<{ v: NonNullable<ReturnType<typeof verticalById>>; market: string }> = [];
     for (const vId of params.verticals) {
       const v = verticalById(vId);
       if (!v) continue;
-      const playCats = expandPlayCategories(v.play, !!v.expandGames);
-      for (const market of params.markets) {
-        cell++;
-        setJobPhase(job.id, 'scraping', `charts ${vId}/${market} (${cell}/${cellTotal})`);
-        // Play charts (each category × collection)
+      for (const market of params.markets) chartCells.push({ v, market });
+    }
+    let playCellsDone = 0;
+    let appleCellsDone = 0;
+    const chartProgress = () =>
+      setJobPhase(
+        job.id,
+        'scraping',
+        `charts — Play ${playCellsDone}/${chartCells.length} · Apple ${appleCellsDone}/${chartCells.length}`,
+      );
+    const playChartsTask = async () => {
+      for (const { v, market } of chartCells) {
+        if (isCancelRequested(job.id)) return; // stop: unwound after the barrier
+        const playCats = expandPlayCategories(v.play, !!v.expandGames);
         for (const chart of params.playCharts) {
           for (const cat of playCats) {
             const apps = await playChart(cat, chart, market, onLog);
             apps.forEach((a, i) => {
               upsertDiscoveredApp({
-                store: 'google_play', app_id: a.appId, title: a.title, vertical: vId, country: market,
+                store: 'google_play', app_id: a.appId, title: a.title, vertical: v.id, country: market,
                 source: 'chart', discovery_depth: 0, chart, rank: i + 1,
               });
             });
             chartRows += apps.length;
           }
         }
-        // Apple top-free chart
+        playCellsDone++;
+        chartProgress();
+      }
+    };
+    const appleChartsTask = async () => {
+      for (const { v, market } of chartCells) {
+        if (isCancelRequested(job.id)) return;
         for (const _c of params.appleCharts) {
           const apps = await appleChart(v.appleGenre, market, onLog);
           apps.forEach((a, i) => {
             upsertDiscoveredApp({
-              store: 'app_store', app_id: a.appId, title: a.title, vertical: vId, country: market,
+              store: 'app_store', app_id: a.appId, title: a.title, vertical: v.id, country: market,
               source: 'chart', discovery_depth: 0, chart: 'top-free', rank: i + 1,
             });
           });
           chartRows += apps.length;
         }
+        appleCellsDone++;
+        chartProgress();
       }
-    }
+    };
+    await Promise.all([playChartsTask(), appleChartsTask()]);
+    throwIfCancelled(job.id);
     onLog('info', `charts done: ${chartRows} chart sightings; ${countDiscoveredApps()} distinct (store,app,country) rows`);
 
-    // ── Phase 2: similar crawl (Play), level-by-level to SIMILAR_MAX_DEPTH ────
-    setJobPhase(job.id, 'scraping', 'similar crawl');
-    let newSimilar = 0;
-    let similarRequests = 0;
+    // ── Phases 2+3: similar crawl (Play) OVERLAPPED with the search battery ──
+    //
+    // The similar crawl is Play-only, so the iTunes limiter used to sit idle for
+    // its whole duration — and then the search battery paid 6s per cell waiting
+    // on iTunes. Restructured into two concurrent tracks:
+    //   • Play track:  similar crawl, then the Play half of the search battery.
+    //   • Apple track: the Apple half of the search battery, immediately.
+    // Each store half keeps its own per-(store, cell) rotation stamp, so the
+    // capped budget still sweeps the whole grid across runs per store. Total
+    // requests spent are unchanged; the wall-clock is max(tracks), not the sum.
+    setJobPhase(job.id, 'scraping', 'similar crawl + store search');
     ensureSimilarCrawlTable();
-    const crawledAt = similarCrawlTimes('google_play');
-    outer: for (let depth = 0; depth < SIMILAR_MAX_DEPTH; depth++) {
-      if (newSimilar >= params.similarMaxAppsPerRun) break;
-      // Seeds are Play apps of the ACTIVE verticals whose shallowest graph sighting
-      // is exactly this depth. At depth 0 that is exactly the chart apps, and a
-      // depth-SIMILAR_MAX_DEPTH app is never a seed (verification #4).
-      // Never-crawled seeds first, then least-recently-crawled: the seed set grows
-      // across runs, so without this the request budget is spent re-walking the same
-      // prefix and the deeper levels starve permanently.
-      const seeds = orderByProgress(
-        similarSeedApps('google_play', depth, params.verticals),
-        (s) => s.app_id,
-        crawledAt,
-      );
-      const fresh = seeds.filter((s) => !crawledAt.has(s.app_id)).length;
-      onLog(
-        'info',
-        `similar depth ${depth}: ${seeds.length} seeds (${fresh} never crawled) ` +
-          `(new so far ${newSimilar}/${params.similarMaxAppsPerRun})`,
-      );
-      for (const seed of seeds) {
-        if (newSimilar >= params.similarMaxAppsPerRun) break outer;
-        // Independent REQUEST bound. Without it a saturated graph inserts nothing,
-        // never reaches the app cap, and re-walks every seed at 1 req/s for hours.
-        if (similarRequests >= SIMILAR_MAX_REQUESTS_PER_RUN) {
-          onLog('warn', `similar crawl hit request cap ${SIMILAR_MAX_REQUESTS_PER_RUN} — stopping crawl`);
-          break outer;
-        }
-        similarRequests++;
-        // Stamped whether or not this seed yields anything: the request was spent, and
-        // a barren or blocked seed must go to the BACK of the queue rather than
-        // re-consuming the budget ahead of seeds never tried.
-        markSimilarCrawled('google_play', seed.app_id);
-        // Queried in the seed's own storefront (us-preferred, from the markets
-        // it was sighted in): a geo-restricted seed resolves ONLY there, and a
-        // us query would return nothing — stamped above as crawled, the seed
-        // would then contribute zero graph edges forever.
-        const sims = await playSimilar(seed.app_id, seed.country, onLog);
-        for (const a of sims) {
-          const { inserted } = upsertDiscoveredApp({
-            // Sighted in the storefront the similar query ran against — see the
-            // same choice on developer-catalog upserts below.
-            store: 'google_play', app_id: a.appId, title: a.title, country: seed.country,
-            // Inherit the seed's vertical so the next depth level can find these
-            // apps as seeds and so rollup keeps vertical attribution.
-            vertical: seed.vertical,
-            source: 'similar', discovery_depth: depth + 1,
-          });
-          if (inserted) {
-            newSimilar++;
-            if (newSimilar >= params.similarMaxAppsPerRun) {
-              onLog('warn', `similar crawl hit cap ${params.similarMaxAppsPerRun} — stopping crawl`);
-              break outer;
-            }
-          }
-        }
-      }
-    }
-    onLog('info', `similar crawl done: +${newSimilar} new apps from ${similarRequests} requests`);
+    ensureSearchBatteryTables();
 
-    // ── Phase 3: search battery ──────────────────────────────────────────────
-    // One cell per (vertical, market, term) — 9 x 12 x 15 = 1620 at full scope.
-    // Bounded by SEARCH_MAX_REQUESTS_PER_RUN and rotated least-recently-searched
-    // first, so the cap defers cells to the next run instead of starving the tail
-    // of the grid forever (the guarantee the similar crawl and developer-catalog
-    // phases already carry).
-    setJobPhase(job.id, 'scraping', 'search battery');
-    let searchRows = 0;
-    let searchRequests = 0;
-    let searchCellsRun = 0;
-    ensureSearchBatteryTable();
-    const searchedAt = searchCellTimes();
     const searchCells: SearchCell[] = [];
     for (const vId of params.verticals) {
       let terms = tailSearchTerms(vId);
@@ -231,60 +194,142 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
         for (const term of terms) searchCells.push({ vertical: vId, market, term });
       }
     }
-    const orderedCells = orderByProgress(searchCells, searchCellKey, searchedAt);
-    for (const cell of orderedCells) {
-      if (searchRequests >= SEARCH_MAX_REQUESTS_PER_RUN) break;
-      // Both requests are spent whether or not they yield, and the cell is
-      // stamped either way — a barren or blocked cell must go to the BACK of the
-      // rotation rather than re-consuming the budget ahead of never-run cells.
-      searchRequests += 2;
-      markSearchCell(cell);
-      searchCellsRun++;
-      const [playApps, appleApps] = await Promise.all([
-        playSearch(cell.term, cell.market, onLog),
-        appleSearch(cell.term, cell.market, onLog),
-      ]);
-      for (const a of playApps) {
-        upsertDiscoveredApp({ store: 'google_play', app_id: a.appId, title: a.title, vertical: cell.vertical, country: cell.market, source: 'search' });
+    // Half the request budget per store — same total spend as the old combined
+    // loop, which charged 2 requests per cell.
+    const perStoreSearchBudget = Math.floor(SEARCH_MAX_REQUESTS_PER_RUN / 2);
+
+    /** One store's half of the battery: LRU-ordered over ITS OWN stamps. */
+    const runSearchStore = async (store: StoreKind): Promise<{ cells: number; rows: number }> => {
+      const ordered = orderByProgress(searchCells, searchCellKey, searchCellTimesForStore(store));
+      let cells = 0;
+      let rows = 0;
+      for (const cell of ordered) {
+        if (isCancelRequested(job.id)) break; // stop: unwound after the barrier
+        if (cells >= perStoreSearchBudget) break;
+        cells++;
+        // Stamped whether or not it yields — a barren or blocked cell goes to the
+        // BACK of this store's rotation rather than re-consuming budget.
+        markSearchCellForStore(store, cell);
+        const apps =
+          store === 'google_play'
+            ? await playSearch(cell.term, cell.market, onLog)
+            : await appleSearch(cell.term, cell.market, onLog);
+        for (const a of apps) {
+          upsertDiscoveredApp({ store, app_id: a.appId, title: a.title, vertical: cell.vertical, country: cell.market, source: 'search' });
+        }
+        rows += apps.length;
       }
-      for (const a of appleApps) {
-        upsertDiscoveredApp({ store: 'app_store', app_id: a.appId, title: a.title, vertical: cell.vertical, country: cell.market, source: 'search' });
+      return { cells, rows };
+    };
+
+    /** The similar crawl, unchanged in logic — only lifted so the Play track can
+     *  sequence it before its search half. Returns {newApps, requests}. */
+    const runSimilarCrawl = async (): Promise<{ newApps: number; requests: number }> => {
+      let newSimilar = 0;
+      let similarRequests = 0;
+      const crawledAt = similarCrawlTimes('google_play');
+      outer: for (let depth = 0; depth < SIMILAR_MAX_DEPTH; depth++) {
+        if (newSimilar >= params.similarMaxAppsPerRun) break;
+        // Seeds are Play apps of the ACTIVE verticals whose shallowest graph
+        // sighting is exactly this depth; never-crawled first, then least-recent
+        // (the anti-starvation rotation — see orderByProgress).
+        const seeds = orderByProgress(
+          similarSeedApps('google_play', depth, params.verticals),
+          (s) => s.app_id,
+          crawledAt,
+        );
+        const fresh = seeds.filter((s) => !crawledAt.has(s.app_id)).length;
+        onLog(
+          'info',
+          `similar depth ${depth}: ${seeds.length} seeds (${fresh} never crawled) ` +
+            `(new so far ${newSimilar}/${params.similarMaxAppsPerRun})`,
+        );
+        for (const seed of seeds) {
+          if (isCancelRequested(job.id)) break outer; // stop: unwound after the barrier
+          if (newSimilar >= params.similarMaxAppsPerRun) break outer;
+          // Independent REQUEST bound. Without it a saturated graph inserts
+          // nothing, never reaches the app cap, and re-walks every seed for hours.
+          if (similarRequests >= SIMILAR_MAX_REQUESTS_PER_RUN) {
+            onLog('warn', `similar crawl hit request cap ${SIMILAR_MAX_REQUESTS_PER_RUN} — stopping crawl`);
+            break outer;
+          }
+          similarRequests++;
+          // Stamped whether or not this seed yields anything — spent budget sends
+          // it to the back of the queue either way.
+          markSimilarCrawled('google_play', seed.app_id);
+          // Queried in the seed's own storefront (geo-restricted seeds resolve
+          // only there).
+          const sims = await playSimilar(seed.app_id, seed.country, onLog);
+          for (const a of sims) {
+            const { inserted } = upsertDiscoveredApp({
+              store: 'google_play', app_id: a.appId, title: a.title, country: seed.country,
+              // Inherit the seed's vertical so deeper levels stay attributable.
+              vertical: seed.vertical,
+              source: 'similar', discovery_depth: depth + 1,
+            });
+            if (inserted) {
+              newSimilar++;
+              if (newSimilar >= params.similarMaxAppsPerRun) {
+                onLog('warn', `similar crawl hit cap ${params.similarMaxAppsPerRun} — stopping crawl`);
+                break outer;
+              }
+            }
+          }
+        }
       }
-      searchRows += playApps.length + appleApps.length;
-    }
+      return { newApps: newSimilar, requests: similarRequests };
+    };
+
+    const [playTrack, appleSearchHalf] = await Promise.all([
+      (async () => {
+        const similar = await runSimilarCrawl();
+        onLog('info', `similar crawl done: +${similar.newApps} new apps from ${similar.requests} requests`);
+        setJobPhase(job.id, 'scraping', 'store search (Play half)');
+        const search = await runSearchStore('google_play');
+        return { similar, search };
+      })(),
+      runSearchStore('app_store'),
+    ]);
+    throwIfCancelled(job.id);
+    const newSimilar = playTrack.similar.newApps;
+    const searchRows = playTrack.search.rows + appleSearchHalf.rows;
     onLog(
       'info',
-      `search battery done: ${searchCellsRun}/${orderedCells.length} cells, ${searchRequests} requests, ` +
-        `${searchRows} sightings; ${countDiscoveredApps()} distinct rows total`,
+      `search battery done: Play ${playTrack.search.cells} + Apple ${appleSearchHalf.cells} cells ` +
+        `(budget ${perStoreSearchBudget}/store), ${searchRows} sightings; ${countDiscoveredApps()} distinct rows total`,
     );
-    if (searchCellsRun < orderedCells.length) {
+    if (playTrack.search.cells >= perStoreSearchBudget || appleSearchHalf.cells >= perStoreSearchBudget) {
       onLog(
         'warn',
-        `search battery capped at ${SEARCH_MAX_REQUESTS_PER_RUN} requests — ` +
-          `${orderedCells.length - searchCellsRun} cells deferred to the next run (least-recently-searched first)`,
+        `search battery capped at ${SEARCH_MAX_REQUESTS_PER_RUN} requests — remaining cells deferred ` +
+          `to the next run (least-recently-searched first, per store)`,
       );
     }
 
     // ── Phase 4: enrichment (+ install-band gate) ────────────────────────────
     setJobPhase(job.id, 'enriching', 'app detail');
-    let enrichSummary = await enrichApps(buildWorklist(), onLog);
+    const stopCheck = { shouldStop: () => isCancelRequested(job.id) };
+    let enrichSummary = await enrichApps(buildWorklist(), onLog, stopCheck);
     logEnrich(onLog, 'enrichment', enrichSummary);
+    throwIfCancelled(job.id);
 
     // ── Phase 5: developer-catalog expansion, then a second enrichment pass ──
     setJobPhase(job.id, 'enriching', 'developer catalogs');
-    const catalogApps = await expandDeveloperCatalogs(onLog);
+    const catalogApps = await expandDeveloperCatalogs(onLog, job.id);
     if (catalogApps > 0) {
       onLog('info', `dev-catalog: +${catalogApps} portfolio apps discovered; re-enriching`);
-      enrichSummary = await enrichApps(buildWorklist(), onLog);
+      enrichSummary = await enrichApps(buildWorklist(), onLog, stopCheck);
       logEnrich(onLog, 're-enrichment', enrichSummary);
     }
+    throwIfCancelled(job.id);
 
     // ── Phase 5b: liveness sweep — drop apps the stores no longer list ───────
     // The catalog is permanent and never re-fetched, which is what makes repeat
     // runs fast; this is the counterweight that keeps it honest. Runs BEFORE the
     // rollup so a delisting is reflected in this run's publishers, not next run's.
     setJobPhase(job.id, 'enriching', 'liveness sweep');
-    const liveness = await sweepLiveness(onLog);
+    const liveness = await sweepLiveness(onLog, job.id);
+    throwIfCancelled(job.id);
 
     // ── Phase 6: publisher rollup ────────────────────────────────────────────
     setJobPhase(job.id, 'classifying', 'publisher rollup');
@@ -292,7 +337,21 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
 
     // ── Phase 7: confirmation (GATC RPC + optional Meta), budgeted ───────────
     setJobPhase(job.id, 'classifying', 'confirmation');
-    const confirm = await confirmPublishers({ maxApiCalls: params.confirmationMaxApiCalls, onLog });
+    const confirm = await confirmPublishers({
+      maxApiCalls: params.confirmationMaxApiCalls,
+      onLog,
+      shouldStop: () => isCancelRequested(job.id),
+      // LIVE lead counter: the export is confirmed-only, so the honest mid-run
+      // "leads so far" is the corpus-wide confirmed-publisher count as verdicts
+      // land. Also surfaced in the phase detail so the Jobs list shows it.
+      onProgress: (s) => {
+        setJobLeadsFound(job.id, countConfirmedPublishers());
+        if (s.processed % 10 === 0) {
+          setJobPhase(job.id, 'classifying', `confirming advertisers ${s.processed}/${s.queued} · ${s.confirmed} confirmed this run`);
+        }
+      },
+    });
+    throwIfCancelled(job.id);
 
     // ── Phase 8: scoring ─────────────────────────────────────────────────────
     setJobPhase(job.id, 'classifying', 'scoring');
@@ -354,6 +413,10 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
         .catch((e) => onLog('warn', `notification error: ${(e as Error).message}`));
     }
   } catch (err) {
+    if (err instanceof JobCancelledError) {
+      finalizeCancelledStoreJob(job, onLog);
+      return;
+    }
     const msg = (err as Error).message || 'unknown error';
     log.error(`store-first job ${job.id} failed`, err);
     onLog('error', `job failed: ${msg}`);
@@ -361,6 +424,37 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
     const fresh = getJob(job.id);
     if (fresh) void notifyJobFailed(fresh).catch(() => {});
   }
+}
+
+/**
+ * Stop-button finalize: everything discovered/enriched/confirmed up to the stop
+ * is already persisted in the shared corpus, so a quick LOCAL rollup + scoring +
+ * CSV (all DB work, no network, no paid calls) turns the partial run into a
+ * partial deliverable instead of throwing it away. Best-effort throughout — a
+ * failure here still marks the job cancelled, never failed.
+ */
+function finalizeCancelledStoreJob(job: JobRow, onLog: OnLog): void {
+  let csvPath: string | null = null;
+  let kept = 0;
+  try {
+    setJobPhase(job.id, 'building_csv', 'stopped — exporting what was found so far');
+    rollupPublishers(onLog);
+    scoreAllPublishers(onLog);
+    const discovered = listPublishersByScore(1_000_000);
+    const publishers = EXPORT_CONFIRMED_ONLY
+      ? discovered.filter((p) => p.confirmed_advertiser === 1)
+      : discovered;
+    const params = resolveStoreParams(job.source_params ? JSON.parse(job.source_params) : null);
+    const out = buildPublisherCsv(job.id, publishers, leadHistorySeed(), params.maxLeads);
+    csvPath = out.path;
+    kept = out.rowsWritten;
+    persistPublisherLeads(job.id, out.exported);
+    setJobLeadsFound(job.id, kept);
+  } catch (e) {
+    onLog('warn', `stop-finalize could not export partial leads (non-fatal): ${(e as Error).message}`);
+  }
+  markJobCancelled(job.id, `stopped by user — ${kept} lead(s) kept`, csvPath);
+  onLog('warn', `store-first job stopped by user — ${kept} partial lead(s) exported`);
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -494,42 +588,51 @@ export function livenessAction(verdict: 'live' | 'gone' | 'unknown'): 'skip' | '
   return verdict === 'gone' ? 'mark_gone' : 'mark_live';
 }
 
-async function sweepLiveness(onLog: OnLog): Promise<{ checked: number; delisted: number }> {
+async function sweepLiveness(onLog: OnLog, jobId?: string): Promise<{ checked: number; delisted: number }> {
   const staleBefore = Date.now() - LIVENESS_RECHECK_AFTER_DAYS * 86_400_000;
   let checked = 0;
   let delisted = 0;
 
   // Play: one throttled request per app, so the budget is small.
-  const playCandidates = listLivenessCandidates('google_play', staleBefore, LIVENESS_MAX_PLAY_PER_RUN);
-  for (const c of playCandidates) {
-    const action = livenessAction(await playAppLiveness(c.app_id, c.country, onLog));
-    if (action === 'skip') continue; // inconclusive: ask again next run
-    markAppLiveness('google_play', c.app_id, action === 'mark_gone');
-    checked++;
-    if (action === 'mark_gone') delisted++;
-  }
+  const playSweep = async () => {
+    const playCandidates = listLivenessCandidates('google_play', staleBefore, LIVENESS_MAX_PLAY_PER_RUN);
+    for (const c of playCandidates) {
+      if (jobId && isCancelRequested(jobId)) break; // Stop button — sweep resumes next run
+      const action = livenessAction(await playAppLiveness(c.app_id, c.country, onLog));
+      if (action === 'skip') continue; // inconclusive: ask again next run
+      markAppLiveness('google_play', c.app_id, action === 'mark_gone');
+      checked++;
+      if (action === 'mark_gone') delisted++;
+    }
+  };
 
   // Apple: 100 ids per request, so a much larger slice fits the same wall-clock.
   // Grouped by storefront because a listing is per-country: an app pulled from one
   // market may still be live in another, and asking in the wrong one is a false
   // delisting. Same country preference the enrichment worklist uses.
-  const appleCandidates = listLivenessCandidates('app_store', staleBefore, LIVENESS_MAX_APPLE_PER_RUN);
-  const byCountry = new Map<string, string[]>();
-  for (const c of appleCandidates) {
-    const cc = (c.country || 'us').toLowerCase();
-    if (!byCountry.has(cc)) byCountry.set(cc, []);
-    byCountry.get(cc)!.push(c.app_id);
-  }
-  for (const [cc, ids] of byCountry) {
-    const verdicts = await appleLiveness(ids, cc, onLog);
-    for (const [appId, verdict] of verdicts) {
-      const action = livenessAction(verdict);
-      if (action === 'skip') continue;
-      markAppLiveness('app_store', appId, action === 'mark_gone');
-      checked++;
-      if (action === 'mark_gone') delisted++;
+  const appleSweep = async () => {
+    const appleCandidates = listLivenessCandidates('app_store', staleBefore, LIVENESS_MAX_APPLE_PER_RUN);
+    const byCountry = new Map<string, string[]>();
+    for (const c of appleCandidates) {
+      const cc = (c.country || 'us').toLowerCase();
+      if (!byCountry.has(cc)) byCountry.set(cc, []);
+      byCountry.get(cc)!.push(c.app_id);
     }
-  }
+    for (const [cc, ids] of byCountry) {
+      if (jobId && isCancelRequested(jobId)) break; // Stop button — sweep resumes next run
+      const verdicts = await appleLiveness(ids, cc, onLog);
+      for (const [appId, verdict] of verdicts) {
+        const action = livenessAction(verdict);
+        if (action === 'skip') continue;
+        markAppLiveness('app_store', appId, action === 'mark_gone');
+        checked++;
+        if (action === 'mark_gone') delisted++;
+      }
+    }
+  };
+
+  // The two stores throttle independently — sweep them concurrently.
+  await Promise.all([playSweep(), appleSweep()]);
 
   if (checked > 0) {
     onLog(
@@ -556,16 +659,23 @@ export function searchCellKey(cell: SearchCell): string {
 }
 
 /**
- * Per-cell "this (vertical, market, term) search has already run" marker.
+ * Per-(store, cell) "this search has already run" marker.
  *
  * The same starvation guard similar_crawl_seed and developer_catalog_expansion
  * carry, and for the same reason: SEARCH_MAX_REQUESTS_PER_RUN truncates a list
  * that is otherwise built vertical-then-market-then-term, so with no marker every
  * run would re-search the identical prefix (finance/us/...) and the cells past the
  * cut — at full scope that is most of the grid — would never be searched at all.
+ *
+ * Stamps are PER STORE since the Play and Apple halves of the battery run as
+ * independent concurrent streams (each behind its own rate limiter) with their
+ * own budgets — one shared stamp would let the faster stream mark cells the
+ * slower one never actually searched. The legacy combined table seeds the
+ * per-store table once, so rotation history from before the split carries over.
  */
-function ensureSearchBatteryTable(): void {
-  getDb().exec(`
+function ensureSearchBatteryTables(): void {
+  const db = getDb();
+  db.exec(`
     CREATE TABLE IF NOT EXISTS search_battery_cell (
       vertical TEXT NOT NULL,
       market TEXT NOT NULL,
@@ -573,24 +683,41 @@ function ensureSearchBatteryTable(): void {
       last_searched_at INTEGER NOT NULL,
       PRIMARY KEY (vertical, market, term)
     );
+    CREATE TABLE IF NOT EXISTS search_battery_cell_store (
+      store TEXT NOT NULL,
+      vertical TEXT NOT NULL,
+      market TEXT NOT NULL,
+      term TEXT NOT NULL,
+      last_searched_at INTEGER NOT NULL,
+      PRIMARY KEY (store, vertical, market, term)
+    );
   `);
+  // One-time inheritance: a cell the combined loop already searched was searched
+  // in BOTH stores, so both per-store rows inherit its stamp. INSERT OR IGNORE
+  // keeps newer per-store stamps untouched on later runs.
+  for (const store of ['google_play', 'app_store']) {
+    db.prepare(
+      `INSERT OR IGNORE INTO search_battery_cell_store (store, vertical, market, term, last_searched_at)
+        SELECT ?, vertical, market, term, last_searched_at FROM search_battery_cell`,
+    ).run(store);
+  }
 }
 
-/** cell key → ms epoch of its last search. */
-function searchCellTimes(): Map<string, number> {
+/** cell key → ms epoch of this STORE's last search of it. */
+function searchCellTimesForStore(store: StoreKind): Map<string, number> {
   const rows = getDb()
-    .prepare(`SELECT vertical, market, term, last_searched_at FROM search_battery_cell`)
-    .all() as Array<SearchCell & { last_searched_at: number }>;
+    .prepare(`SELECT vertical, market, term, last_searched_at FROM search_battery_cell_store WHERE store = ?`)
+    .all(store) as Array<SearchCell & { last_searched_at: number }>;
   return new Map(rows.map((r) => [searchCellKey(r), r.last_searched_at]));
 }
 
-function markSearchCell(cell: SearchCell): void {
+function markSearchCellForStore(store: StoreKind, cell: SearchCell): void {
   getDb()
     .prepare(
-      `INSERT INTO search_battery_cell (vertical, market, term, last_searched_at) VALUES (?, ?, ?, ?)
-       ON CONFLICT(vertical, market, term) DO UPDATE SET last_searched_at = excluded.last_searched_at`,
+      `INSERT INTO search_battery_cell_store (store, vertical, market, term, last_searched_at) VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(store, vertical, market, term) DO UPDATE SET last_searched_at = excluded.last_searched_at`,
     )
-    .run(cell.vertical, cell.market, cell.term, Date.now());
+    .run(store, cell.vertical, cell.market, cell.term, Date.now());
 }
 
 function ensureSimilarCrawlTable(): void {
@@ -726,7 +853,7 @@ export function orderByProgress<T>(
  *  publish a contact, storing them as developer_catalog. Bounded by
  *  DEV_CATALOG_MAX_PER_RUN combined, spent on the developers whose catalogs are
  *  still un-expanded. Returns the count of NEW apps discovered. */
-async function expandDeveloperCatalogs(onLog: OnLog): Promise<number> {
+async function expandDeveloperCatalogs(onLog: OnLog, jobId?: string): Promise<number> {
   const total = DEV_CATALOG_MAX_PER_RUN;
   if (total <= 0) return 0;
   ensureCatalogExpansionTable();
@@ -741,6 +868,7 @@ async function expandDeveloperCatalogs(onLog: OnLog): Promise<number> {
   ): Promise<number> => {
     let used = 0;
     for (const dev of orderByProgress(devs, (d) => d.id, catalogExpansionTimes(store))) {
+      if (jobId && isCancelRequested(jobId)) break; // Stop button — everything fetched so far is stamped
       if (used >= budget) break;
       if (newApps >= DEV_CATALOG_MAX_APPS_PER_RUN) break;
       used++;
@@ -774,12 +902,36 @@ async function expandDeveloperCatalogs(onLog: OnLog): Promise<number> {
     return used;
   };
 
-  // Split the budget per store. Play was listed first against ONE shared
-  // counter, so with more Play developers than the budget the Apple loop never
-  // executed a single request. Play gets half; whatever it leaves flows to Apple.
+  // Split the budget per store — HALF EACH, RUN CONCURRENTLY. Play was listed
+  // first against one shared counter, so with more Play developers than budget
+  // the Apple loop never executed a single request; and serial execution paid
+  // Play-time + Apple-time even though the two stores throttle independently.
+  const playDevs = playDevelopersWithContact();
+  const appleDevs = appleArtistsWithContact();
   const playShare = Math.ceil(total / 2);
-  const playUsed = await runStore(playDevelopersWithContact(), playShare, (id, cc) => playDeveloper(id, cc, onLog), 'google_play');
-  const appleUsed = await runStore(appleArtistsWithContact(), total - playUsed, (id, cc) => appleDeveloper(id, cc, onLog), 'app_store');
+  let [playUsed, appleUsed] = await Promise.all([
+    runStore(playDevs, playShare, (id, cc) => playDeveloper(id, cc, onLog), 'google_play'),
+    runStore(appleDevs, total - playShare, (id, cc) => appleDeveloper(id, cc, onLog), 'app_store'),
+  ]);
+  // Leftover budget flows to the other store, but ONLY toward developers never
+  // expanded — re-reading the fresh stamps guards against burning leftover on
+  // re-expansion while un-expanded developers exist elsewhere in neither list.
+  let leftover = total - playUsed - appleUsed;
+  if (leftover > 0 && newApps < DEV_CATALOG_MAX_APPS_PER_RUN && !(jobId && isCancelRequested(jobId))) {
+    const unexpanded = (devs: Array<{ id: string }>, store: StoreKind) => {
+      const t = catalogExpansionTimes(store);
+      return devs.filter((d) => !t.has(d.id)).length;
+    };
+    const appleExtra = Math.min(leftover, unexpanded(appleDevs, 'app_store'));
+    if (appleExtra > 0) {
+      appleUsed += await runStore(appleDevs, appleExtra, (id, cc) => appleDeveloper(id, cc, onLog), 'app_store');
+      leftover = total - playUsed - appleUsed;
+    }
+    const playExtra = Math.min(leftover, unexpanded(playDevs, 'google_play'));
+    if (playExtra > 0) {
+      playUsed += await runStore(playDevs, playExtra, (id, cc) => playDeveloper(id, cc, onLog), 'google_play');
+    }
+  }
 
   onLog('info', `dev-catalog: ${playUsed} Play + ${appleUsed} Apple catalogs → +${newApps} new apps`);
   if (playUsed + appleUsed >= total) {

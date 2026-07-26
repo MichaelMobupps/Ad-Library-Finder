@@ -179,7 +179,15 @@ export function countStoreLinkAds(ads: MetaAd[]): number {
 // ── main ─────────────────────────────────────────────────────────────────────
 
 export async function confirmPublishers(
-  opts: { maxApiCalls: number; onLog?: LogFn },
+  opts: {
+    maxApiCalls: number;
+    onLog?: LogFn;
+    /** Job Stop button — polled between publishers; a stop ends the pass early
+     *  with every verdict recorded so far already persisted. */
+    shouldStop?: () => boolean;
+    /** Called after each publisher so the pipeline can surface a LIVE counter. */
+    onProgress?: (s: ConfirmSummary) => void;
+  },
 ): Promise<ConfirmSummary> {
   const onLog = opts.onLog;
   const summary: ConfirmSummary = {
@@ -223,6 +231,11 @@ export async function confirmPublishers(
 
   let consecBlocks = 0;
   for (const p of queue) {
+    if (opts.shouldStop?.()) {
+      summary.note = `stop requested — ended after ${summary.processed}/${queue.length} publishers (verdicts so far are saved)`;
+      onLog?.('warn', `confirm: ${summary.note}`);
+      break;
+    }
     if (summary.apiCalls >= opts.maxApiCalls) {
       summary.note = `budget exhausted after ${summary.processed}/${queue.length} publishers`;
       break;
@@ -257,6 +270,7 @@ export async function confirmPublishers(
       (result.gatcMeasured ? result.adsCount > 0 : (p.gatc_ads_count ?? 0) > 0) ||
       (result.metaMeasured ? result.metaAds > 0 : (p.meta_active_ads ?? 0) > 0);
     if (confirmed) summary.confirmed++;
+    opts.onProgress?.(summary);
   }
 
   if (!summary.note) summary.note = `confirmed ${summary.confirmed}/${summary.processed} processed`;

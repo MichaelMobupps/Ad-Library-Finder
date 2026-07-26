@@ -43,12 +43,15 @@ import {
   markJobRunning,
   markJobCompleted,
   markJobFailed,
+  markJobCancelled,
   setJobPhase,
   setJobHqZipPath,
+  setJobLeadsFound,
   getJob,
   deferJob,
   JobRow,
 } from './db.js';
+import { JobCancelledError, throwIfCancelled } from './jobControl.js';
 import { BudgetExceededError, nextJerusalemMidnightMs, DAILY_CAP_USD } from './llmBudget.js';
 import { listOffers, AffplusOffer, Platform as AffPlatform } from './affplusScraper.js';
 import { cleanOfferName } from './nameCleaner.js';
@@ -190,6 +193,7 @@ export async function runAffplusJob(job: JobRow): Promise<void> {
 
     for (const country of countries) {
       for (const platform of platforms) {
+        throwIfCancelled(job.id);
         listIdx++;
         setJobPhase(
           job.id,
@@ -232,6 +236,7 @@ export async function runAffplusJob(job: JobRow): Promise<void> {
 
     let processed = 0;
     for (const { offer, sourcePlatform, country } of tagged) {
+      throwIfCancelled(job.id);
       processed++;
       const cleaned = cleanOfferName(offer.name);
       if (!cleaned) {
@@ -361,6 +366,7 @@ export async function runAffplusJob(job: JobRow): Promise<void> {
         country: offer.geo || country,
       });
       resolvedCount++;
+      setJobLeadsFound(job.id, resolvedCount); // live counter
 
       if (processed % 5 === 0 || processed === tagged.length) {
         setJobPhase(
@@ -434,6 +440,18 @@ export async function runAffplusJob(job: JobRow): Promise<void> {
         .catch((e) => onLog('warn', `notification error: ${(e as Error).message}`));
     }
   } catch (err) {
+    if (err instanceof JobCancelledError) {
+      let csvPath: string | null = null;
+      let kept = 0;
+      try {
+        const partial = buildCsv({ jobId: job.id, productType: job.product_type, results: getResults(job.id) });
+        csvPath = partial.path;
+        kept = partial.rowsWritten;
+      } catch { /* best-effort */ }
+      markJobCancelled(job.id, `stopped by user — ${kept} lead(s) kept`, csvPath);
+      onLog('warn', `affplus job stopped by user — ${kept} partial lead(s) exported`);
+      return;
+    }
     if (err instanceof BudgetExceededError) {
       const runAfter = nextJerusalemMidnightMs();
       const when = new Date(runAfter).toISOString();
@@ -475,6 +493,7 @@ async function runAffplusWebJob(job: JobRow, countries: string[], onLog: WebLogF
   let idx = 0;
 
   for (const country of countries) {
+    throwIfCancelled(job.id);
     idx++;
     setJobPhase(job.id, 'scraping', `Affplus Web / ${country} (${idx}/${countries.length})`);
     onLog('info', `affplus-web: listing Desktop / geo=${country}`);
@@ -522,6 +541,7 @@ async function runAffplusWebJob(job: JobRow, countries: string[], onLog: WebLogF
   let processed = 0;
 
   for (const { offer, country } of tagged) {
+    throwIfCancelled(job.id);
     processed++;
     const advertiserName = normalizeWebOffer(offer.name).name;
 
@@ -565,6 +585,7 @@ async function runAffplusWebJob(job: JobRow, countries: string[], onLog: WebLogF
         country: offer.geo || country,
       });
       resolved++;
+      setJobLeadsFound(job.id, resolved); // live counter
     }
 
     if (processed % 5 === 0 || processed === tagged.length) {

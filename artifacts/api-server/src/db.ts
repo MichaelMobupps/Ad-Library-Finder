@@ -5,7 +5,7 @@ import path from 'node:path';
 import { ensureStoreDiscoveryTables } from './storeDiscoveryDb.js';
 
 export type ProductType = 'mobile' | 'cps';
-export type JobStatus = 'pending' | 'running' | 'completed' | 'failed' | 'deferred';
+export type JobStatus = 'pending' | 'running' | 'completed' | 'failed' | 'deferred' | 'cancelled';
 export type JobSource = 'meta' | 'affplus' | 'appgoblin' | 'google_ads' | 'store_first';
 export type JobPhase =
   | 'queued'
@@ -17,7 +17,8 @@ export type JobPhase =
   | 'hq_splitting'
   | 'done'
   | 'failed'
-  | 'deferred';
+  | 'deferred'
+  | 'cancelled';
 
 export interface JobRow {
   id: string;
@@ -53,6 +54,15 @@ export interface JobRow {
    * jobs that have never been deferred.
    */
   run_after: number | null;
+  /** 1 when the user pressed Stop. Pipelines poll this (jobControl.ts) and
+   *  unwind, keeping partial results. 0 for normal jobs. */
+  cancel_requested: number;
+  /**
+   * LIVE lead counter — updated by pipelines as leads land, so the UI can show
+   * "how many leads so far" and a progress bar MID-RUN, not just in the logs.
+   * On completion markJobCompleted syncs it to the final total_advertisers.
+   */
+  leads_found: number;
 }
 
 export interface JobLogRow {
@@ -241,6 +251,14 @@ export async function initDb() {
   if (!colNames.has('run_after')) {
     db.exec(`ALTER TABLE jobs ADD COLUMN run_after INTEGER`);
   }
+  if (!colNames.has('cancel_requested')) {
+    db.exec(`ALTER TABLE jobs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0`);
+  }
+  if (!colNames.has('leads_found')) {
+    db.exec(`ALTER TABLE jobs ADD COLUMN leads_found INTEGER NOT NULL DEFAULT 0`);
+    // Backfill finished jobs so old rows don't show 0 leads next to a non-zero total.
+    db.exec(`UPDATE jobs SET leads_found = total_advertisers WHERE total_advertisers > 0`);
+  }
 
   // Idempotent additive migrations on job_results: app-category enrichment
   // (game vs non-game) for GATC mobile leads. Nullable, so every other pipeline
@@ -263,7 +281,14 @@ export async function initDb() {
   // Garbage-collect expired sessions on startup
   db.prepare(`DELETE FROM sessions WHERE expires_at < ?`).run(Date.now());
 
-  // On startup, mark any 'running' jobs as failed (process restarted mid-job).
+  // On startup, settle jobs that were 'running' when the process died. A job
+  // whose user had ALREADY pressed Stop resolves to 'cancelled' (that is what
+  // the pipeline would have done had it lived to poll the flag); the rest are
+  // failures. Order matters: the cancelled sweep must run first or the failed
+  // sweep would claim its rows.
+  db.prepare(
+    `UPDATE jobs SET status='cancelled', phase='cancelled', phase_detail='stopped by user (server restarted before finalize)', completed_at=? WHERE status='running' AND cancel_requested=1`
+  ).run(Date.now());
   db.prepare(
     `UPDATE jobs SET status='failed', phase='failed', error='process restarted mid-job', completed_at=? WHERE status='running'`
   ).run(Date.now());
@@ -319,6 +344,19 @@ export function listAllJobs(): JobRow[] {
   return getDb().prepare(`SELECT * FROM jobs ORDER BY created_at DESC LIMIT 200`).all() as JobRow[];
 }
 
+export type ActivityJobRow = JobRow & { creator_email: string | null; creator_name: string | null };
+
+/** All jobs across ALL users with the creator's identity — the admin Activity view. */
+export function listAllJobsWithUsers(limit = 200): ActivityJobRow[] {
+  return getDb()
+    .prepare(
+      `SELECT jobs.*, users.email AS creator_email, users.name AS creator_name
+         FROM jobs LEFT JOIN users ON users.id = jobs.created_by_user_id
+        ORDER BY jobs.created_at DESC LIMIT ?`,
+    )
+    .all(limit) as ActivityJobRow[];
+}
+
 export function getNextPendingJob(): JobRow | null {
   // A job is runnable when it is freshly pending, or it was deferred for the LLM
   // daily cap and its run_after (next Asia/Jerusalem midnight) has passed. The
@@ -327,8 +365,9 @@ export function getNextPendingJob(): JobRow | null {
   return (getDb()
     .prepare(
       `SELECT * FROM jobs
-        WHERE status = 'pending'
-           OR (status = 'deferred' AND (run_after IS NULL OR run_after <= ?))
+        WHERE cancel_requested = 0
+          AND (status = 'pending'
+           OR (status = 'deferred' AND (run_after IS NULL OR run_after <= ?)))
         ORDER BY created_at ASC
         LIMIT 1`,
     )
@@ -345,6 +384,7 @@ export function getNextPendingCapExemptJob(): JobRow | null {
     .prepare(
       `SELECT * FROM jobs
         WHERE source = 'store_first'
+          AND cancel_requested = 0
           AND (status = 'pending'
            OR (status = 'deferred' AND (run_after IS NULL OR run_after <= ?)))
         ORDER BY created_at ASC
@@ -355,9 +395,12 @@ export function getNextPendingCapExemptJob(): JobRow | null {
 
 export function markJobRunning(id: string) {
   const now = Date.now();
+  // leads_found resets to 0: a deferred job replays from the top (pipelines
+  // clear/skip their partials), so a stale counter from the prior attempt would
+  // overstate progress until the first live update.
   getDb()
     .prepare(
-      `UPDATE jobs SET status='running', started_at=?, phase='starting', phase_detail='launching browser', phase_updated_at=? WHERE id = ?`
+      `UPDATE jobs SET status='running', started_at=?, leads_found=0, phase='starting', phase_detail='launching browser', phase_updated_at=? WHERE id = ?`
     )
     .run(now, now, id);
 }
@@ -366,9 +409,54 @@ export function markJobCompleted(id: string, csvPath: string, counts: { ads: num
   const now = Date.now();
   getDb()
     .prepare(
-      `UPDATE jobs SET status='completed', csv_path=?, completed_at=?, total_ads_scraped=?, total_advertisers=?, phase='done', phase_detail='complete', phase_updated_at=? WHERE id = ?`
+      `UPDATE jobs SET status='completed', csv_path=?, completed_at=?, total_ads_scraped=?, total_advertisers=?, leads_found=?, phase='done', phase_detail='complete', phase_updated_at=? WHERE id = ?`
     )
-    .run(csvPath, now, counts.ads, counts.advertisers, now, id);
+    .run(csvPath, now, counts.ads, counts.advertisers, counts.advertisers, now, id);
+}
+
+/**
+ * Terminal state for a user-stopped job. Partial results are KEPT: csv_path (when
+ * the pipeline flushed one), job_results rows and leads_found all stay, so a
+ * stopped job still delivers everything it found up to the stop.
+ */
+export function markJobCancelled(id: string, detail: string, csvPath?: string | null) {
+  const now = Date.now();
+  if (csvPath) {
+    getDb().prepare(`UPDATE jobs SET csv_path=? WHERE id = ?`).run(csvPath, id);
+  }
+  getDb()
+    .prepare(
+      `UPDATE jobs SET status='cancelled', completed_at=?, phase='cancelled', phase_detail=?, phase_updated_at=? WHERE id = ?`
+    )
+    .run(now, detail.slice(0, 200), now, id);
+}
+
+/**
+ * Flag a job to stop. If the worker hasn't started it (pending, or deferred and
+ * parked until midnight), it is cancelled on the spot — there is nothing to
+ * unwind. A running job keeps status 'running' until its pipeline polls the flag
+ * (jobControl.throwIfCancelled) and finalizes with markJobCancelled.
+ * Returns false when the job is already terminal.
+ */
+export function requestJobCancel(id: string): boolean {
+  const job = getJob(id);
+  if (!job) return false;
+  if (job.status === 'completed' || job.status === 'failed' || job.status === 'cancelled') return false;
+  getDb().prepare(`UPDATE jobs SET cancel_requested = 1 WHERE id = ?`).run(id);
+  if (job.status === 'pending' || job.status === 'deferred') {
+    markJobCancelled(id, 'stopped by user before start');
+  } else {
+    const now = Date.now();
+    getDb()
+      .prepare(`UPDATE jobs SET phase_detail=?, phase_updated_at=? WHERE id = ?`)
+      .run('stopping — finishing current step…', now, id);
+  }
+  return true;
+}
+
+/** Live "leads so far" counter — cheap single-column update, called mid-run. */
+export function setJobLeadsFound(id: string, n: number) {
+  getDb().prepare(`UPDATE jobs SET leads_found = ? WHERE id = ?`).run(n, id);
 }
 
 export function markJobFailed(id: string, error: string) {

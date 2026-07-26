@@ -4,8 +4,10 @@ import {
   markJobRunning,
   markJobCompleted,
   markJobFailed,
+  markJobCancelled,
   setJobPhase,
   setJobHqZipPath,
+  setJobLeadsFound,
   appendLog,
   insertResult,
   getResults,
@@ -13,6 +15,7 @@ import {
   deferJob,
   JobRow,
 } from './db.js';
+import { JobCancelledError, throwIfCancelled, clearCancelState } from './jobControl.js';
 import {
   BudgetExceededError,
   nextJerusalemMidnightMs,
@@ -64,6 +67,10 @@ async function tick() {
         job = getNextPendingCapExemptJob();
       }
       if (job) {
+        // Fresh cancellation state for this run: a job id can re-enter the worker
+        // (deferred jobs replay), and the control cache's "cancelled" answer is
+        // deliberately sticky within a run.
+        clearCancelState(job.id);
         if (job.source === 'affplus') {
           await runAffplusJob(job);
         } else if (job.source === 'appgoblin') {
@@ -108,6 +115,7 @@ async function runMetaJob(job: JobRow) {
 
     for (const country of countries) {
       for (const keyword of keywords) {
+        throwIfCancelled(job.id);
         queryIdx++;
         setJobPhase(
           job.id,
@@ -144,6 +152,7 @@ async function runMetaJob(job: JobRow) {
         .filter((u): u is string => !!u),
     );
     for (const ad of collected) {
+      throwIfCancelled(job.id);
       if (ad.landing_url && alreadyDone.has(ad.landing_url)) {
         classified++;
         continue;
@@ -166,7 +175,10 @@ async function runMetaJob(job: JobRow) {
       });
 
       classified++;
-      if (isMatch) matched++;
+      if (isMatch) {
+        matched++;
+        setJobLeadsFound(job.id, matched); // live counter for the UI
+      }
       if (classified % 10 === 0 || classified === collected.length) {
         setJobPhase(
           job.id,
@@ -193,6 +205,7 @@ async function runMetaJob(job: JobRow) {
     // HQ split (mobile only). Fire-and-forget for failures inside the split:
     // we don't want a downstream HQ-resolution issue to fail the whole job.
     if (job.product_type === 'mobile') {
+      throwIfCancelled(job.id);
       setJobPhase(job.id, 'hq_splitting', `resolving HQ for ${rowsWritten} apps`);
       try {
         const outcome = await runHqSplit({ jobId: job.id, results: allResults, onLog });
@@ -225,6 +238,22 @@ async function runMetaJob(job: JobRow) {
       });
     }
   } catch (err) {
+    if (err instanceof JobCancelledError) {
+      // Stop button: keep everything classified so far and export it, so a
+      // stopped job still delivers its partial leads.
+      let csvPath: string | null = null;
+      let kept = 0;
+      try {
+        const partial = buildCsv({ jobId: job.id, productType: job.product_type, results: getResults(job.id) });
+        csvPath = partial.path;
+        kept = partial.rowsWritten;
+      } catch {
+        /* partial CSV is best-effort */
+      }
+      markJobCancelled(job.id, `stopped by user — ${kept} lead(s) kept`, csvPath);
+      onLog('warn', `job stopped by user — ${kept} partial lead(s) exported`);
+      return;
+    }
     if (err instanceof BudgetExceededError) {
       const runAfter = nextJerusalemMidnightMs();
       const when = new Date(runAfter).toISOString();
