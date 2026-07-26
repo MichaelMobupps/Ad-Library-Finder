@@ -71,6 +71,7 @@ import {
   getResults,
   clearJobResults,
   setJobHqZipPath,
+  setJobCsvPath,
   type JobRow,
 } from './db.js';
 import { JobCancelledError, throwIfCancelled, isCancelRequested } from './jobControl.js';
@@ -104,6 +105,7 @@ import {
   playDevelopersWithContact,
   appleArtistsWithContact,
   listPublishersByScore,
+  listPublishersForConfirmation,
   listLivenessCandidates,
   markAppLiveness,
   countDelistedApps,
@@ -113,7 +115,7 @@ import { expandPlayCategories, playChart, playSimilar, playDeveloper, playSearch
 import { appleChart, appleDeveloper, appleSearch, appleLiveness } from './appleSource.js';
 import { enrichApps, type EnrichWorkItem, type EnrichSummary } from './storeEnrich.js';
 import { rollupPublishers } from './publisherRollup.js';
-import { confirmPublishers, type ConfirmSummary } from './storeConfirm.js';
+import { confirmPublishers, filterUncheckedSince, type ConfirmSummary } from './storeConfirm.js';
 import { scoreAllPublishers } from './publisherScore.js';
 import {
   buildPublisherCsv,
@@ -134,6 +136,11 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
     log.info(`[job ${job.id}] ${msg}`);
   };
   onLog('info', `store-first discovery job started`);
+
+  // Handle for the catch blocks: the background lead pump is created inside the
+  // try (it needs the parsed params), but a thrown JobCancelledError or any
+  // failure must still be able to land it before finalizing.
+  let shutdownPump: (() => Promise<void>) | null = null;
 
   try {
     const params = resolveStoreParams(job.source_params ? JSON.parse(job.source_params) : null);
@@ -188,6 +195,10 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
       inBand: 0, outOfBand: 0, requests: 0, cappedOut: 0, budgetLeft: ENRICH_MAX_APPS_PER_RUN,
     };
 
+    // Everything below is shared by the BACKGROUND LEAD PUMP and the phase
+    // barriers. runStartTs scopes the confirmation dedupe: a publisher checked
+    // at/after this instant is never re-charged by a later pass of this run.
+    const runStartTs = Date.now();
     let confirmSpent = 0;
     // Run-wide confirmation totals. There are several confirmation passes now, so
     // the summary must aggregate them; `queued` is a snapshot of the eligible
@@ -222,6 +233,31 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
      * Returns true when the requested lead count is on the table — the caller
      * skips straight to the finish.
      */
+    // Serializes every lead-harvest pass (background pump ticks AND phase
+    // barriers) — two concurrent confirmPublishers loops would race the shared
+    // budget and double-check the queue head. A plain promise chain is enough:
+    // callers append, everyone runs strictly in order.
+    let pumpChain: Promise<void> = Promise.resolve();
+    const queueHarvest = (
+      label: string,
+      phase: 'scraping' | 'enriching' | 'classifying',
+      base: number,
+      width: number,
+      quiet = false,
+    ): Promise<boolean> => {
+      let met = false;
+      pumpChain = pumpChain
+        .then(async () => {
+          met = await harvestLeads(label, phase, base, width, quiet);
+        })
+        .catch((e) => {
+          // A pump failure must never kill the job — harvest is best-effort on
+          // top of a pipeline that must always deliver its CSV.
+          onLog('warn', `lead pump pass "${label}" failed (non-fatal): ${(e as Error).message}`);
+        });
+      return pumpChain.then(() => met);
+    };
+
     const harvestLeads = async (
       label: string,
       /**
@@ -237,8 +273,18 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
       phase: 'scraping' | 'enriching' | 'classifying',
       progressBase: number,
       progressWidth: number,
+      /**
+       * Background pump pass: touch NEITHER the coarse phase NOR the progress
+       * bar. The pump runs continuously alongside whatever phase is active, so
+       * reporting its own phase would drag the ordered UI stepper BACKWARDS
+       * (a tick during 'enriching' would rewind it to 'scraping') and its
+       * zero-width span would be meaningless on the bar. The live signal a
+       * pump tick produces is the LEAD COUNTER and the growing CSV, which are
+       * updated regardless.
+       */
+      quiet = false,
     ): Promise<boolean> => {
-      setJobPhase(job.id, phase, `finding advertisers — ${label}`);
+      if (!quiet) setJobPhase(job.id, phase, `finding advertisers — ${label}`);
       rollupPublishers(onLog);
 
       const budgetLeft = Math.max(0, params.confirmationMaxApiCalls - confirmSpent);
@@ -260,7 +306,11 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
         );
       }
 
-      if (budgetLeft > 0 && !orderAlreadyFilled) {
+      // Nothing new to check ⇒ no pass. Keeps background ticks free when the
+      // discovery streams have not produced a new publisher since last time.
+      const uncheckedNow = filterUncheckedSince(listPublishersForConfirmation(), runStartTs).length;
+
+      if (budgetLeft > 0 && !orderAlreadyFilled && uncheckedNow > 0) {
         // Recomputed in onProgress and READ by `enough`. storeConfirm calls
         // onProgress before enough, so this is always current; evaluating
         // exportableNow() in both would scan the publisher table twice per
@@ -276,6 +326,11 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
         const confirm = await confirmPublishers({
           maxApiCalls: budgetLeft,
           onLog,
+          // One warm-up per RUN (module-global cookie jar) and never re-check a
+          // publisher this run already answered for — both matter now that
+          // passes run continuously instead of once.
+          skipWarmUp: confirmPasses > 0,
+          skipConfirmedSince: runStartTs,
           shouldStop: () => isCancelRequested(job.id),
           // Stop the moment the order is filled. Without this a 20-lead job
           // spent its entire budget (and the proxy spend behind it) long after
@@ -287,13 +342,15 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
               liveExportable = exportableNow(seed);
               setJobLeadsFound(job.id, liveExportable);
             }
-            span(progressBase, progressWidth, st.processed / Math.max(1, st.queued));
-            if (st.processed % 10 === 0) {
-              setJobPhase(
-                job.id,
-                phase,
-                `finding advertisers — ${label} · ${st.processed}/${st.queued} checked, ${st.confirmed} advertising`,
-              );
+            if (!quiet) {
+              span(progressBase, progressWidth, st.processed / Math.max(1, st.queued));
+              if (st.processed % 10 === 0) {
+                setJobPhase(
+                  job.id,
+                  phase,
+                  `finding advertisers — ${label} · ${st.processed}/${st.queued} checked, ${st.confirmed} advertising`,
+                );
+              }
             }
           },
         });
@@ -316,7 +373,7 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
       scoreAllPublishers(onLog);
       leadsOnTable = exportLeadsSoFar();
       setJobLeadsFound(job.id, leadsOnTable);
-      setJobProgress(job.id, progressBase + progressWidth);
+      if (!quiet) setJobProgress(job.id, progressBase + progressWidth);
 
       if (params.maxLeads != null && leadsOnTable >= params.maxLeads) {
         leadTargetMet = true;
@@ -327,7 +384,7 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
         );
         return true;
       }
-      onLog('info', `checkpoint "${label}": ${leadsOnTable} lead(s) exportable so far`);
+      if (!quiet) onLog('info', `checkpoint "${label}": ${leadsOnTable} lead(s) exportable so far`);
       return false;
     };
 
@@ -341,9 +398,51 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
      */
     function exportLeadsSoFar(): number {
       const out = rebuildJobLeadExport(job.id, params.maxLeads);
+      const firstExport = csvPath == null;
       csvPath = out.path;
+      // REAL-TIME deliverable: point job.csv_path at the file the moment it
+      // first exists, exactly like the CPS pipeline's incremental flush. The
+      // download route serves it from then on, so the user watches the Excel
+      // GROW during the run instead of discovering it after the fact.
+      if (firstExport) setJobCsvPath(job.id, out.path);
       return out.rowsWritten;
     }
+
+    // ── THE BACKGROUND LEAD PUMP ─────────────────────────────────────────────
+    // The user's actual mental model, made literal: scrape an app → look its
+    // publisher up on Ads Transparency → if it advertises, it is IN THE EXCEL —
+    // continuously, while discovery keeps running. The pump ticks every
+    // PUMP_INTERVAL_MS, and each tick is a no-op unless the discovery streams
+    // rolled up NEW unchecked publishers since the last tick, so idle ticks
+    // cost zero network and zero budget. Ticks serialize with the phase
+    // barriers through queueHarvest, and every pass draws on the run's single
+    // confirmation budget with skipConfirmedSince dedupe — total spend is
+    // IDENTICAL to the old single terminal pass, only the timing moves.
+    const PUMP_INTERVAL_MS = 15_000;
+    let pumpShutdown = false;
+    const pumpDone = (async () => {
+      while (!pumpShutdown) {
+        // Sleep in 1s slices so cancel/target/shutdown react promptly.
+        for (let waited = 0; waited < PUMP_INTERVAL_MS && !pumpShutdown; waited += 1_000) {
+          await new Promise((r) => setTimeout(r, 1_000));
+        }
+        if (pumpShutdown || leadTargetMet || isCancelRequested(job.id)) break;
+        if (confirmSpent >= params.confirmationMaxApiCalls) break; // budget dry — barriers handle the rest
+        const before = leadsOnTable;
+        await queueHarvest('live', 'scraping', 0, 0, true); // quiet: no phase/progress writes
+        if (leadsOnTable > before) {
+          onLog('info', `lead pump: ${leadsOnTable} lead(s) now in the export (+${leadsOnTable - before} since last check)`);
+        }
+      }
+    })();
+    /** Stop the pump and wait for any in-flight pass to land. Every exit path
+     *  (finish, cancel, failure) MUST call this before finalizing. */
+    const stopPump = async (): Promise<void> => {
+      pumpShutdown = true;
+      await pumpDone.catch(() => {});
+      await pumpChain.catch(() => {});
+    };
+    shutdownPump = stopPump;
 
     // ── Phase 1: chart harvest — Play and Apple streams CONCURRENTLY ─────────
     // The two stores have independent rate limiters (Play ~5 req/s spread over
@@ -371,7 +470,7 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
     };
     const playChartsTask = async () => {
       for (const { v, market } of chartCells) {
-        if (isCancelRequested(job.id)) return; // stop: unwound after the barrier
+        if (isCancelRequested(job.id) || leadTargetMet) return; // stop/target: unwound after the barrier
         const playCats = expandPlayCategories(v.play, !!v.expandGames);
         for (const chart of params.playCharts) {
           for (const cat of playCats) {
@@ -391,7 +490,7 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
     };
     const appleChartsTask = async () => {
       for (const { v, market } of chartCells) {
-        if (isCancelRequested(job.id)) return;
+        if (isCancelRequested(job.id) || leadTargetMet) return;
         for (const _c of params.appleCharts) {
           const apps = await appleChart(v.appleGenre, market, onLog);
           apps.forEach((a, i) => {
@@ -416,7 +515,7 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
     // phase in the pipeline (48s on a measured single-market run). So the first
     // leads can be on the table about a minute into a job, and a small order is
     // frequently filled here outright — before a single enrichment fetch.
-    if (await harvestLeads('top charts', 'scraping', 6, 12)) return await finishRun();
+    if (await queueHarvest('top charts', 'scraping', 6, 12)) return await finishRun();
     throwIfCancelled(job.id);
 
     // ── Phases 2+3: similar crawl (Play) OVERLAPPED with the search battery ──
@@ -462,7 +561,7 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
       let cells = 0;
       let rows = 0;
       for (const cell of ordered) {
-        if (isCancelRequested(job.id)) break; // stop: unwound after the barrier
+        if (isCancelRequested(job.id) || leadTargetMet) break; // stop/target: unwound after the barrier
         if (cells >= perStoreSearchBudget) break;
         cells++;
         // Stamped whether or not it yields — a barren or blocked cell goes to the
@@ -504,7 +603,7 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
             `(new so far ${newSimilar}/${params.similarMaxAppsPerRun})`,
         );
         for (const seed of seeds) {
-          if (isCancelRequested(job.id)) break outer; // stop: unwound after the barrier
+          if (isCancelRequested(job.id) || leadTargetMet) break outer; // stop/target: unwound after the barrier
           if (newSimilar >= params.similarMaxAppsPerRun) break outer;
           // Independent REQUEST bound. Without it a saturated graph inserts
           // nothing, never reaches the app cap, and re-walks every seed for hours.
@@ -572,13 +671,16 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
     // The similar crawl and the search battery add the tail publishers that the
     // charts miss; confirm what they found BEFORE paying for enrichment, which
     // is by far the most expensive phase in the run.
-    if (await harvestLeads('long-tail discovery', 'scraping', 32, 8)) return await finishRun();
+    if (await queueHarvest('long-tail discovery', 'scraping', 32, 8)) return await finishRun();
     throwIfCancelled(job.id);
 
     // ── Phase 4: enrichment (+ install-band gate) ────────────────────────────
     setJobPhase(job.id, 'enriching', 'app detail');
     const stopCheck = {
-      shouldStop: () => isCancelRequested(job.id),
+      // The pump can satisfy the lead target MID-ENRICHMENT — from that moment
+      // every further store fetch is pure waste, so the streams drain out here
+      // exactly like a user Stop, except the job then completes successfully.
+      shouldStop: () => isCancelRequested(job.id) || leadTargetMet,
       onProgress: (done: number, total: number) => span(40, 18, done / Math.max(1, total)),
     };
     // ONE fetch budget for the whole run, threaded through both enrichment
@@ -596,8 +698,13 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
     // Enrichment is what unlocks the in-band tail tiers (an app needs its
     // install count and developer contact before it can qualify), so this is
     // where the tail publishers become confirmable.
-    if (await harvestLeads('enriched catalog', 'enriching', 58, 8)) return await finishRun();
+    if (await queueHarvest('enriched catalog', 'enriching', 58, 8)) return await finishRun();
     throwIfCancelled(job.id);
+
+    // Target met mid-enrichment (pump) drains the streams and lands here —
+    // everything after this point is corpus upkeep the filled order does not
+    // need, so go straight to the finish.
+    if (leadTargetMet) return await finishRun();
 
     // ── Phase 5: developer-catalog expansion, then a second enrichment pass ──
     setJobPhase(job.id, 'enriching', 'developer catalogs');
@@ -626,6 +733,8 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
     throwIfCancelled(job.id);
     setJobProgress(job.id, 74);
 
+    if (leadTargetMet) return await finishRun(); // pump satisfied the order during catalogs
+
     // ── Phase 5b: liveness sweep — drop apps the stores no longer list ───────
     // The catalog is permanent and never re-fetched, which is what makes repeat
     // runs fast; this is the counterweight that keeps it honest. Runs BEFORE the
@@ -636,7 +745,7 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
     setJobProgress(job.id, 78);
 
     // ── FINAL LEAD CHECKPOINT — spend whatever budget is left ────────────────
-    await harvestLeads('full catalog', 'classifying', 78, 17);
+    await queueHarvest('full catalog', 'classifying', 78, 17);
     throwIfCancelled(job.id);
 
     return await finishRun();
@@ -651,6 +760,9 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
      * adds no export work of its own.
      */
     async function finishRun(): Promise<void> {
+      // Land the pump FIRST: no pass may rewrite the CSV between here and the
+      // Excel build, or the .xlsx and the .csv would disagree.
+      await stopPump();
       // Every path into finishRun has run at least one checkpoint, so the CSV is
       // already on disk. Rebuild defensively rather than trusting that invariant
       // to survive a future edit — it is local DB work and idempotent.
@@ -701,6 +813,9 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
       }
     }
   } catch (err) {
+    // Land the pump before ANY finalize: a mid-flight confirm pass finishing
+    // after finalize would rewrite the CSV/lead rows of a settled job.
+    if (shutdownPump) await shutdownPump().catch(() => {});
     if (err instanceof JobCancelledError) {
       finalizeCancelledStoreJob(job, onLog);
       return;

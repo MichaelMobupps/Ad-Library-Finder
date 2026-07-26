@@ -138,17 +138,20 @@ function getProxyDispatcher(onLog?: LogFn): Dispatcher | undefined {
  * belong to the burned exit's browsing session and would look stolen on a new
  * IP. No-op without a proxy.
  */
-function rotateProxyExit(onLog?: LogFn): void {
+function rotateProxyExit(onLog?: LogFn, reason: 'blocked' | 'scheduled' = 'blocked'): void {
   if (!PROXY_URL) return;
   proxySessionCounter++;
+  requestsOnCurrentExit = 0;
   const old = proxyDispatcher;
   proxyDispatcher = undefined; // rebuilt lazily by the next request
   if (old) old.close().catch(() => {});
   cookieJar.clear();
   warmedUp = false; // the next warm-up call really warms the NEW exit
+  // A scheduled rotation happens every PROXY_ROTATE_EVERY requests, so it logs
+  // at debug — otherwise a 2,000-call run would emit ~80 info lines.
   onLog?.(
-    'info',
-    `google-ads: rotated proxy exit — new connection pool${PROXY_URL.includes('{session}') ? ' + new {session} id' : ''}`,
+    reason === 'scheduled' ? 'debug' : 'info',
+    `google-ads: rotated proxy exit (${reason}) — new connection pool${PROXY_URL.includes('{session}') ? ' + new {session} id' : ''}`,
   );
 }
 
@@ -220,15 +223,61 @@ function redactProxy(u: string): string {
 }
 
 /**
+ * How many proxied requests may share one exit IP before we proactively rotate.
+ *
+ * MEASURED against the live Proxy-Seller residential pool: a single reused
+ * ProxyAgent produced only **2 distinct exit IPs across 5 requests** (they
+ * alternated 176.x / 95.x), while building a fresh ProxyAgent per request gave
+ * 4 distinct IPs out of 5. The account's "rotate for each request" setting only
+ * takes effect on a NEW CONNECTION — undici's keep-alive pool pins each pooled
+ * connection to an exit, so a process-lifetime dispatcher meant an entire run's
+ * Ads Transparency traffic egressed from a couple of IPs and got penalty-boxed.
+ *
+ * Rotation is not free: rotateProxyExit() also drops the cookie jar (cookies
+ * issued to the burned exit look stolen on a new IP), so each rotation costs a
+ * re-warm. 25 amortises that to ~4% overhead while turning "2 IPs per run" into
+ * one exit per 25 requests — for a 2,000-call confirmation budget, ~80 distinct
+ * exits instead of 2. Set 1 to rotate every request (max diversity, a warm-up
+ * per call), or 0 to restore the old never-rotate behaviour.
+ */
+const PROXY_ROTATE_EVERY = clampInt(process.env.GOOGLE_ADS_PROXY_ROTATE_EVERY, 25, 0, 10_000);
+let requestsOnCurrentExit = 0;
+
+/**
  * Attach the proxy dispatcher to a fetch init when one is configured. The DOM
  * `RequestInit` type has no `dispatcher` field (it's a Node/undici extension),
  * so the assignment is cast locally — this is the one supported way to proxy the
  * global fetch on Node 20.
+ *
+ * Also drives PROACTIVE exit rotation (see PROXY_ROTATE_EVERY). Rotation happens
+ * BEFORE the dispatcher is taken, so this request is the first on the new exit.
  */
 function withProxy(init: RequestInit, onLog?: LogFn): RequestInit {
+  if (PROXY_URL && PROXY_ROTATE_EVERY > 0) requestsOnCurrentExit++;
   const d = getProxyDispatcher(onLog);
   if (d) (init as { dispatcher?: Dispatcher }).dispatcher = d;
   return init;
+}
+
+/**
+ * Rotate the exit if this one has served its quota, then make sure the NEW exit
+ * is warm before anything important goes out on it.
+ *
+ * Deliberately called from an ASYNC boundary (the top of rpcPost) rather than
+ * from withProxy: rotateProxyExit() clears the cookie jar, and withProxy is
+ * synchronous, so rotating there left exactly one RPC per rotation egressing
+ * from a fresh, cookie-less exit — the shape Google rate-limits hardest. Here
+ * the re-warm can be awaited, so every RPC runs on a warm session.
+ */
+async function rotateExitIfDue(onLog?: LogFn): Promise<void> {
+  if (!PROXY_URL || PROXY_ROTATE_EVERY <= 0) return;
+  if (requestsOnCurrentExit >= PROXY_ROTATE_EVERY) rotateProxyExit(onLog, 'scheduled');
+  if (!warmedUp) await warmUpSession(onLog);
+}
+
+/** Requests made on the current exit — exported for tests/diagnostics. */
+export function proxyRequestsOnCurrentExit(): number {
+  return requestsOnCurrentExit;
 }
 
 /** True when an outbound proxy is configured for the scraper. */
@@ -1002,6 +1051,13 @@ async function rpcPost(
   const body = new URLSearchParams({ 'f.req': JSON.stringify(payload) }).toString();
   onLog?.('debug', `google-ads rpc ${label} → ${method}`);
   const maxRetries = opts?.maxRetries ?? MAX_RETRIES;
+
+  // Proactive exit rotation + re-warm. rotateProxyExit() drops the cookie jar
+  // with the burned IP (cookies issued to one exit look stolen on another), so
+  // the re-warm here is what keeps every RPC on a warm session. Both are no-ops
+  // when nothing is due, costing one homepage GET per PROXY_ROTATE_EVERY calls.
+  await rotateExitIfDue(onLog);
+  if (!warmedUp) await warmUpSession(onLog);
 
   let last: RpcOutcome = { json: null, status: 0, blocked: false, error: 'no attempt' };
   for (let attempt = 0; attempt <= maxRetries; attempt++) {

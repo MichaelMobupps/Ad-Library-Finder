@@ -179,6 +179,16 @@ export function countStoreLinkAds(ads: MetaAd[]): number {
   return n;
 }
 
+/** Pure: drop queue entries already confirmation-checked at/after `since`.
+ *  undefined/null since ⇒ queue unchanged. Exported for tests. */
+export function filterUncheckedSince<T extends { last_confirm_at: number | null }>(
+  queue: T[],
+  since: number | null | undefined,
+): T[] {
+  if (since == null) return queue;
+  return queue.filter((p) => p.last_confirm_at == null || p.last_confirm_at < since);
+}
+
 // ── main ─────────────────────────────────────────────────────────────────────
 
 export async function confirmPublishers(
@@ -200,6 +210,18 @@ export async function confirmPublishers(
      * lead had landed.
      */
     enough?: () => boolean;
+    /**
+     * Skip publishers whose last confirmation attempt is at/after this epoch —
+     * i.e. "already checked THIS RUN". The pipeline now runs MANY confirmation
+     * passes per run (a continuous background pump + phase barriers), all
+     * sharing one budget; without this filter a pass whose queue starts with
+     * publishers the previous pass just checked re-spends budget re-asking the
+     * same question, which is paid API calls and proxy GB for zero information.
+     */
+    skipConfirmedSince?: number;
+    /** Skip the session warm-up (the cookie jar is module-global, so one warm-up
+     *  per RUN is enough — pass true on every pass after the first). */
+    skipWarmUp?: boolean;
   },
 ): Promise<ConfirmSummary> {
   const onLog = opts.onLog;
@@ -208,7 +230,7 @@ export async function confirmPublishers(
     skipped: false, reachedTarget: false, note: '',
   };
 
-  const queue = listPublishersForConfirmation();
+  const queue = filterUncheckedSince(listPublishersForConfirmation(), opts.skipConfirmedSince);
   summary.queued = queue.length;
   if (queue.length === 0) {
     summary.note = 'no eligible publishers';
@@ -238,7 +260,7 @@ export async function confirmPublishers(
   }
 
   // Warm one cookie session up-front (best-effort; rpcPost still backs off).
-  if (gatcAvailable) {
+  if (gatcAvailable && !opts.skipWarmUp) {
     const warm = await warmUpSession(onLog);
     if (warm.blocked) onLog?.('warn', 'confirm: warm-up was blocked — proceeding but the exit IP may be penalty-boxed');
   }
@@ -414,6 +436,22 @@ export function runStoreConfirmTests(): { passed: number; failed: number; failur
     if (cond) passed++;
     else failures.push(`FAIL: ${desc}`);
   };
+
+  // filterUncheckedSince — the guard that keeps the run's MANY confirmation
+  // passes (background pump + phase barriers) from re-charging the same
+  // publisher against one shared budget.
+  {
+    const q = (last: number | null) => ({ last_confirm_at: last });
+    const T = 1_000_000;
+    const queue = [q(null), q(T - 1), q(T), q(T + 1)];
+    check(filterUncheckedSince(queue, undefined).length === 4, 'since undefined ⇒ queue unchanged');
+    check(filterUncheckedSince(queue, null).length === 4, 'since null ⇒ queue unchanged');
+    const kept = filterUncheckedSince(queue, T);
+    check(kept.length === 2, `checked at/after runStart dropped (kept ${kept.length}/4)`);
+    check(kept[0].last_confirm_at === null, 'never-checked publisher always kept');
+    check(kept[1].last_confirm_at === T - 1, 'checked BEFORE the run kept (stale verdict, re-checkable)');
+    check(filterUncheckedSince([], T).length === 0, 'empty queue stays empty');
+  }
 
   const adv = (o: Partial<GoogleAdsAdvertiser>): GoogleAdsAdvertiser => ({
     advertiser_id: 'AR1', name: '', domain: null, region: null, matchedKeyword: '', ...o,
