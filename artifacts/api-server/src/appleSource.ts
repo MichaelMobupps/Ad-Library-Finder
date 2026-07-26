@@ -18,6 +18,7 @@
 
 import {
   ITUNES_REQUEST_INTERVAL_MS,
+  ITUNES_CONCURRENCY,
   ITUNES_LOOKUP_BATCH,
   ITUNES_SEARCH_LIMIT,
   APPLE_CHART_NUM,
@@ -33,10 +34,15 @@ const FETCH_HEADERS = {
   'Accept-Language': 'en-US,en;q=0.9',
 };
 
-// One limiter for EVERY itunes.apple.com call (spec: 10 req/min across all iTunes
-// endpoints). Charts, lookup, catalog and search all share this single budget —
-// the chart feed is served from itunes.apple.com too (see appleChart).
-const itunesLimiter = new RateLimiter(ITUNES_REQUEST_INTERVAL_MS);
+// One limiter for EVERY itunes.apple.com call across all iTunes endpoints.
+// Charts, lookup, catalog and search all share this single budget — the chart
+// feed is served from itunes.apple.com too (see appleChart).
+//
+// The interval was halved (6s → 3s, i.e. 10 → 20 req/min) because the
+// developer-catalog phase is one un-batchable request per catalog and was the
+// binding constraint on a measured 26-minute phase. Concurrency stays 1: Apple
+// is stricter than Play, and doubling the rate is already the change under test.
+const itunesLimiter = new RateLimiter(ITUNES_REQUEST_INTERVAL_MS, ITUNES_CONCURRENCY);
 
 export interface AppleListApp {
   appId: string; // numeric track id, as string

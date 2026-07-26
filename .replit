@@ -51,6 +51,22 @@ externalPort = 6800
 localPort = 3910
 externalPort = 8000
 
+[[ports]]
+localPort = 3911
+externalPort = 8008
+
+[[ports]]
+localPort = 3912
+externalPort = 8080
+
+[[ports]]
+localPort = 3913
+externalPort = 8081
+
+[[ports]]
+localPort = 3914
+externalPort = 8099
+
 [env]
 NODE_ENV = "production"
 PORT = "3001"

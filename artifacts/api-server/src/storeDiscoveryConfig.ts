@@ -216,10 +216,40 @@ export const CONFIRMATION_HARD_MAX_API_CALLS = clampInt(
 // Throttles (store endpoints)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** Play: 1 request / second across google-play-scraper calls. */
+/** Play: 1 request / second PER STREAM across google-play-scraper calls. */
 export const PLAY_REQUEST_INTERVAL_MS = clampInt(process.env.STORE_PLAY_INTERVAL_MS, 1_000, 0, 30_000); // (env)
-/** iTunes: 10 requests / minute across ALL itunes.apple.com endpoints ⇒ 6000ms. */
-export const ITUNES_REQUEST_INTERVAL_MS = clampInt(process.env.STORE_ITUNES_INTERVAL_MS, 6_000, 0, 60_000); // (env)
+/**
+ * How many Play requests may be in flight at once.
+ *
+ * This is THE speed lever for the whole pipeline. Enrichment is one Play detail
+ * fetch per app, and at concurrency 1 a measured run spent 5,682 serialized
+ * fetches = 1h50m, i.e. 71% of a 2h34m job, while the Apple stream sat idle
+ * after 48 seconds. The limiter divides the interval by this number, so the
+ * aggregate target rate is `concurrency` req/s — five polite 1-req/s streams,
+ * not a five-fold increase in per-stream aggression.
+ *
+ * Play answers these from public listing pages and tolerates this comfortably
+ * from a residential exit; `playRequestBlocked()` additionally trips an adaptive
+ * backoff across every stream on a 429/403/block page. Set to 1 to restore the
+ * old strictly-serial behaviour.
+ */
+export const PLAY_CONCURRENCY = clampInt(process.env.STORE_PLAY_CONCURRENCY, 5, 1, 16); // (env)
+/**
+ * iTunes: interval between requests across ALL itunes.apple.com endpoints.
+ *
+ * Was 6000ms (10 req/min) — deliberately far under Apple's practical tolerance,
+ * and the binding constraint on the developer-catalog phase, which is one
+ * un-batchable request per catalog: a measured run spent 26 minutes there, of
+ * which Apple's 250 catalogs were ~25 min while Play's 250 finished in ~8 and
+ * idled. 3000ms (20 req/min) halves that phase and still leaves generous
+ * headroom; the /lookup path batches 100 ids per request either way.
+ */
+export const ITUNES_REQUEST_INTERVAL_MS = clampInt(process.env.STORE_ITUNES_INTERVAL_MS, 3_000, 0, 60_000); // (env)
+/** In-flight cap for iTunes. Deliberately 1: Apple is stricter than Play and the
+ *  interval above already doubled the rate. Raise only with evidence. */
+export const ITUNES_CONCURRENCY = clampInt(process.env.STORE_ITUNES_CONCURRENCY, 1, 1, 8); // (env)
+/** How long a detected Play block backs off EVERY Play stream. */
+export const PLAY_BLOCK_BACKOFF_MS = clampInt(process.env.STORE_PLAY_BLOCK_BACKOFF_MS, 30_000, 0, 600_000); // (env)
 /** iTunes /lookup batch size (Apple tolerates ~200; stay at 100). */
 export const ITUNES_LOOKUP_BATCH = clampInt(process.env.STORE_ITUNES_BATCH, 100, 1, 200); // (env)
 /** iTunes store search page size (max 200). */

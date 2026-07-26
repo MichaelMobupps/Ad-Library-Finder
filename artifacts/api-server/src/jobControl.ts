@@ -53,3 +53,28 @@ export function throwIfCancelled(jobId: string): void {
 export function clearCancelState(jobId: string): void {
   lastCheck.delete(jobId);
 }
+
+// ── Active-run registry ──────────────────────────────────────────────────────
+// The queue runs jobs CONCURRENTLY (parallel across users). Pipelines with
+// module-global session state (the GATC cookie jar + adaptive throttle shared
+// by google_ads and store_first's confirmation) consult this to avoid resetting
+// a session another in-flight job is using.
+
+const activeBySource = new Map<string, number>();
+
+export function beginJobRun(source: string): void {
+  activeBySource.set(source, (activeBySource.get(source) ?? 0) + 1);
+}
+
+export function endJobRun(source: string): void {
+  const n = (activeBySource.get(source) ?? 1) - 1;
+  if (n <= 0) activeBySource.delete(source);
+  else activeBySource.set(source, n);
+}
+
+/** How many jobs of the given source(s) are in flight right now. */
+export function activeRunCount(...sources: string[]): number {
+  let n = 0;
+  for (const s of sources) n += activeBySource.get(s) ?? 0;
+  return n;
+}

@@ -388,12 +388,13 @@ jobsRouter.post('/', (req: Request<{}, {}, CreateJobBody>, res: Response) => {
     };
   }
 
-  // Operator-chosen lead cap (20/50/100, or absent = as many as found). Supported
-  // by the two sources that routinely return hundreds of leads; stored on
-  // sourceParams so each pipeline reads it the same way. Invalid/0/negative
-  // normalizes to null (uncapped) rather than to an empty export.
+  // Operator-chosen lead cap (20/50/100, or absent = as many as found).
+  // Supported by EVERY source — stored on sourceParams so each pipeline reads
+  // it the same way and caps its CSV/Excel export (discovery still runs in
+  // full; nothing found is thrown away). Invalid/0/negative normalizes to null
+  // (uncapped) rather than to an empty export.
   const leadCap = normalizeMaxLeads(maxLeads);
-  if (leadCap != null && (jobSource === 'google_ads' || jobSource === 'store_first')) {
+  if (leadCap != null) {
     sourceParams = { ...(sourceParams || {}), maxLeads: leadCap };
   }
 

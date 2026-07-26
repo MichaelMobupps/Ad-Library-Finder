@@ -2,7 +2,33 @@
  * Store-first discovery pipeline (spec IMPLEMENTATION steps 3–13, orchestration).
  *
  * The `store_first` job source. DISCOVERY is app-store data; GATC/Meta only
- * CONFIRM. Phases, in order:
+ * CONFIRM.
+ *
+ * LEAD-FIRST ORDERING. A lead is a CONFIRMED advertiser, so confirmation is the
+ * only phase that produces one. It used to run once, as phase 7 of 10, behind
+ * every discovery and enrichment phase — which meant a run stopped (or merely
+ * slow) at any earlier point exported NOTHING, however large the corpus it had
+ * already built. Measured on a real 2h34m run: 4,117 publishers rolled up,
+ * 0 leads delivered, because the job never reached confirmation.
+ *
+ * Confirmation is now a CHECKPOINT the pipeline reaches repeatedly — the first
+ * one right after the chart harvest, seconds in. Each checkpoint does rollup →
+ * confirm a slice of the budget → score → write the CSV. So leads accumulate
+ * from the opening minutes, a Stop at any moment exports what is on the table,
+ * and a job with a lead target STOPS AS SOON AS IT IS MET instead of grinding
+ * through phases whose output it no longer needs.
+ *
+ * HOW MUCH the first checkpoints yield depends on the corpus, and the honest
+ * statement is worth having in writing: rollupPublishers builds from
+ * allDoneAppDetails(), i.e. ENRICHED apps only. Against an established corpus
+ * (the normal case — production carries thousands of enriched apps and
+ * publishers) checkpoint 1 has a full corpus to roll up and confirm, so a small
+ * order can be filled within seconds of the job starting. Against a COLD corpus
+ * there is nothing enriched yet, so checkpoints 1 and 2 legitimately find
+ * nothing and the first leads appear at checkpoint 3, after enrichment. Both
+ * cases still beat the old pipeline, which produced nothing until 80%.
+ *
+ * Phases, in order:
  *   1. Chart harvest        — Play TOP_FREE/TOP_GROSSING + Apple top-free per
  *                             active vertical × market (source=chart, depth 0).
  *   2. Similar crawl (Play) — BFS from chart apps to SIMILAR_MAX_DEPTH, bounded by
@@ -16,11 +42,13 @@
  *  5b. Liveness sweep       — re-checks least-recently-verified known apps and
  *                             tombstones the ones the stores no longer list, so a
  *                             permanent never-re-fetched catalog cannot drift.
- *   6. Rollup               — publishers + portfolio aggregates.
- *   7. Confirmation         — GATC (RPC) + optional Meta, budgeted.
- *   8. Scoring              — charted vs tail-only profiles.
- *   9. Leads + CSV          — one lead per publisher, Prospector export.
- *  10. HQ split             — the per-HQ-country .xlsx bundle every other source
+ *   6. Liveness sweep       — see 5b.
+ *   -- LEAD CHECKPOINT --   — rollup + confirmation (GATC RPC + optional Meta,
+ *                             budgeted) + scoring + CSV. Runs after the charts,
+ *                             after discovery, after enrichment and at the end;
+ *                             any of them may finish the job early once the
+ *                             requested lead count is on the table.
+ *   7. HQ split             — the per-HQ-country .xlsx bundle every other source
  *                             emits, so one run yields one Excel with no second
  *                             search and no separate confirmation step.
  *
@@ -61,6 +89,7 @@ import {
   LIVENESS_RECHECK_AFTER_DAYS,
   DEV_CATALOG_MAX_PER_RUN,
   DEV_CATALOG_MAX_APPS_PER_RUN,
+  ENRICH_MAX_APPS_PER_RUN,
 } from './storeDiscoveryConfig.js';
 import {
   upsertDiscoveredApp,
@@ -84,9 +113,15 @@ import { expandPlayCategories, playChart, playSimilar, playDeveloper, playSearch
 import { appleChart, appleDeveloper, appleSearch, appleLiveness } from './appleSource.js';
 import { enrichApps, type EnrichWorkItem, type EnrichSummary } from './storeEnrich.js';
 import { rollupPublishers } from './publisherRollup.js';
-import { confirmPublishers } from './storeConfirm.js';
+import { confirmPublishers, type ConfirmSummary } from './storeConfirm.js';
 import { scoreAllPublishers } from './publisherScore.js';
-import { buildPublisherCsv, leadHistorySeed, persistPublisherLeads } from './storeLeads.js';
+import {
+  buildPublisherCsv,
+  leadHistorySeed,
+  persistPublisherLeads,
+  dedupePublishers,
+  type DedupeSeed,
+} from './storeLeads.js';
 import { notifyJobCompleted, notifyJobFailed } from './notifier.js';
 import { log } from './logger.js';
 
@@ -123,20 +158,201 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
     // wall-clock shares). Each phase reports fraction-done inside its span;
     // setJobProgress is monotonic, so concurrent streams can't move it backwards
     // and an early-finishing phase just jumps to its span end at the barrier.
-    //   charts 0-15 · similar+search 15-40 · enrich 40-65 · catalogs 65-75 ·
-    //   liveness 75-79 · rollup 79-80 · confirm 80-92 · score 92-93 ·
-    //   CSV 93-95 · HQ split 95-100 (completion pins 100).
+    //
+    // Lead checkpoints are interleaved, so the discovery phases were compressed
+    // to make room for them:
+    //   charts 0-6 · CHECKPOINT 6-18 · similar+search 18-32 · CHECKPOINT 32-40 ·
+    //   enrich 40-58 · CHECKPOINT 58-66 · catalogs 66-74 · liveness 74-78 ·
+    //   FINAL CHECKPOINT 78-95 · HQ split 95-100 (completion pins 100).
+    // A checkpoint that meets the lead target jumps straight to the HQ split.
     const span = (base: number, width: number, frac: number) =>
       setJobProgress(job.id, base + width * Math.max(0, Math.min(1, frac)));
 
+    // ── Lead harvesting (see the LEAD-FIRST ORDERING note at the top) ────────
+    //
+    // State shared by every checkpoint. The confirmation budget is a single
+    // per-run pool spent across all of them, so repeated checkpoints cost the
+    // operator no more paid calls than the old single terminal pass did —
+    // listPublishersForConfirmation orders never-confirmed first, so each
+    // checkpoint advances through the backlog rather than re-checking the head.
+    // Run counters. Declared UP HERE, not at the phase that computes them,
+    // because finishRun() reads all of them and any checkpoint may call it —
+    // a `const` declared at its phase would still be in the temporal dead zone
+    // when an early exit runs, crashing the very fast path this restructure adds.
+    let chartRows = 0;
+    let newSimilar = 0;
+    let searchRows = 0;
+    let catalogApps = 0;
+    let enrichSummary: EnrichSummary = {
+      apps: 0, enriched: 0, cached: 0, failed: 0, games: 0, nonGames: 0, unclassified: 0,
+      inBand: 0, outOfBand: 0, requests: 0, cappedOut: 0, budgetLeft: ENRICH_MAX_APPS_PER_RUN,
+    };
+
+    let confirmSpent = 0;
+    // Run-wide confirmation totals. There are several confirmation passes now, so
+    // the summary must aggregate them; `queued` is a snapshot of the eligible
+    // backlog, so it takes the LAST pass's value rather than a meaningless sum.
+    const confirmTotals: ConfirmSummary = {
+      queued: 0, processed: 0, apiCalls: 0, confirmed: 0, gatcHits: 0, metaHits: 0,
+      skipped: false, reachedTarget: false, note: '',
+    };
+    let confirmPasses = 0;
+    let leadsOnTable = 0;
+    let csvPath: string | null = null;
+    let leadTargetMet = false;
+
+    /**
+     * Publishers that would actually land in the CSV right now: confirmed, minus
+     * the ones earlier jobs already delivered.
+     *
+     * This is deliberately the DEDUPED count. The live counter used to report
+     * countConfirmedPublishers() — corpus-wide, including leads long since
+     * exported by other jobs — so the UI could sit at "20 leads" while the CSV
+     * held three. `seed` is passed in and computed once per checkpoint: nothing
+     * persists into job_results mid-checkpoint, so it cannot go stale inside one.
+     */
+    const exportableNow = (seed: DedupeSeed): number => dedupePublishers(leadEligiblePublishers(), seed).length;
+
+    /**
+     * Turn the corpus as it stands into leads, then report whether the job can
+     * stop. rollup + scoring are pure local DB work (measured at ~1s on a
+     * 4,000-publisher corpus), so running them per checkpoint is free next to a
+     * single confirmation RPC.
+     *
+     * Returns true when the requested lead count is on the table — the caller
+     * skips straight to the finish.
+     */
+    const harvestLeads = async (
+      label: string,
+      /**
+       * The COARSE phase to report while this checkpoint runs.
+       *
+       * The UI stepper is an ordered list (scraping → classifying → enriching →
+       * building_csv), so a checkpoint that always reported 'classifying' would
+       * drive it BACKWARDS every time the run returned to discovery or
+       * enrichment. Each checkpoint therefore reports the stage it sits in and
+       * the checkpoint activity rides in phase_detail, which keeps the stepper
+       * monotonic while still naming what is actually happening.
+       */
+      phase: 'scraping' | 'enriching' | 'classifying',
+      progressBase: number,
+      progressWidth: number,
+    ): Promise<boolean> => {
+      setJobPhase(job.id, phase, `finding advertisers — ${label}`);
+      rollupPublishers(onLog);
+
+      const budgetLeft = Math.max(0, params.confirmationMaxApiCalls - confirmSpent);
+      const seed = leadHistorySeed();
+      const target = params.maxLeads;
+
+      // CORPUS FAST PATH: the shared corpus is permanent, so an order small
+      // enough to be filled from publishers ALREADY confirmed by earlier runs
+      // needs no confirmation at all. Checked before the budget is touched, so
+      // such a job costs zero paid API calls (and zero residential proxy
+      // traffic) and finishes in the time it takes to roll up and write a CSV.
+      const alreadyDeliverable = exportableNow(seed);
+      const orderAlreadyFilled = target != null && alreadyDeliverable >= target;
+      if (orderAlreadyFilled) {
+        onLog(
+          'info',
+          `checkpoint "${label}": corpus already holds ${alreadyDeliverable} deliverable lead(s) ` +
+            `(target ${target}) — skipping confirmation entirely, no API calls spent`,
+        );
+      }
+
+      if (budgetLeft > 0 && !orderAlreadyFilled) {
+        // Recomputed in onProgress and READ by `enough`. storeConfirm calls
+        // onProgress before enough, so this is always current; evaluating
+        // exportableNow() in both would scan the publisher table twice per
+        // confirmation for the same answer.
+        //
+        // Only recomputed when the confirmed count actually MOVED: exportableNow
+        // is a full publisher scan plus a dedupe pass, and a publisher that came
+        // back "not advertising" cannot have changed the exportable total. On a
+        // large corpus this is the difference between one scan per API call and
+        // one scan per actual lead.
+        let liveExportable = alreadyDeliverable;
+        let lastConfirmedSeen = -1;
+        const confirm = await confirmPublishers({
+          maxApiCalls: budgetLeft,
+          onLog,
+          shouldStop: () => isCancelRequested(job.id),
+          // Stop the moment the order is filled. Without this a 20-lead job
+          // spent its entire budget (and the proxy spend behind it) long after
+          // the 20th lead had landed.
+          enough: target == null ? undefined : () => liveExportable >= target,
+          onProgress: (st) => {
+            if (st.confirmed !== lastConfirmedSeen) {
+              lastConfirmedSeen = st.confirmed;
+              liveExportable = exportableNow(seed);
+              setJobLeadsFound(job.id, liveExportable);
+            }
+            span(progressBase, progressWidth, st.processed / Math.max(1, st.queued));
+            if (st.processed % 10 === 0) {
+              setJobPhase(
+                job.id,
+                phase,
+                `finding advertisers — ${label} · ${st.processed}/${st.queued} checked, ${st.confirmed} advertising`,
+              );
+            }
+          },
+        });
+        confirmSpent += confirm.apiCalls;
+        confirmPasses++;
+        confirmTotals.queued = confirm.queued;
+        confirmTotals.processed += confirm.processed;
+        confirmTotals.apiCalls += confirm.apiCalls;
+        confirmTotals.confirmed += confirm.confirmed;
+        confirmTotals.gatcHits += confirm.gatcHits;
+        confirmTotals.metaHits += confirm.metaHits;
+        // "skipped" only stands if EVERY pass was skipped (cooldown / no provider).
+        confirmTotals.skipped = confirm.skipped && (confirmPasses === 1 || confirmTotals.skipped);
+        confirmTotals.reachedTarget = confirmTotals.reachedTarget || confirm.reachedTarget;
+        confirmTotals.note = confirm.note;
+      }
+
+      // Export EVERY time, so a stop (or a crash) at any later point still has a
+      // complete, downloadable CSV sitting on disk for this job.
+      scoreAllPublishers(onLog);
+      leadsOnTable = exportLeadsSoFar();
+      setJobLeadsFound(job.id, leadsOnTable);
+      setJobProgress(job.id, progressBase + progressWidth);
+
+      if (params.maxLeads != null && leadsOnTable >= params.maxLeads) {
+        leadTargetMet = true;
+        onLog(
+          'info',
+          `lead target met: ${leadsOnTable}/${params.maxLeads} leads after "${label}" ` +
+            `(${confirmSpent}/${params.confirmationMaxApiCalls} confirmation calls spent) — skipping the remaining discovery phases`,
+        );
+        return true;
+      }
+      onLog('info', `checkpoint "${label}": ${leadsOnTable} lead(s) exportable so far`);
+      return false;
+    };
+
+    /**
+     * (Re)write this job's CSV from the confirmed corpus and persist the rows
+     * into the shared lead store. Rebuilt from scratch each checkpoint rather
+     * than appended: clearJobResults first means the job's OWN earlier rows
+     * never dedupe its later export away (the same trap the resume path fixed),
+     * and the result is idempotent, so the file on disk is always the complete
+     * current answer instead of a partial that a later crash would freeze.
+     */
+    function exportLeadsSoFar(): number {
+      const out = rebuildJobLeadExport(job.id, params.maxLeads);
+      csvPath = out.path;
+      return out.rowsWritten;
+    }
+
     // ── Phase 1: chart harvest — Play and Apple streams CONCURRENTLY ─────────
-    // The two stores have independent rate limiters (Play 1 req/s, iTunes
-    // 1 req/6s), so running them serially paid Play-time PLUS Apple-time for no
+    // The two stores have independent rate limiters (Play ~5 req/s spread over
+    // PLAY_CONCURRENCY streams, iTunes 1 req/3s), so running them serially paid
+    // Play-time PLUS Apple-time for no
     // reason. Two streams over the same (vertical x market) grid, each behind
     // its own limiter, finish in max() instead of sum() — the same requests,
     // the same politeness, roughly half the wall-clock.
     setJobPhase(job.id, 'scraping', 'charts');
-    let chartRows = 0;
     const chartCells: Array<{ v: NonNullable<ReturnType<typeof verticalById>>; market: string }> = [];
     for (const vId of params.verticals) {
       const v = verticalById(vId);
@@ -151,7 +367,7 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
         'scraping',
         `charts — Play ${playCellsDone}/${chartCells.length} · Apple ${appleCellsDone}/${chartCells.length}`,
       );
-      span(0, 15, (playCellsDone + appleCellsDone) / Math.max(1, chartCells.length * 2));
+      span(0, 6, (playCellsDone + appleCellsDone) / Math.max(1, chartCells.length * 2));
     };
     const playChartsTask = async () => {
       for (const { v, market } of chartCells) {
@@ -194,6 +410,15 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
     throwIfCancelled(job.id);
     onLog('info', `charts done: ${chartRows} chart sightings; ${countDiscoveredApps()} distinct (store,app,country) rows`);
 
+    // ── LEAD CHECKPOINT 1 — the cheapest, highest-yield one ──────────────────
+    // Charted publishers are the TOP tier of listPublishersForConfirmation's
+    // priority order, and the chart harvest that produces them is the fastest
+    // phase in the pipeline (48s on a measured single-market run). So the first
+    // leads can be on the table about a minute into a job, and a small order is
+    // frequently filled here outright — before a single enrichment fetch.
+    if (await harvestLeads('top charts', 'scraping', 6, 12)) return await finishRun();
+    throwIfCancelled(job.id);
+
     // ── Phases 2+3: similar crawl (Play) OVERLAPPED with the search battery ──
     //
     // The similar crawl is Play-only, so the iTunes limiter used to sit idle for
@@ -229,7 +454,7 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
       Math.min(SIMILAR_MAX_REQUESTS_PER_RUN, params.similarMaxAppsPerRun > 0 ? SIMILAR_MAX_REQUESTS_PER_RUN : 0) +
         Math.min(perStoreSearchBudget, searchCells.length) * 2,
     );
-    const p23tick = () => span(15, 25, ++p23done / p23total);
+    const p23tick = () => span(18, 14, ++p23done / p23total);
 
     /** One store's half of the battery: LRU-ordered over ITS OWN stamps. */
     const runSearchStore = async (store: StoreKind): Promise<{ cells: number; rows: number }> => {
@@ -326,8 +551,8 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
       runSearchStore('app_store'),
     ]);
     throwIfCancelled(job.id);
-    const newSimilar = playTrack.similar.newApps;
-    const searchRows = playTrack.search.rows + appleSearchHalf.rows;
+    newSimilar = playTrack.similar.newApps;
+    searchRows = playTrack.search.rows + appleSearchHalf.rows;
     onLog(
       'info',
       `search battery done: Play ${playTrack.search.cells} + Apple ${appleSearchHalf.cells} cells ` +
@@ -341,128 +566,139 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
       );
     }
 
-    setJobProgress(job.id, 40); // phase 2+3 barrier
+    setJobProgress(job.id, 32); // phase 2+3 barrier
+
+    // ── LEAD CHECKPOINT 2 — after the long-tail discovery ────────────────────
+    // The similar crawl and the search battery add the tail publishers that the
+    // charts miss; confirm what they found BEFORE paying for enrichment, which
+    // is by far the most expensive phase in the run.
+    if (await harvestLeads('long-tail discovery', 'scraping', 32, 8)) return await finishRun();
+    throwIfCancelled(job.id);
 
     // ── Phase 4: enrichment (+ install-band gate) ────────────────────────────
     setJobPhase(job.id, 'enriching', 'app detail');
     const stopCheck = {
       shouldStop: () => isCancelRequested(job.id),
-      onProgress: (done: number, total: number) => span(40, 25, done / Math.max(1, total)),
+      onProgress: (done: number, total: number) => span(40, 18, done / Math.max(1, total)),
     };
-    let enrichSummary = await enrichApps(buildWorklist(), onLog, stopCheck);
+    // ONE fetch budget for the whole run, threaded through both enrichment
+    // passes. It used to be a fresh ENRICH_MAX_APPS_PER_RUN per call, so a run
+    // quietly spent up to double the configured ceiling.
+    enrichSummary = await enrichApps(buildWorklist(), onLog, {
+      ...stopCheck,
+      fetchBudget: ENRICH_MAX_APPS_PER_RUN,
+    });
     logEnrich(onLog, 'enrichment', enrichSummary);
     throwIfCancelled(job.id);
-    setJobProgress(job.id, 65);
+    setJobProgress(job.id, 58);
+
+    // ── LEAD CHECKPOINT 3 — after enrichment ─────────────────────────────────
+    // Enrichment is what unlocks the in-band tail tiers (an app needs its
+    // install count and developer contact before it can qualify), so this is
+    // where the tail publishers become confirmable.
+    if (await harvestLeads('enriched catalog', 'enriching', 58, 8)) return await finishRun();
+    throwIfCancelled(job.id);
 
     // ── Phase 5: developer-catalog expansion, then a second enrichment pass ──
     setJobPhase(job.id, 'enriching', 'developer catalogs');
-    const catalogApps = await expandDeveloperCatalogs(onLog, job.id);
+    catalogApps = await expandDeveloperCatalogs(onLog, job.id);
     setJobProgress(job.id, 70);
     if (catalogApps > 0) {
       onLog('info', `dev-catalog: +${catalogApps} portfolio apps discovered; re-enriching`);
+      // Relabel: this is a SECOND enrichment pass, not the catalog fetch. Leaving
+      // the detail on "developer catalogs" is precisely what made the reported
+      // job look frozen — it sat at 73% under that label for the better part of
+      // an hour while it was actually enriching.
+      setJobPhase(job.id, 'enriching', `app detail (portfolio pass — ${catalogApps} new apps)`);
+      // Spends only what the FIRST pass left of the run's single fetch budget.
+      // Previously this call received a fresh full budget, so one run could make
+      // 2x ENRICH_MAX_APPS_PER_RUN network fetches (measured: 3,202 + 2,480
+      // against a stated cap of 4,000) — the single largest block of wall-clock
+      // in the whole pipeline, most of it spent re-walking backlog rather than
+      // the catalog apps this pass exists to enrich.
       enrichSummary = await enrichApps(buildWorklist(), onLog, {
         shouldStop: stopCheck.shouldStop,
-        onProgress: (done, total) => span(70, 5, done / Math.max(1, total)),
+        onProgress: (done, total) => span(70, 4, done / Math.max(1, total)),
+        fetchBudget: enrichSummary.budgetLeft,
       });
       logEnrich(onLog, 're-enrichment', enrichSummary);
     }
     throwIfCancelled(job.id);
-    setJobProgress(job.id, 75);
+    setJobProgress(job.id, 74);
 
     // ── Phase 5b: liveness sweep — drop apps the stores no longer list ───────
     // The catalog is permanent and never re-fetched, which is what makes repeat
     // runs fast; this is the counterweight that keeps it honest. Runs BEFORE the
-    // rollup so a delisting is reflected in this run's publishers, not next run's.
+    // final checkpoint so a delisting is reflected in this run's publishers.
     setJobPhase(job.id, 'enriching', 'liveness sweep');
-    const liveness = await sweepLiveness(onLog, job.id);
+    await sweepLiveness(onLog, job.id);
     throwIfCancelled(job.id);
-    setJobProgress(job.id, 79);
+    setJobProgress(job.id, 78);
 
-    // ── Phase 6: publisher rollup ────────────────────────────────────────────
-    setJobPhase(job.id, 'classifying', 'publisher rollup');
-    rollupPublishers(onLog);
-    setJobProgress(job.id, 80);
-
-    // ── Phase 7: confirmation (GATC RPC + optional Meta), budgeted ───────────
-    setJobPhase(job.id, 'classifying', 'confirmation');
-    const confirm = await confirmPublishers({
-      maxApiCalls: params.confirmationMaxApiCalls,
-      onLog,
-      shouldStop: () => isCancelRequested(job.id),
-      // LIVE lead counter: the export is confirmed-only, so the honest mid-run
-      // "leads so far" is the corpus-wide confirmed-publisher count as verdicts
-      // land. Also surfaced in the phase detail so the Jobs list shows it.
-      onProgress: (s) => {
-        setJobLeadsFound(job.id, countConfirmedPublishers());
-        span(80, 12, s.processed / Math.max(1, s.queued));
-        if (s.processed % 10 === 0) {
-          setJobPhase(job.id, 'classifying', `confirming advertisers ${s.processed}/${s.queued} · ${s.confirmed} confirmed this run`);
-        }
-      },
-    });
+    // ── FINAL LEAD CHECKPOINT — spend whatever budget is left ────────────────
+    await harvestLeads('full catalog', 'classifying', 78, 17);
     throwIfCancelled(job.id);
-    setJobProgress(job.id, 92);
 
-    // ── Phase 8: scoring ─────────────────────────────────────────────────────
-    setJobPhase(job.id, 'classifying', 'scoring');
-    scoreAllPublishers(onLog);
-    setJobProgress(job.id, 93);
+    return await finishRun();
 
-    // ── Phase 9: leads + Prospector CSV ──────────────────────────────────────
-    setJobPhase(job.id, 'building_csv', 'publisher CSV');
-    const discovered = listPublishersByScore(1_000_000);
-    // The deliverable is app companies that PROVABLY advertise, so unconfirmed
-    // publishers are held back from the export (they stay in the Publishers table
-    // and become exportable the run their verdict comes back positive). Reported
-    // explicitly rather than silently: at any finite confirmation budget most of a
-    // large corpus is "not checked yet", and that must not read as "not advertising".
-    const publishers = EXPORT_CONFIRMED_ONLY
-      ? discovered.filter((p) => p.confirmed_advertiser === 1)
-      : discovered;
-    if (EXPORT_CONFIRMED_ONLY) {
-      const unchecked = discovered.filter((p) => p.last_confirm_at == null).length;
+    /**
+     * Land the run: report the funnel, build the per-HQ Excel bundle from the
+     * CSV the last checkpoint already wrote, and mark the job completed.
+     *
+     * Every exit path goes through here — an early one because the lead target
+     * was met, or the full sweep. The CSV and the lead rows are already on disk
+     * and in job_results by this point (each checkpoint rewrites them), so this
+     * adds no export work of its own.
+     */
+    async function finishRun(): Promise<void> {
+      // Every path into finishRun has run at least one checkpoint, so the CSV is
+      // already on disk. Rebuild defensively rather than trusting that invariant
+      // to survive a future edit — it is local DB work and idempotent.
+      if (csvPath == null) leadsOnTable = exportLeadsSoFar();
+      const exportPath = csvPath as string;
+      const discovered = listPublishersByScore(1_000_000);
+      const confirmedCount = discovered.filter((p) => p.confirmed_advertiser === 1).length;
+      if (EXPORT_CONFIRMED_ONLY) {
+        const unchecked = discovered.filter((p) => p.last_confirm_at == null).length;
+        onLog(
+          'info',
+          `export filter: ${confirmedCount}/${discovered.length} publishers confirmed advertising ` +
+            `(${discovered.length - confirmedCount} held back — of those ${unchecked} not yet checked by the confirmation budget)`,
+        );
+      }
+      if (params.maxLeads != null && leadsOnTable >= params.maxLeads) {
+        onLog('info', `lead cap: exported the top ${leadsOnTable} publishers by score (cap ${params.maxLeads})`);
+      }
       onLog(
         'info',
-        `export filter: ${publishers.length}/${discovered.length} publishers confirmed advertising ` +
-          `(${discovered.length - publishers.length} held back — of those ${unchecked} not yet checked by the confirmation budget)`,
+        `CSV written: ${exportPath} (${leadsOnTable} publisher leads; ` +
+          `${confirmSpent}/${params.confirmationMaxApiCalls} confirmation calls spent)`,
       );
-    }
-    // Dedupe against leads earlier jobs already exported, then persist the
-    // survivors into the shared lead store (spec step 12).
-    const { path: csvPath, rowsWritten, exported } = buildPublisherCsv(
-      job.id,
-      publishers,
-      leadHistorySeed(),
-      params.maxLeads,
-    );
-    if (params.maxLeads != null && rowsWritten >= params.maxLeads) {
-      onLog('info', `lead cap: exported the top ${rowsWritten} publishers by score (cap ${params.maxLeads})`);
-    }
-    const persisted = persistPublisherLeads(job.id, exported);
-    onLog(
-      'info',
-      `CSV written: ${csvPath} (${rowsWritten} publisher leads, ${publishers.length - rowsWritten} deduped against existing leads; ${persisted} saved)`,
-    );
 
-    // ── Phase 10: per-HQ-country .xlsx bundle ────────────────────────────────
-    setJobProgress(job.id, 95);
-    await buildExcelBundle(job.id, rowsWritten, onLog);
+      // ── per-HQ-country .xlsx bundle ───────────────────────────────────────
+      setJobProgress(job.id, 95);
+      await buildExcelBundle(job.id, leadsOnTable, onLog);
 
-    // ── Run summary ──────────────────────────────────────────────────────────
-    printRunSummary(onLog, { confirm, enrichSummary, publishers: publishers.length });
+      printRunSummary(onLog, { confirm: confirmTotals, enrichSummary, publishers: confirmedCount });
 
-    // `ads` is this RUN's discovery volume, not the lifetime size of the
-    // discovered_apps table — that table accumulates across every run, so
-    // reporting its total made each job look like it had re-scraped everything.
-    const appsThisRun = chartRows + newSimilar + searchRows + catalogApps;
-    markJobCompleted(job.id, csvPath, { ads: appsThisRun, advertisers: rowsWritten });
-    onLog('info', 'store-first job completed');
+      // `ads` is this RUN's discovery volume, not the lifetime size of the
+      // discovered_apps table — that table accumulates across every run, so
+      // reporting its total made each job look like it had re-scraped everything.
+      const appsThisRun = chartRows + newSimilar + searchRows + catalogApps;
+      markJobCompleted(job.id, exportPath, { ads: appsThisRun, advertisers: leadsOnTable });
+      onLog(
+        'info',
+        leadTargetMet
+          ? `store-first job completed early — ${leadsOnTable}/${params.maxLeads} leads found without needing the remaining phases`
+          : 'store-first job completed',
+      );
 
-    const fresh = getJob(job.id);
-    if (fresh) {
-      void notifyJobCompleted(fresh)
-        .then(() => onLog('info', 'notification dispatched'))
-        .catch((e) => onLog('warn', `notification error: ${(e as Error).message}`));
+      const done = getJob(job.id);
+      if (done) {
+        void notifyJobCompleted(done)
+          .then(() => onLog('info', 'notification dispatched'))
+          .catch((e) => onLog('warn', `notification error: ${(e as Error).message}`));
+      }
     }
   } catch (err) {
     if (err instanceof JobCancelledError) {
@@ -492,15 +728,10 @@ function finalizeCancelledStoreJob(job: JobRow, onLog: OnLog): void {
     setJobPhase(job.id, 'building_csv', 'stopped — exporting what was found so far');
     rollupPublishers(onLog);
     scoreAllPublishers(onLog);
-    const discovered = listPublishersByScore(1_000_000);
-    const publishers = EXPORT_CONFIRMED_ONLY
-      ? discovered.filter((p) => p.confirmed_advertiser === 1)
-      : discovered;
     const params = resolveStoreParams(job.source_params ? JSON.parse(job.source_params) : null);
-    const out = buildPublisherCsv(job.id, publishers, leadHistorySeed(), params.maxLeads);
+    const out = rebuildJobLeadExport(job.id, params.maxLeads);
     csvPath = out.path;
     kept = out.rowsWritten;
-    persistPublisherLeads(job.id, out.exported);
     setJobLeadsFound(job.id, kept);
   } catch (e) {
     onLog('warn', `stop-finalize could not export partial leads (non-fatal): ${(e as Error).message}`);
@@ -510,6 +741,33 @@ function finalizeCancelledStoreJob(job: JobRow, onLog: OnLog): void {
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
+
+/** Publishers eligible to become leads right now, score-descending. The export
+ *  is confirmed-only by default: an unconfirmed publisher is a candidate, not a
+ *  lead, and stays in the Publishers table until its verdict comes back. */
+function leadEligiblePublishers() {
+  const discovered = listPublishersByScore(1_000_000);
+  return EXPORT_CONFIRMED_ONLY ? discovered.filter((p) => p.confirmed_advertiser === 1) : discovered;
+}
+
+/**
+ * (Re)write a job's CSV from the corpus as it stands and persist the rows into
+ * the shared lead store. Returns the file path and the row count.
+ *
+ * IDEMPOTENT, and that is the whole point: it clears the job's OWN previously
+ * exported rows first. Those rows feed leadHistorySeed()'s cross-job dedupe, so
+ * without the clear a job's earlier export marks its own leads as "already
+ * delivered" and the rebuild silently drops every one of them. That is exactly
+ * how a stopped run with 5 leads on the table reported "0 partial lead(s)
+ * exported" — the checkpoint had persisted them, then the stop-finalize deduped
+ * them against themselves.
+ */
+function rebuildJobLeadExport(jobId: string, maxLeads: number | null): { path: string; rowsWritten: number } {
+  clearJobResults(jobId);
+  const out = buildPublisherCsv(jobId, leadEligiblePublishers(), leadHistorySeed(), maxLeads);
+  persistPublisherLeads(jobId, out.exported);
+  return { path: out.path, rowsWritten: out.rowsWritten };
+}
 
 /** Build the enrichment worklist: distinct (store, app_id) for both stores, with
  *  is_chart carried through so enrichment can order + band-gate correctly. */

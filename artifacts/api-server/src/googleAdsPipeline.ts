@@ -53,7 +53,7 @@ import {
   deferJob,
   type JobRow,
 } from './db.js';
-import { JobCancelledError, throwIfCancelled, isCancelRequested } from './jobControl.js';
+import { JobCancelledError, throwIfCancelled, isCancelRequested, activeRunCount } from './jobControl.js';
 import { enrichStoreUrls } from './appCategory.js';
 import { BudgetExceededError, nextJerusalemMidnightMs, DAILY_CAP_USD } from './llmBudget.js';
 import {
@@ -215,8 +215,16 @@ export async function runGoogleAdsJob(job: JobRow): Promise<void> {
 
     // Start each job with a clean scraper session: fresh cookies (re-warmed at
     // discovery) and throttle baseline, so a long-lived server doesn't carry one
-    // job's stale cookies / ratcheted-up throttle into the next.
-    resetGoogleAdsSession();
+    // job's stale cookies / ratcheted-up throttle into the next. GUARDED under
+    // the concurrent queue: the cookie jar and adaptive throttle are module-
+    // global and shared with store_first's confirmation phase, so resetting
+    // them while another GATC-using job is mid-flight would wipe that job's
+    // warm session and its ratcheted (protective) throttle.
+    if (activeRunCount('google_ads', 'store_first') <= 1) {
+      resetGoogleAdsSession();
+    } else {
+      onLog('info', 'google-ads: another GATC-using job is in flight — keeping the shared session warm (no reset)');
+    }
 
     const params = parseParams(job);
     const countries: string[] = JSON.parse(job.countries);

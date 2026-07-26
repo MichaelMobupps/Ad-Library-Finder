@@ -57,7 +57,7 @@ import { BudgetExceededError, nextJerusalemMidnightMs, DAILY_CAP_USD } from './l
 import { listOffers, AffplusOffer, Platform as AffPlatform } from './affplusScraper.js';
 import { cleanOfferName } from './nameCleaner.js';
 import { resolveAndVerify, Platform as ResolvePlatform, ResolvedStore } from './storeResolver.js';
-import { buildCsv } from './csv.js';
+import { buildCsv, selectExportRows, normalizeMaxLeads } from './csv.js';
 import { notifyJobCompleted, notifyJobFailed } from './notifier.js';
 import { runHqSplit } from './hqSplit.js';
 import { verticalDecision, looksScammy } from './webPolicy.js';
@@ -404,11 +404,17 @@ export async function runAffplusJob(job: JobRow): Promise<void> {
     setJobPhase(job.id, 'building_csv', `writing CSV (${resolvedCount} verified rows)`);
 
     // 5. Build CSV using existing mobile schema (header is now "store_url").
+    // Operator-chosen lead cap (20/50/100/all) applies to the CSV and the HQ
+    // split alike, so the Excel never disagrees with the CSV.
     const allResults = getResults(job.id);
+    const affMaxLeads = normalizeMaxLeads(
+      job.source_params ? (JSON.parse(job.source_params) as Record<string, unknown>).maxLeads : null,
+    );
     const { path: csvPath, rowsWritten } = buildCsv({
       jobId: job.id,
       productType: job.product_type,
       results: allResults,
+      maxRows: affMaxLeads,
     });
     onLog('info', `affplus: CSV written: ${csvPath} (${rowsWritten} rows)`);
 
@@ -416,7 +422,11 @@ export async function runAffplusJob(job: JobRow): Promise<void> {
     if (job.product_type === 'mobile') {
       setJobPhase(job.id, 'hq_splitting', `resolving HQ for ${rowsWritten} apps`);
       try {
-        const outcome = await runHqSplit({ jobId: job.id, results: allResults, onLog });
+        const outcome = await runHqSplit({
+          jobId: job.id,
+          results: selectExportRows(allResults, job.product_type, affMaxLeads),
+          onLog,
+        });
         if (outcome.zipPath) {
           setJobHqZipPath(job.id, outcome.zipPath);
           const summary = Object.entries(outcome.perCountryCounts)
@@ -449,7 +459,10 @@ export async function runAffplusJob(job: JobRow): Promise<void> {
       let csvPath: string | null = null;
       let kept = 0;
       try {
-        const partial = buildCsv({ jobId: job.id, productType: job.product_type, results: getResults(job.id) });
+        const cap = normalizeMaxLeads(
+          job.source_params ? (JSON.parse(job.source_params) as Record<string, unknown>).maxLeads : null,
+        );
+        const partial = buildCsv({ jobId: job.id, productType: job.product_type, results: getResults(job.id), maxRows: cap });
         csvPath = partial.path;
         kept = partial.rowsWritten;
       } catch { /* best-effort */ }
@@ -628,6 +641,9 @@ async function runAffplusWebJob(job: JobRow, countries: string[], onLog: WebLogF
     jobId: job.id,
     productType: job.product_type,
     results: allResults,
+    maxRows: normalizeMaxLeads(
+      job.source_params ? (JSON.parse(job.source_params) as Record<string, unknown>).maxLeads : null,
+    ),
   });
   onLog('info', `affplus-web: CSV written: ${csvPath} (${rowsWritten} rows)`);
   if (rowsWritten === 0) {

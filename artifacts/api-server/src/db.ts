@@ -369,40 +369,23 @@ export function listAllJobsWithUsers(limit = 200): ActivityJobRow[] {
     .all(limit) as ActivityJobRow[];
 }
 
-export function getNextPendingJob(): JobRow | null {
-  // A job is runnable when it is freshly pending, or it was deferred for the LLM
-  // daily cap and its run_after (next Asia/Jerusalem midnight) has passed. The
-  // deferred job becomes eligible on its own once the clock crosses midnight, so
-  // no scheduler process is needed. Oldest first across both states.
-  return (getDb()
+/**
+ * The runnable candidates for the CONCURRENT dispatcher, oldest first: fresh
+ * pending jobs plus deferred jobs whose Jerusalem-midnight run_after has
+ * passed, never anything the user already stopped. The dispatcher applies the
+ * per-user / per-cap policies on top of this list.
+ */
+export function listRunnableJobs(limit = 50): JobRow[] {
+  return getDb()
     .prepare(
       `SELECT * FROM jobs
         WHERE cancel_requested = 0
           AND (status = 'pending'
            OR (status = 'deferred' AND (run_after IS NULL OR run_after <= ?)))
         ORDER BY created_at ASC
-        LIMIT 1`,
+        LIMIT ?`,
     )
-    .get(Date.now()) as JobRow) ?? null;
-}
-
-/** Oldest runnable job EXEMPT from the LLM daily cap (source='store_first').
- *  Used when the queue head is cap-blocked: getNextPendingJob returns only the
- *  single oldest job, and a cap-blocked head never leaves 'pending', so without
- *  this an exempt job queued behind it would be head-of-line blocked until the
- *  Jerusalem-day reset even though it spends no LLM budget at all. */
-export function getNextPendingCapExemptJob(): JobRow | null {
-  return (getDb()
-    .prepare(
-      `SELECT * FROM jobs
-        WHERE source = 'store_first'
-          AND cancel_requested = 0
-          AND (status = 'pending'
-           OR (status = 'deferred' AND (run_after IS NULL OR run_after <= ?)))
-        ORDER BY created_at ASC
-        LIMIT 1`,
-    )
-    .get(Date.now()) as JobRow) ?? null;
+    .all(Date.now(), limit) as JobRow[];
 }
 
 export function markJobRunning(id: string) {

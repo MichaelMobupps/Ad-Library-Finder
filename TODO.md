@@ -218,6 +218,275 @@ After each phase completes, before moving on:
   final stop clean. Builds ✓, 642 assertions ✓. `.replit` smoke-port auto-adds reverted (x2).
   Deploy to take live.
 
+## Follow-up: per-user parallel queue (2026-07-26)  ☑
+
+- Problem (user-reported from live Activity): the queue was GLOBAL-SERIAL — Alberto's first job sat
+  behind Michael's running job for 45+ minutes.
+- New concurrent dispatcher in queue.ts: **parallel across users, serial within a user** — a user's
+  first pending job starts immediately; their second waits for their own first. Global in-flight cap
+  `QUEUE_MAX_CONCURRENT_JOBS` (default 3, max 8) bounds browsers/proxy/LLM bursts. LLM-cap parking
+  preserved per candidate (non-exempt jobs skipped when the daily cap is hit; store_first exempt).
+- Concurrency-safety audit of shared module state: store rate limiters are global → politeness holds
+  across any number of jobs; meta uses an isolated browser context per query (safe); the GATC cookie
+  jar + adaptive throttle are module-global → `resetGoogleAdsSession()` is now guarded by a new
+  active-run registry (jobControl beginJobRun/endJobRun/activeRunCount) so it never wipes a session
+  another in-flight GATC job is using. Dead queue helpers (getNextPendingJob/CapExempt) removed.
+- Smoke on :3911 with two users: A running + B1 running IN PARALLEL, B2 pending behind B1 (own queue);
+  stop B1 → B2 started while A kept running; all stops clean. Builds ✓, 642 assertions ✓,
+  `.replit` smoke-port reverted. Deploy to take live.
+
+## Follow-up: email fact-check → lead cap for ALL sources (2026-07-26)  ☑
+
+- Fact-checked the team-announcement email against the build. Two corrections:
+  1. Keyword bank is **37 languages** (2,808 keywords, 23 verticals) — not "100+".
+  2. "How many leads?" only existed for the Google Ads engines → **built it for Meta/Affplus/AppGoblin
+     too**: route stores maxLeads for every source; meta/affplus(mobile+web)/appgoblin pipelines cap
+     their CSV + HQ-split rows (selectExportRows) incl. the stopped-job partial CSVs; the New Job form
+     now always shows the lead question. Smoke: maxLeads persisted in source_params for all three ✓.
+- Also flagged for the email: "resumes exactly" is precise for Google Ads Mobile (durable stamps);
+  other sources re-run safely and de-dupe. And the per-user parallel queue was missing from the draft.
+- Builds ✓, 642 assertions ✓, `.replit` reverted.
+
+## Follow-up: "0 leads after 2h34m" — lead-first pipeline + Play concurrency (2026-07-26)  ☑
+
+Trigger: user's live job `job_DU5w6R_kRw` ran **2h34m, reached 73%, and exported 0 leads of 20
+requested**. Logs pasted by the user were profiled line-by-line.
+
+### Diagnosis (all measured from that job's own logs, not estimated)
+
+| Segment | Window | Duration | % of job |
+|---|---|---|---|
+| Charts | 13:47:06–13:47:54 | 48s | 0.5% |
+| Similar crawl ‖ Apple search | 13:47:54–13:59:06 | 11m12s | 7.2% |
+| Play search half | 13:59:06–14:05:22 | 6m16s | 4.1% |
+| **Enrichment pass 1** | 14:05:25–15:07:26 | **1h02m01s** | **40.1%** |
+| Dev catalogs | 15:07:26–15:33:30 | 26m04s | 16.8% |
+| **Re-enrichment (pass 2)** | 15:33:34–16:21:42 | **48m08s** | **31.1%** |
+| Rollup + scoring | 16:21:47–16:21:48 | 1s | ~0% |
+| **Confirmation** | **never ran** | — | — |
+
+1. **Enrichment was 71% of the run**, and it is ONE serial Play stream. Reconstructed exactly from
+   `requests=` vs `fetched=` (requests counts 1/Play app but 1/100-app Apple batch): pass 1 =
+   ~3,202 Play + ~8 Apple batches → 3,202 × 1.16s = 61.9 min vs 62m01s measured; pass 2 = 2,480
+   Play, all of it → 47.9 min vs 48m08s measured. **5,682 serialized Play fetches = 1h50m.**
+   Apple finished its 8 batches in 48s and idled for the next hour.
+2. **`maxLeads` did nothing.** It was referenced in exactly ONE place — the final `buildPublisherCsv`.
+   A 20-lead job and a 10,000-lead job did identical work.
+3. **Leads were structurally impossible before 80% progress.** `confirmed_advertiser` is set only by
+   the confirmation phase (phase 7 of 10). The job was stopped at 73%, so `EXPORT_CONFIRMED_ONLY`
+   filtered all 4,117 rolled-up publishers to zero. The corpus was export-ready 48s in; confirmation
+   at `confirmBudget=200` is ~5 min. **That job could have delivered 20 leads in ~6 minutes.**
+4. **The enrichment budget was silently doubled.** `fetchBudget = ENRICH_MAX_APPS_PER_RUN` was a
+   LOCAL in `enrichApps`, called twice per run ⇒ 8,000 fetches against a stated cap of 4,000.
+5. **Progress span was mis-weighted**: re-enrichment got 5 points (70→75) but costs as much as pass 1
+   (25 points), and the phase label never left "developer catalogs" — hence 73% for an hour.
+6. Scope was NOT the problem: the run was already 1 market / 8 verticals and charts took 48 seconds.
+
+### Fixes shipped
+
+- **Lead-first pipeline** (`storeDiscoveryPipeline.ts`): confirmation is no longer terminal. Four
+  CHECKPOINTS — after charts, after long-tail discovery, after enrichment, and a final one — each
+  doing rollup → confirm a slice of the ONE per-run budget → score → write CSV. Leads accumulate from
+  the opening seconds; **any** stop exports what is on the table. Verified live: checkpoint 1 fired
+  at **+4 seconds**.
+- **Lead-target early exit**: new `enough?: () => boolean` on `confirmPublishers` (+ `reachedTarget`
+  on ConfirmSummary), evaluated against the DEDUPED exportable count. A checkpoint that fills the
+  order jumps straight to `finishRun()` and skips every remaining phase.
+- **Honest live counter**: was `countConfirmedPublishers()` (corpus-wide, incl. leads other jobs
+  already delivered) — could read "20 leads" while the CSV held 3. Now the deduped exportable count,
+  computed once per publisher and reused by `enough` (was two full table scans per confirmation).
+- **Play concurrency** (`storeThrottle.ts` rewritten): `RateLimiter(minIntervalMs, maxConcurrent)`.
+  Gap is now **start-to-start**, not settle-to-start — the old chain stacked fetch latency on top of
+  the interval (1.16s/req for a "1 req/s" limiter, a silent 14% tax). `PLAY_CONCURRENCY=5` (env
+  `STORE_PLAY_CONCURRENCY`, max 16); the interval is divided by N so the aggregate target rate is
+  N req/s. `maxConcurrent=1` reproduces the old behaviour exactly.
+  **Measured live against real Play: 965ms/req → 205ms/req (4.7x), 19/20 ok at both 1 and 5, and 8
+  concurrent also clean at 142ms/req.** Extrapolated: 5,682 fetches 110min → ~19min.
+- **Adaptive backoff**: new `playRequestBlocked()` classifier (429/403/captcha/unusual-traffic, and
+  deliberately NOT 404) trips `limiter.penalize(PLAY_BLOCK_BACKOFF_MS=30s)` across every Play stream,
+  wired into all 6 Play call sites.
+- **Single enrich budget**: `enrichApps` takes `opts.fetchBudget` and returns `budgetLeft`; the
+  pipeline threads pass 1's remainder into pass 2. The config value now means what it says.
+- **iTunes 6s → 3s** (`ITUNES_REQUEST_INTERVAL_MS`, 10 → 20 req/min) + `ITUNES_CONCURRENCY` (default
+  1). Dev catalogs is Apple-bound (250 catalogs × 6s = 25min while Play's 250 took ~8min and idled).
+- **Progress re-weighted** for the interleaved order: charts 0-6 · CP 6-18 · discovery 18-32 ·
+  CP 32-40 · enrich 40-58 · CP 58-66 · catalogs 66-74 · liveness 74-78 · final CP 78-95 · HQ 95-100.
+
+### Bugs found BY the audit and fixed before shipping
+
+1. **TDZ crash on every early-exit path** — `finishRun()` (hoisted) read `newSimilar`/`searchRows`/
+   `catalogApps`/`enrichSummary`, all `const`s declared AFTER checkpoint 1. Any early exit would have
+   thrown `ReferenceError`. All run counters hoisted to the top of the try block. Caught by a
+   purpose-built probe, not by tsc.
+2. **The user's exact bug, still live after the checkpoint work** — a stop after checkpoint 1 reported
+   `0 partial lead(s) exported` even though `job_results` held 5. Cause: `finalizeCancelledStoreJob`
+   rebuilt the CSV with `leadHistorySeed()`, which by then contained the job's OWN checkpoint-1 leads,
+   so all of them deduped against themselves. Extracted `rebuildJobLeadExport()` (clears the job's own
+   rows first — the same trap the resume path already documented) and both paths now use it.
+   Re-probed: **5 leads kept instead of 0.**
+3. **UI stepper would have bounced backwards** — checkpoints reporting `classifying` mid-`scraping`
+   drive the ordered PHASE_ORDER stepper in reverse. Each checkpoint now reports the coarse phase it
+   sits in; the checkpoint activity rides in `phase_detail`, keeping the stepper monotonic.
+4. **Test runner never ran async suites** — discovery regex was `/^export function run\w*Tests/`, so
+   `hqSplitWeb` (async) had silently never been gated. Regex now accepts `export async function`;
+   +2 modules now covered.
+
+### Verification
+
+- Builds ✓ (api-server + dashboard). **28 modules, 677 offline assertions ✓** (was 26/642:
+  +storeThrottle 11, +hqSplitWeb, + new playRequestBlocked / enrich-budget assertions).
+- Hermetic probe: early exit at checkpoint 1 → `completed`, leads 3/3, progress 100, CSV has 3 rows.
+- Real-store probe: Stop mid-similar-crawl → `cancelled`, **5 leads kept**, CSV has 5 rows.
+- **Live server smoke on :3913** through the real HTTP API: boot ✓, `/api/health` 200, SPA 200,
+  anonymous `/api/me` 401, admin session ✓, job created via POST /api/jobs ✓, queue picked it up ✓,
+  charts done +3s, **checkpoint 1 at +4s** ✓, POST /stop → `stopping — finishing current step…` →
+  `cancelled` with **leads_found=2** (capped at the requested 2) and a real CSV ✓.
+- Dev DB left clean (smoke user/session/job removed, seeded confirmations reverted, probe rows gone);
+  `.replit` smoke ports reverted.
+
+### DECISION: do NOT route Play through the residential proxy (overrides the earlier plan)
+
+Measured a real Play response: **1.2 MB per request** (app detail and search alike). At 5,682
+enrichment fetches that is **~6.8 GB per run** against a **10 GiB** Proxy-Seller package — one mobile
+job would consume ~68% of the monthly allowance, and that allowance is what GATC *confirmation* (the
+only phase that actually makes leads) depends on. Two runs would exhaust it and `PROXY_TRAFFIC_ABORT_GB`
+would then refuse to start every subsequent job. Play therefore stays on **direct egress + adaptive
+backoff**; the backoff is the escape hatch if Google pushes back. Revisit only with evidence of blocks.
+
+### Expected effect on the reported job
+
+2h34m (0 leads) → **~20 min at full scope**, or **~1-5 min when a small order is filled at an early
+checkpoint**. Leads visible from ~4s in; a Stop at any point keeps them.
+
+### STILL OPEN (next session picks up here)
+
+- ☐ **Deploy.** All of the above is committed to the working tree but NOT published — production
+  still runs the old build. The pending deploy ALSO carries the per-user parallel queue, which is why
+  the user's screenshot shows Alberto's 3 jobs queued 2h26m+ behind Michael's one running job.
+- ☐ Fixes 3 + 4 from the analysis, deliberately deferred (user chose "Fixes 1+2+5" for this pass):
+  - **Fix 3 — demand-driven enrichment.** 6,480 fetches produced 1,738 in-band tail apps to feed a
+    confirmation budget that could only examine ~66 publishers. ~100x over-provisioned. Derive the
+    enrich budget from the confirmation budget / lead target.
+  - **Fix 4 — discovery outruns enrichment.** Discovery added 26,497 apps in 18 min; enrichment
+    consumes ≤4,000/run. Backlog went 22,497 → 20,060 and mathematically never drains. The amplifier
+    is the search battery: 240 cells → ~17,900 rows because `ITUNES_SEARCH_LIMIT=200`. Either cap
+    what discovery may ADD per run to what enrichment can consume, or cut the search page size.
+
+## Godlike audit #4 — round 2 on the lead-first + speed work (2026-07-26)  ☑
+
+User asked for another full round: audit + blast radius + smoke + auto-fix, with speed re-confirmed.
+
+### Found and fixed
+
+1. **Corpus fast path was missing** (the thing approved in the very first design question).
+   `harvestLeads` spent confirmation calls even when the corpus ALREADY held enough deliverable
+   leads. Now `exportableNow(seed)` is evaluated BEFORE the budget is touched: an order fillable from
+   publishers earlier runs already confirmed skips confirmation entirely — **zero paid API calls, zero
+   proxy traffic**. Verified: `checkpoint "top charts": corpus already holds 5 deliverable lead(s)
+   (target 3) — skipping confirmation entirely, no API calls spent`.
+2. **Per-publisher full-table rescan.** `exportableNow` (publisher scan + dedupe pass) ran once per
+   confirmation API call. Now recomputed only when `summary.confirmed` actually MOVES — a publisher
+   that came back "not advertising" cannot change the exportable total. On a large corpus this is one
+   scan per LEAD instead of one per CALL.
+3. **Limiter semantics were easy to misread** (found by a 200-task stress harness). Peak in-flight is
+   `min(maxConcurrent, ceil(latency / gap))`, NOT `maxConcurrent` — with Play's latency and a 200ms
+   gap only ~2 requests overlap while the run still lands its 5 req/s target. Was a TEST bug, not a
+   code bug; the invariant is now documented in the header and pinned by TWO assertions (the rate
+   gate binding on fast work, and the ceiling being reachable on slow work).
+4. **Cold-corpus honesty.** `rollupPublishers` builds from `allDoneAppDetails()` — enriched apps only.
+   So on a COLD corpus checkpoints 1-2 legitimately yield nothing and the first leads appear at
+   checkpoint 3 (post-enrichment); on an ESTABLISHED corpus (production: thousands of enriched apps)
+   checkpoint 1 has a full corpus to confirm and can fill a small order in seconds. Now stated
+   explicitly in the pipeline header instead of implied.
+
+### Limiter stress harness (200 tasks, saturation + 40 interleaved rejections)
+
+No deadlock, no slot leak, cap never breached, limiter still usable afterwards, aggregate rate =
+concurrency/interval (591ms vs ~600ms expected), start-to-start pacing confirmed (242ms where the old
+settle-based chain would be ~450ms), penalty holds all streams then clears, degenerate configs
+(interval 0, 64-wide) safe. Six of these are now permanent assertions in `runStoreThrottleTests`.
+
+### SPEED — re-measured, repeatable, on REAL chart apps (not hand-picked popular ones)
+
+| Concurrency | Run 1 | Run 2 | Success |
+|---|---|---|---|
+| 1 (old behaviour) | 954 ms/req | 953 ms/req | 15/15 |
+| 5 (shipped) | 232 ms/req | 211 ms/req | 15/15 |
+
+**4.1–4.5x on the Play stream**, no failures, no throttling. The 954 ms/req baseline independently
+reproduces the user's production figure of 1.16 s/req, which validates the whole cost model.
+
+Full cold-corpus pipeline run (finance/us, real stores): charts +3.0s · **checkpoints 1+2 at +3.1s** ·
+enrichment 485 apps / 386 requests in 145.7s (**378 ms/req sustained, vs 954 ms/req old = 2.5x** —
+lower than the isolated A/B because the window also carries the Apple stream and checkpoint work) ·
+dev catalogs 358 Play + 85 Apple in **289s** (Apple-bound; the old 6s interval would have made the
+Apple half alone ~510s) · re-enrichment running on the SHARED budget (Fix 2 confirmed in situ).
+
+### Blast radius — verified, not assumed
+
+- `playSource`/`appleSource` are imported ONLY by `storeEnrich`, `publisherRollup` (URL helpers) and
+  `storeDiscoveryPipeline`. meta / affplus / appgoblin / googleAds pipelines never touch them, so the
+  throttle changes cannot reach them. Confirmed by grep, and those files are untouched in this diff.
+- `RateLimiter` has exactly 2 production call sites (both updated); `maxConcurrent` defaults to 1 so
+  the signature stays backward-compatible.
+- `ConfirmSummary` (+`reachedTarget`) and `EnrichSummary` (+`budgetLeft`) each have exactly 2
+  constructors, both updated. `scripts/verify-tail-confirm.mjs` calls `confirmPublishers` without the
+  new optional `enough` — still valid.
+- `rollupPublishers` / `scoreAllPublishers` are SYNCHRONOUS, and so is the whole
+  clear→build→persist sequence in `rebuildJobLeadExport`. With single-threaded JS + sync sqlite that
+  makes the rebuild ATOMIC against concurrently running jobs — **no cross-job dedupe race** even
+  under the per-user parallel queue.
+- Progress spans verified contiguous and monotonic: 0-6 · 6-18 · 18-32 · 32-40 · 40-58 · 58-66 ·
+  66-70 · 70-74 · 74-78 · 78-95 · 95-100. All four exit paths funnel through `finishRun()`;
+  `markJobCompleted` appears exactly once.
+- **Live multi-source smoke on :3914**: store_first / google_ads / meta / affplus / appgoblin all
+  created + queued + stopped → every one settled `cancelled` cleanly. Validation guards still fire
+  (appgoblin no-axis 400, unknown market `zz` 400).
+
+### Full cold-corpus run — completed end to end (finance/us, real stores)
+
+    +3.0s    charts done: 500 sightings / 485 distinct
+    +3.1s    checkpoint 1 "top charts"          → 0 leads (cold corpus: nothing enriched yet)
+    +3.1s    checkpoint 2 "long-tail discovery" → 0 leads
+  +148.8s    enrichment: 485 apps, 386 requests (145.7s @ 378 ms/req sustained)
+  +149.1s    checkpoint 3 "enriched catalog"    → 0 leads (probe ran with confirmBudget=0)
+  +438.3s    dev-catalog: 358 Play + 85 Apple → +978 apps  (289s, Apple-bound; was ~510s at 6s)
+  +659.3s    re-enrichment: 978 fetched / 485 cached, 851 requests — SHARED budget, no cap warning
+  +734.2s    liveness: 529 apps re-checked
+  +734.5s    checkpoint 4 + CSV + completed at 100%
+
+**12.2 minutes wall-clock for a complete run**, every phase reached, job `completed` at 100%.
+0 leads is CORRECT here and honestly reported — the probe deliberately ran `confirmBudget=0` to avoid
+paid calls, and the export filter said so: *"0/376 publishers confirmed advertising (376 held back —
+of those 376 not yet checked by the confirmation budget)"*. Fix 2 is visible in situ: the second
+enrichment pass fetched exactly the 978 catalog apps out of the run's shared remainder, with no
+"budget exhausted" warning — the old code would have handed it a fresh 4,000.
+
+### Also fixed this round
+
+- **Re-enrichment relabelled.** The second pass kept `phase_detail = "developer catalogs"`, which is
+  literally what made the reported job look frozen at 73% for the better part of an hour. It now
+  reports `app detail (portfolio pass — N new apps)`.
+- Stale throttle comments in `storeEnrich.ts` / `storeDiscoveryPipeline.ts` still claimed
+  "Play 1 req/s, iTunes 1 req/6s". Updated. (`appCategory.ts` keeps its own 6000/1000 ms constants —
+  they are the CPS pipeline's separate `GATC_*` tunables and are correctly out of scope; storeEnrich
+  imports only pure classification helpers from it.)
+
+### Verification totals
+
+Builds ✓ (api-server + dashboard). **28 modules, 683 offline assertions ✓, 0 failed.**
+Dev DB left clean (all smoke users/sessions/jobs/logs/results removed, seeded confirmations reverted;
+128 publishers / 0 confirmed, exactly as before). `.replit` smoke ports (3911-3914) reverted — twice,
+Replit re-adds them on every port bind.
+
 ## Notes / decisions log
 
 - 2026-07-26: File created from user's request. Order chosen: background jobs first (user: "most important thing"), then UI unification, then speed.
+- 2026-07-26: Play stays on direct egress — residential proxy is GB-prohibitive for 1.2 MB Play pages
+  (see the DECISION block above). Concurrency 5 chosen over the clean-at-8 measurement for margin.
+- 2026-07-26: Live Proxy-Seller balance at time of writing: **51.2 MB used of 10 GB** (0.5%), package
+  active until 21.08.2026. Confirms the proxy is nowhere near pressure for what it is actually used
+  for (small GATC JSON round-trips) — and that routing 1.2 MB Play pages through it would have been
+  ~130x the project's entire spend to date, in a single run.
+- 2026-07-26: Play stays on direct egress — residential proxy is GB-prohibitive for 1.2 MB Play pages
+  (see the DECISION block above). Concurrency 5 chosen over the clean-at-8 measurement for margin.
