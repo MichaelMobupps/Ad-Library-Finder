@@ -479,6 +479,132 @@ Dev DB left clean (all smoke users/sessions/jobs/logs/results removed, seeded co
 128 publishers / 0 confirmed, exactly as before). `.replit` smoke ports (3911-3914) reverted — twice,
 Replit re-adds them on every port bind.
 
+## STREAMING lead pump + real-time Excel + proxy exit rotation (2026-07-26 evening)  ☑ CODE DONE
+
+**User requirement, verbatim intent (asked "many times", with visible frustration):** scrape app →
+look it up on Ads Transparency IMMEDIATELY → add to the Excel IN REAL TIME. NOT batch checkpoints,
+NOT "reach 20 then maybe export". Leads must be in the planned Excel WHILE scraping runs. Burning
+proxy GB + time on discovery before any confirmation is the waste being complained about.
+
+### THE PROXY FINDING — user was RIGHT, and it is measured
+
+User's theory: "each request needs to come with a different request so the dynamic resident proxy
+changes... not reuse the same request again and again." Tested live against the real Proxy-Seller pool
+(tiny IP-echo payloads):
+
+| setup | exit IPs across 5 requests |
+|---|---|
+| shared ProxyAgent (**what the code did**) | 176.214.206.142, 95.24.117.161, 176.214.206.142, 95.24.117.161, 176.214.206.142 → **2 distinct** |
+| fresh ProxyAgent per request | 4 different IPs → **4 distinct** |
+
+The account IS set to "rotate for each request" — but that only applies to a NEW CONNECTION. undici's
+keep-alive pool pins each pooled connection to an exit, so an entire run's Ads Transparency traffic
+egressed from ~2 residential IPs on repeat. That is a direct cause of GATC penalty-boxing.
+`rotateProxyExit()` existed but fired ONLY reactively, after a block.
+
+**Fix:** `GOOGLE_ADS_PROXY_ROTATE_EVERY` (default **25**, 0 = never/old behaviour, 1 = every request)
+drives PROACTIVE rotation from inside `withProxy()`. 2 IPs/run becomes ~80 distinct exits for a
+2,000-call budget. Rotation drops the cookie jar (cookies from a burned exit look stolen on a new IP),
+so `rpcPost` now lazily re-warms when `!warmedUp` — one homepage GET per rotation, ~4% overhead,
+instead of leaving the rest of the run RPC-ing cold. Default 25 (not 1) amortises that warm-up.
+Verified through the real `withProxy()` path: with stride 1 the per-exit counter resets every request.
+
+### What shipped in the pipeline
+
+1. **storeConfirm.ts** — `skipConfirmedSince` (never re-charge a publisher already checked THIS RUN;
+   also stops the 4 barrier passes re-spending budget on the queue head), `skipWarmUp` (one session
+   warm-up per run), pure `filterUncheckedSince()` (+6 assertions).
+2. **storeDiscoveryPipeline.ts** — **continuous background lead pump**: ticks every 15s (in 1s
+   cancel-responsive slices), each tick a no-op unless discovery rolled up NEW unchecked publishers,
+   so idle ticks cost zero network and zero budget. `queueHarvest()` is a promise-chain mutex so pump
+   ticks and phase barriers never run two confirm passes against one shared budget. `stopPump()` is
+   awaited on EVERY exit path (finish, cancel, failure) so no in-flight pass can rewrite a settled
+   job's CSV. Total confirmation spend is IDENTICAL to the old single terminal pass — only the timing
+   moves.
+3. **REAL-TIME Excel** — `exportLeadsSoFar()` calls `setJobCsvPath()` on the FIRST export, so the
+   download route serves the growing file mid-run (same mechanism the CPS pipeline already used).
+   UI: both Download-CSV gates in App.tsx are now `csv_path != null` instead of completed/cancelled,
+   labelled "CSV so far" / "Download CSV (so far — leads stream in live)" while running.
+4. **Target-met halts everywhere** — `leadTargetMet` now breaks the chart tasks, similar crawl, both
+   search halves, and both enrichment passes (`shouldStop`), plus early `finishRun()` returns before
+   catalogs and before liveness. Previously the order could only be recognised at a barrier.
+
+### PROOF the requirement is met
+
+Hermetic probe against real stores, corpus seeded with 6 confirmed publishers, target 50 (so the run
+CANNOT finish instantly and must keep scraping):
+
+    first CSV appeared at : +3.2s
+      job status then     : running          <-- still scraping
+      phase then          : scraping/similar crawl + store search
+      rows in it then     : 6                <-- real leads, downloadable
+    final status          : cancelled | leads 6
+    VERDICT: leads were downloadable DURING the run
+
+Builds ✓ (api-server + dashboard, new bundle `index-gKDSRi-Z.js`). **28 modules, 689 assertions ✓.**
+
+### ⚠ PRODUCTION DATA MAY BE EPHEMERAL — VERIFY BEFORE TRUSTING THE WARM-CORPUS PATH
+
+After the last publish, production Activity showed "0 past jobs" and the user's new run behaved like a
+COLD corpus. If Replit's deployment filesystem is ephemeral, `data/ad-library.sqlite` (the permanent
+corpus AND the lead-history dedupe) is wiped on every deploy — which would mean every run re-discovers
+from scratch and the corpus fast path never pays off. CHECK THIS FIRST next session; if confirmed, the
+corpus needs persistent storage (Replit object storage / external DB) and that is the single highest-
+value remaining fix.
+
+### Godlike audit #5 — on the pump itself  ☑
+
+**Adversarial harness** replicating the real promise-chain shape (6 invariants, all hold):
+single-flight held under 3 concurrent barrier calls + ticks (peak 1); no pass left in flight; **no
+pass ran after stopPump** (the finalize-safety invariant); chain drained by stopPump; budget respected
+across passes; pump halts once target met; stopPump idempotent (finishRun + catch may both call it);
+a throwing pass does not wedge later passes.
+
+**Bugs found by this audit and auto-fixed:**
+1. **Pump would have dragged the UI stepper BACKWARDS.** Ticks always reported `phase:'scraping'`, so a
+   tick during `enriching` rewound the ordered stepper — the exact regression fixed for checkpoints in
+   audit #3. Added `quiet` mode: pump passes touch NEITHER the coarse phase NOR the progress bar
+   (their zero-width span was meaningless anyway). The live signal stays the lead counter + growing
+   CSV, and a tick now logs only when the count actually moved.
+2. **One RPC per rotation went out cold.** Rotation fired inside the SYNCHRONOUS `withProxy()`, which
+   cannot await a re-warm — so each rotation left exactly one Ads Transparency RPC egressing from a
+   fresh, cookie-less exit (the shape Google rate-limits hardest). Moved the rotation decision to
+   `rotateExitIfDue()`, called at the async top of `rpcPost`, so the re-warm is awaited and every RPC
+   runs on a warm session. `withProxy` now only counts.
+3. Verified no recursion risk: `warmUpSession` is a plain homepage GET (never calls `rpcPost`) and
+   sets `warmedUp` before its fetch, so the lazy re-warm cannot loop or double-warm.
+4. Verified `setJobProgress` is `MAX(progress_pct, ?)` — monotonic — so the pump's zero-value writes
+   are no-ops and can never reset the bar.
+
+### Live smoke — the requirement, proven over real HTTP  ☑
+
+    t+5s   running leads=4  scraping/similar crawl + store search | GET /csv -> 200 rows=4
+    t+30s  running leads=4  scraping/similar crawl + store search | GET /csv -> 200 rows=4
+    first data row: "Gamma Greeks: AI Stock Option Signals, Flow Alerts",US,https://play.google.com/...
+
+Leads downloadable via the real API **while status=running, mid-`scraping`** — before classification.
+A Stop then kept all 4 (`store_first cancelled leads=4`).
+
+**Smoke-methodology bug found (NOT a product bug):** the first attempt showed `leads=4` but
+`csv_path=null`/404. Cause: THREE server processes from earlier smokes (ports 3913/3914) were still
+alive sharing one sqlite DB, and an OLD one's queue worker picked up the job and ran pre-`setJobCsvPath`
+code. Killed all, re-ran on a single clean server → correct. **Lesson for future smokes: always
+`pkill -9 -f dist/index.js` and verify zero survivors BEFORE creating jobs**, or results are garbage.
+(Not a production concern — prod runs exactly one process.)
+
+**Blast radius:** all 5 sources create + settle `cancelled` cleanly; guards still fire (appgoblin
+no-axis, unknown market `zz`). `googleAdsScraper` rotation touches the CPS pipeline too — that is
+intended and beneficial (same penalty-box exposure), ~4% warm-up overhead at the default stride of 25.
+Dev DB restored exactly (128 publishers / 0 confirmed / 0 stray jobs); `.replit` reverted.
+
+Builds ✓ both packages. **28 modules, 689 assertions ✓, 0 failed.**
+
+### REMAINING
+- ☐ PUBLISH (still carries the per-user parallel queue too — Alberto's jobs are still serialized in
+  prod until this ships).
+- ☐ Deferred by user choice, still open: Fix 3 (demand-driven enrichment) and Fix 4 (discovery
+  outruns enrichment; search battery amplifier via `ITUNES_SEARCH_LIMIT=200`).
+
 ## Notes / decisions log
 
 - 2026-07-26: File created from user's request. Order chosen: background jobs first (user: "most important thing"), then UI unification, then speed.

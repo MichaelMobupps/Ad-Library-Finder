@@ -370,9 +370,9 @@ function JobsList({
               <td className="small muted">{j.recipient_email || '(default)'}</td>
               <td className="small">{new Date(j.created_at).toLocaleString()}</td>
               <td onClick={(e) => e.stopPropagation()}>
-                {(j.status === 'completed' || j.status === 'cancelled') && j.csv_path && (
+                {j.csv_path && (
                   <a href={api.csvUrl(j.id)} className="btn small">
-                    Download CSV
+                    {j.status === 'running' ? 'CSV so far' : 'Download CSV'}
                   </a>
                 )}
                 <StopButton job={j} onStopped={onChanged} small />
@@ -489,9 +489,11 @@ function JobDetail({ id, onBack }: { id: string; onBack: () => void }) {
         <Field label="Advertisers (CSV)">{job.total_advertisers}</Field>
       </div>
 
-      {(job.status === 'completed' || (job.status === 'cancelled' && job.csv_path)) && (
+      {job.csv_path && (
         <div className="cta-row">
-          <a href={api.csvUrl(job.id)} className="btn primary">⬇ Download CSV</a>
+          <a href={api.csvUrl(job.id)} className="btn primary">
+            {job.status === 'running' ? '⬇ Download CSV (so far — leads stream in live)' : '⬇ Download CSV'}
+          </a>
           {job.hq_zip_path && (
             <a href={api.hqZipUrl(job.id)} className="btn" style={{ marginLeft: 8 }}>⬇ Excel (by HQ country)</a>
           )}
