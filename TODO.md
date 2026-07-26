@@ -157,6 +157,34 @@ After each phase completes, before moving on:
   owner CSV download 200 with the real 11 leads from the earlier live CPS run, instant-stop race
   → `cancelled: stopped by user before start` (queue never picked it up), SPA serves the new bundle.
 
+## Follow-up: sources are first-class again (2026-07-26, user feedback)  ☑
+
+- User: legacy scrapers were hidden under the Google Ads menu's Advanced — "totally different lead
+  sources". Restructured: nav menu is **"+ New Job"** again; inside, **Lead source** is the FIRST
+  visible choice — 🎯 Google Ads (default) beside 📘 Meta Ad Library, 🔗 Affplus, 👾 AppGoblin.
+- Google Ads choice → the simplified flow (Mobile/CPS cards, countries, lead cap, Advanced knobs).
+  Meta/Affplus → Mobile-vs-CPS cards + countries + email (their full old capability; one job per run).
+  AppGoblin → its category / ad-network fields inline, Mobile-only.
+- `GoogleAdsForm.tsx` renamed → `NewJobForm.tsx`. No backend changes. Build ✓, no stale refs,
+  boot smoke ✓ serving the new bundle. NOTE: leadfinder.mobupps.net shows this after the next deploy.
+
+## Godlike audit #3 (2026-07-26, after the source-picker restructure)  ☑
+
+- Audit finding → fixed: **AppGoblin's first stop-check ran only AFTER the full scrape** — a Stop
+  pressed mid-scrape waited it out. Added a pre-scrape `throwIfCancelled`.
+- Startup-recovery sweep order re-verified in db.ts (cancelled before failed) ✓.
+- Blast radius: user PUBLISHED between rounds (commit 84fed16 absorbed the earlier work), so this
+  round's delta is exactly: NewJobForm.tsx (renamed from GoogleAdsForm), App.tsx, styles.css,
+  appgoblinPipeline.ts, TODO.md. Replit auto-added smoke ports to `.replit` again (3907, 3908) —
+  reverted both times; only 3001→80 ships.
+- Smoke on :3908 — created + instantly stopped a job for EVERY source using the exact payload
+  shapes the new form sends: store_first ✓, google_ads ✓, meta mobile ✓, meta cps ✓, affplus cps ✓,
+  appgoblin ✓ — all `cancelled: stopped by user before start`. Validation guards fire (appgoblin
+  no-axis 400, appgoblin CPS 400). SPA serves the current bundle. Builds ✓, 642 assertions ✓.
+- Cleaned 8 cancelled smoke jobs out of the dev DB (kept the completed 11-lead CPS run).
+- REMINDER: leadfinder.mobupps.net still runs the previous deploy — republish to get the
+  source-picker New Job menu + AppGoblin stop fix live.
+
 ## Notes / decisions log
 
 - 2026-07-26: File created from user's request. Order chosen: background jobs first (user: "most important thing"), then UI unification, then speed.

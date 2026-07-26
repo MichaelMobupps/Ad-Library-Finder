@@ -122,6 +122,9 @@ export async function runAppgoblinJob(job: JobRow): Promise<void> {
     const countries: string[] = JSON.parse(job.countries);
     const informationalCountry = countries[0] || '';
 
+    // Stop pressed while this job sat in the queue: bail before the scrape —
+    // the next check is only AFTER scrapeAppgoblin returns, which can be long.
+    throwIfCancelled(job.id);
     const scrape = await scrapeAppgoblin({
       category,
       adNetworkDomain,
