@@ -479,6 +479,21 @@ main {
   grid-template-columns: 1fr 1fr;
   gap: 12px;
 }
+/* The lead-source row: 4 first-class cards side by side. */
+.source-cards {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 10px;
+}
+.mode-card.compact {
+  padding: 12px 14px;
+  gap: 4px;
+}
+.mode-card.compact .mode-card-title { font-size: var(--fs-sm); }
+.mode-card.compact .mode-card-sub { font-size: 12px; line-height: 1.4; }
+@media (max-width: 1100px) {
+  .source-cards { grid-template-columns: 1fr 1fr; }
+}
 .mode-card {
   display: flex;
   flex-direction: column;

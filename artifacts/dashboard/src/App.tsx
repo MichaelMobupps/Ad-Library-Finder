@@ -15,7 +15,7 @@ import {
   PHASE_STEPS,
 } from './api/client';
 import Publishers from './Publishers';
-import GoogleAdsForm from './GoogleAdsForm';
+import NewJobForm from './NewJobForm';
 
 type View =
   | { kind: 'publishers' }
@@ -145,9 +145,9 @@ function AuthedApp({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
           <button
             className={`nav-btn ${view.kind === 'new' ? 'active' : ''}`}
             onClick={() => setView({ kind: 'new' })}
-            title="Find Mobile or CPS leads from Google Ads — the one unified search"
+            title="Run a new job — Google Ads, Meta Ad Library, Affplus or AppGoblin"
           >
-            Google Ads
+            + New Job
           </button>
           <button className={`nav-btn ${view.kind === 'list' ? 'active' : ''}`} onClick={() => setView({ kind: 'list' })}>
             My Jobs
@@ -192,7 +192,7 @@ function AuthedApp({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
         )}
         {view.kind === 'activity' && me.isAdmin && <ActivityView onAuthError={handleAuthError} />}
         {view.kind === 'new' && (
-          <GoogleAdsForm
+          <NewJobForm
             settings={settings}
             onCreated={() => {
               refresh();
@@ -282,9 +282,9 @@ function JobsList({
   if (jobs.length === 0) {
     return (
       <div className="empty">
-        <p className="empty-title">No searches yet</p>
-        <p className="empty-sub">Start a Google Ads search — pick Mobile or CPS, your countries and how many leads you want.</p>
-        <button className="btn primary" onClick={onNew}>🔍 New search</button>
+        <p className="empty-title">No jobs yet</p>
+        <p className="empty-sub">Run a new job — pick a lead source (Google Ads, Meta, Affplus, AppGoblin), your countries and how many leads you want.</p>
+        <button className="btn primary" onClick={onNew}>+ New Job</button>
       </div>
     );
   }
