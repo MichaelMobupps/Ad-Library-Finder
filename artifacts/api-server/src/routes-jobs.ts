@@ -8,11 +8,13 @@ import {
   listJobsForUser,
   listAllJobsWithUsers,
   requestJobCancel,
+  resumeJob,
   getLogs,
   getResults,
   ProductType,
   JobSource,
 } from './db.js';
+import { clearCancelState } from './jobControl.js';
 import { buildCsv, normalizeMaxLeads, LEAD_LIMIT_CHOICES } from './csv.js';
 import { RequestWithUser, requireAdmin, isAdminUser } from './auth.js';
 import { fetchAppgoblinCategoryList } from './appgoblinScraper.js';
@@ -450,6 +452,27 @@ jobsRouter.post('/:id/stop', (req, res) => {
   res.json({ job: getJob(job.id) });
 });
 
+// POST /api/jobs/:id/resume — re-queue a stopped or failed job under the same
+// id. The job's owner can resume their own; an admin can resume anyone's.
+// store_first genuinely continues where it stopped (durable rotation stamps +
+// caches); the other sources replay safely with deduped results.
+jobsRouter.post('/:id/resume', (req, res) => {
+  const user = (req as RequestWithUser).user!;
+  const job = getJob(req.params.id);
+  if (!job) return res.status(404).json({ error: 'not found' });
+  if (job.created_by_user_id && job.created_by_user_id !== user.id && !isAdminUser(user)) {
+    return res.status(404).json({ error: 'not found' });
+  }
+  const ok = resumeJob(job.id);
+  if (!ok) {
+    return res.status(409).json({ error: `job is ${job.status} — only stopped or failed jobs can be resumed` });
+  }
+  // Drop any sticky in-process "cancelled" answer for this id so the worker
+  // sees a clean flag the moment it picks the job up.
+  clearCancelState(job.id);
+  res.json({ job: getJob(job.id) });
+});
+
 // GET /api/jobs/appgoblin-categories — list the real AppGoblin category slugs.
 // Cached for 1h in the scraper module. Returns [{id,name,android,ios,total_apps}].
 // Defined BEFORE /:id so Express does not match "appgoblin-categories" as an id.
@@ -535,11 +558,18 @@ jobsRouter.get('/publishers.csv', requireAdmin, (req: Request, res: Response) =>
   res.send(publisherViewCsv(rows));
 });
 
-jobsRouter.get('/:id', (req, res) => {
+// Owner OR admin may read a job. Admins reach other users' jobs from the
+// Activity view (click-through to the live log); regular users stay scoped to
+// their own — a non-owner still gets an indistinguishable 404.
+function canReadJob(req: Request, jobOwner: string | null): boolean {
   const user = (req as RequestWithUser).user!;
+  return !jobOwner || jobOwner === user.id || isAdminUser(user);
+}
+
+jobsRouter.get('/:id', (req, res) => {
   const job = getJob(req.params.id);
   if (!job) return res.status(404).json({ error: 'not found' });
-  if (job.created_by_user_id && job.created_by_user_id !== user.id) {
+  if (!canReadJob(req, job.created_by_user_id)) {
     return res.status(404).json({ error: 'not found' });
   }
   const logs = getLogs(req.params.id);
@@ -547,10 +577,9 @@ jobsRouter.get('/:id', (req, res) => {
 });
 
 jobsRouter.get('/:id/csv', (req, res) => {
-  const user = (req as RequestWithUser).user!;
   const job = getJob(req.params.id);
   if (!job) return res.status(404).json({ error: 'not found' });
-  if (job.created_by_user_id && job.created_by_user_id !== user.id) {
+  if (!canReadJob(req, job.created_by_user_id)) {
     return res.status(404).json({ error: 'not found' });
   }
 
@@ -590,10 +619,9 @@ jobsRouter.get('/:id/csv', (req, res) => {
 // Per-HQ-country .xlsx bundle (mobile jobs only). The orchestrator sets
 // hq_zip_path after the CSV has been written and HQ resolution succeeded.
 jobsRouter.get('/:id/hq-zip', (req, res) => {
-  const user = (req as RequestWithUser).user!;
   const job = getJob(req.params.id);
   if (!job) return res.status(404).json({ error: 'not found' });
-  if (job.created_by_user_id && job.created_by_user_id !== user.id) {
+  if (!canReadJob(req, job.created_by_user_id)) {
     return res.status(404).json({ error: 'not found' });
   }
   if (!job.hq_zip_path || !existsSync(job.hq_zip_path)) {

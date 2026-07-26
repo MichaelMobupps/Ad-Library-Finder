@@ -8,6 +8,7 @@ import {
   setJobPhase,
   setJobHqZipPath,
   setJobLeadsFound,
+  setJobProgress,
   appendLog,
   insertResult,
   getResults,
@@ -122,6 +123,8 @@ async function runMetaJob(job: JobRow) {
           'scraping',
           `${country} / "${keyword}" (${queryIdx}/${totalQueries})`
         );
+        // Overall progress: scrape sweep is 0..50 of the run.
+        setJobProgress(job.id, 50 * (queryIdx / Math.max(1, totalQueries)));
         onLog('info', `scrape ${country} / "${keyword}"`);
         const ads = await scrapeQuery(country, keyword, (m) => onLog('debug', m));
         let newCount = 0;
@@ -185,6 +188,8 @@ async function runMetaJob(job: JobRow) {
           'classifying',
           `${classified}/${collected.length} advertisers (${matched} matched)`
         );
+        // Overall progress: classification is 50..90 of the run.
+        setJobProgress(job.id, 50 + 40 * (classified / Math.max(1, collected.length)));
       }
       if (classified % 25 === 0) {
         onLog('info', `  classified ${classified}/${collected.length} (matched product type: ${matched})`);
@@ -192,6 +197,7 @@ async function runMetaJob(job: JobRow) {
     }
 
     onLog('info', `classification done: ${matched} matched ${job.product_type}`);
+    setJobProgress(job.id, 90); // CSV + HQ split close out; completion pins 100
     setJobPhase(job.id, 'building_csv', `writing CSV (${matched} matched rows)`);
 
     const allResults = getResults(job.id);

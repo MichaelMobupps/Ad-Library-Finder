@@ -130,7 +130,13 @@ function orderWorklist(items: EnrichWorkItem[]): EnrichWorkItem[] {
 export async function enrichApps(
   items: EnrichWorkItem[],
   onLog?: LogFn,
-  opts?: { shouldStop?: () => boolean },
+  opts?: {
+    shouldStop?: () => boolean;
+    /** Fetch-stream progress: (network units done, total units) — one unit is a
+     *  Play detail fetch or an Apple lookup batch. Cache hits are excluded, so
+     *  this tracks the part of the pass that actually costs wall-clock. */
+    onProgress?: (done: number, total: number) => void;
+  },
 ): Promise<EnrichSummary> {
   const summary: EnrichSummary = {
     apps: 0,
@@ -199,6 +205,14 @@ export async function enrichApps(
   // wall-clock is max(streams) instead of their sum. Both streams mutate the
   // shared summary; JS is single-threaded, so the counters stay coherent.
 
+  // Progress units: each Play fetch and each Apple batch is one unit.
+  const appleGroups = groupByEnrichCountry(toFetchApple);
+  let appleBatchTotal = 0;
+  for (const [, g] of appleGroups) appleBatchTotal += Math.ceil(g.length / ITUNES_LOOKUP_BATCH);
+  const progressTotal = toFetchPlay.length + appleBatchTotal;
+  let progressDone = 0;
+  const tick = () => opts?.onProgress?.(++progressDone, progressTotal);
+
   // ── Play: one detail fetch per app (already throttled inside playSource). ──
   const playStream = async () => {
     for (const it of toFetchPlay) {
@@ -211,6 +225,7 @@ export async function enrichApps(
       summary.requests++;
       // eslint-disable-next-line no-await-in-loop
       const d = await playAppDetail(it.app_id, it.country || 'us', onLog);
+      tick();
       if (!d) {
         upsertAppDetail(failedRow(it.store, it.app_id, prior, attempts));
         summary.failed++;
@@ -247,7 +262,7 @@ export async function enrichApps(
   // against above), and /lookup takes a single country — so mixing markets in
   // one call would silently fail the minority-market apps into failedRow. ──
   const appleStream = async () => {
-    for (const [cc, group] of groupByEnrichCountry(toFetchApple)) {
+    for (const [cc, group] of appleGroups) {
       for (let i = 0; i < group.length; i += ITUNES_LOOKUP_BATCH) {
         if (opts?.shouldStop?.()) {
           onLog?.('warn', 'enrich: stop requested — ending Apple lookups early (cache keeps everything done so far)');
@@ -257,6 +272,7 @@ export async function enrichApps(
         summary.requests++;
         // eslint-disable-next-line no-await-in-loop
         const map = await appleLookup(batch.map((b) => b.app_id), cc, onLog);
+        tick();
         enrichAppleBatch(batch, map, summary);
       }
     }

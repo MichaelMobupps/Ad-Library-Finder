@@ -37,6 +37,7 @@ import {
   setJobPhase,
   setJobHqZipPath,
   setJobLeadsFound,
+  setJobProgress,
   getJob,
   deferJob,
   type JobRow,
@@ -125,6 +126,7 @@ export async function runAppgoblinJob(job: JobRow): Promise<void> {
     // Stop pressed while this job sat in the queue: bail before the scrape —
     // the next check is only AFTER scrapeAppgoblin returns, which can be long.
     throwIfCancelled(job.id);
+    setJobProgress(job.id, 5); // scrape is the long haul: 5..55 of the run
     const scrape = await scrapeAppgoblin({
       category,
       adNetworkDomain,
@@ -144,11 +146,16 @@ export async function runAppgoblinJob(job: JobRow): Promise<void> {
     }
 
     throwIfCancelled(job.id);
+    setJobProgress(job.id, 55);
     setJobPhase(job.id, 'classifying', `${scrape.apps.length} apps to classify`);
 
     let inserted = 0;
     let skippedNoStore = 0;
+    let clsIdx = 0;
     for (const app of scrape.apps) {
+      clsIdx++;
+      // Overall progress: classification is 55..85 of the run.
+      if (clsIdx % 10 === 0) setJobProgress(job.id, 55 + 30 * (clsIdx / Math.max(1, scrape.apps.length)));
       const cls = classifyApp(app);
       if (!cls) {
         skippedNoStore++;
@@ -170,6 +177,7 @@ export async function runAppgoblinJob(job: JobRow): Promise<void> {
     setJobLeadsFound(job.id, inserted);
     onLog('info', `appgoblin: inserted ${inserted} rows (skipped ${skippedNoStore} with unknown store)`);
 
+    setJobProgress(job.id, 85); // CSV + HQ split close out; completion pins 100
     setJobPhase(job.id, 'building_csv', `writing CSV (${inserted} rows)`);
 
     const allResults = getResults(job.id);

@@ -461,6 +461,20 @@ main {
   background: var(--accent);
   transition: width 0.4s var(--ease);
 }
+/* Row-sized bar for the Activity table. */
+.leadbar.mini {
+  width: 90px;
+  max-width: 90px;
+  height: 6px;
+  flex: none;
+  vertical-align: middle;
+}
+.activity-progress {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  white-space: nowrap;
+}
 .btn.danger {
   color: var(--danger);
   border-color: rgba(220, 38, 38, 0.35);
