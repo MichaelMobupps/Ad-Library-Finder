@@ -157,7 +157,8 @@ export default function NewJobForm({
   const toggleIn = (list: string[], v: string) =>
     list.includes(v) ? list.filter((x) => x !== v) : [...list, v];
 
-  const leadCapApplies = source === 'google_ads' || source === 'store_first';
+  // Every source supports the lead cap: pipelines cap their CSV/Excel export
+  // while discovery still runs in full.
   const effectiveRecipient = recipientEmail.trim() || settings?.defaultRecipient || '(none configured)';
 
   const countryHint = (): string => {
@@ -188,7 +189,7 @@ export default function NewJobForm({
       productTypes: [mode],
       recipientEmail: recipientEmail.trim() || null,
       source,
-      maxLeads: leadCapApplies ? maxLeads : null,
+      maxLeads,
     };
     if (source === 'store_first') {
       if (sfVerticals.length === 0) {
@@ -345,10 +346,9 @@ export default function NewJobForm({
         <p className="form-hint">{countryHint()}</p>
       </div>
 
-      {/* 4 ─ How many leads (the two Google Ads engines only) */}
-      {leadCapApplies && (
-        <div className="form-row">
-          <label>How many leads do you want?</label>
+      {/* 4 ─ How many leads (every source honours the cap) */}
+      <div className="form-row">
+        <label>How many leads do you want?</label>
           <div className="checkbox-row">
             {LEAD_LIMIT_CHOICES.map((n) => (
               <label className="checkbox" key={n}>
@@ -361,12 +361,11 @@ export default function NewJobForm({
               <span>As many as found</span>
             </label>
           </div>
-          <p className="form-hint">
-            Your file contains the best leads up to this number. The search keeps everything else it
-            discovers, so nothing is wasted.
-          </p>
-        </div>
-      )}
+        <p className="form-hint">
+          Your file contains the best leads up to this number. The search keeps everything else it
+          discovers, so nothing is wasted.
+        </p>
+      </div>
 
       {/* 5 ─ Email */}
       <div className="form-row">

@@ -48,6 +48,9 @@ export interface ConfirmSummary {
   gatcHits: number; // publishers with ads_count > 0
   metaHits: number; // publishers with Meta store-link ads > 0
   skipped: boolean; // whole phase skipped (cooldown / no proxy path)
+  /** The pass ended because opts.enough() said the lead target was met — a
+   *  SUCCESS, not a budget exhaustion or a user stop. */
+  reachedTarget: boolean;
   note: string;
 }
 
@@ -187,11 +190,22 @@ export async function confirmPublishers(
     shouldStop?: () => boolean;
     /** Called after each publisher so the pipeline can surface a LIVE counter. */
     onProgress?: (s: ConfirmSummary) => void;
+    /**
+     * "We already have what the job asked for" — polled after each publisher.
+     *
+     * DISTINCT from shouldStop: that is the user's Stop button and ends the job
+     * as cancelled, whereas this is a satisfied lead target and ends the pass
+     * SUCCESSFULLY. Without it a job ordering 20 leads burned its whole
+     * confirmation budget (and the operator's proxy spend) long after the 20th
+     * lead had landed.
+     */
+    enough?: () => boolean;
   },
 ): Promise<ConfirmSummary> {
   const onLog = opts.onLog;
   const summary: ConfirmSummary = {
-    queued: 0, processed: 0, apiCalls: 0, confirmed: 0, gatcHits: 0, metaHits: 0, skipped: false, note: '',
+    queued: 0, processed: 0, apiCalls: 0, confirmed: 0, gatcHits: 0, metaHits: 0,
+    skipped: false, reachedTarget: false, note: '',
   };
 
   const queue = listPublishersForConfirmation();
@@ -271,6 +285,15 @@ export async function confirmPublishers(
       (result.metaMeasured ? result.metaAds > 0 : (p.meta_active_ads ?? 0) > 0);
     if (confirmed) summary.confirmed++;
     opts.onProgress?.(summary);
+
+    // Lead target satisfied — stop spending. Checked AFTER onProgress so the
+    // caller has already seen (and exported) this publisher's verdict.
+    if (opts.enough?.()) {
+      summary.reachedTarget = true;
+      summary.note = `lead target reached after ${summary.processed}/${queue.length} publishers (${summary.apiCalls} calls)`;
+      onLog?.('info', `confirm: ${summary.note}`);
+      break;
+    }
   }
 
   if (!summary.note) summary.note = `confirmed ${summary.confirmed}/${summary.processed} processed`;

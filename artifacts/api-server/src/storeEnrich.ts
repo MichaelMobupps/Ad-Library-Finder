@@ -61,7 +61,14 @@ export interface EnrichSummary {
   inBand: number; // Play non-chart apps within the install band
   outOfBand: number; // Play non-chart apps outside the band
   requests: number; // outbound store requests actually made
-  cappedOut: number; // apps skipped because ENRICH_MAX_APPS_PER_RUN was hit
+  cappedOut: number; // apps skipped because the fetch budget was exhausted
+  /** Fetch budget still unspent when the pass ended. The pipeline calls
+   *  enrichApps TWICE per run (once after discovery, once after the developer
+   *  catalogs), and the budget used to be a fresh ENRICH_MAX_APPS_PER_RUN on each
+   *  call — so a run silently spent up to 2x the configured ceiling (measured:
+   *  3,202 + 2,480 = 5,682 Play fetches against a stated cap of 4,000). Threading
+   *  the remainder into the second call makes the config value mean what it says. */
+  budgetLeft: number;
 }
 
 /** Pure install-band predicate (Play). null installs ⇒ NOT in band (tail
@@ -136,6 +143,10 @@ export async function enrichApps(
      *  Play detail fetch or an Apple lookup batch. Cache hits are excluded, so
      *  this tracks the part of the pass that actually costs wall-clock. */
     onProgress?: (done: number, total: number) => void;
+    /** Network fetches this pass may spend. Defaults to the full configured
+     *  ceiling; the pipeline passes the previous pass's `budgetLeft` so both
+     *  passes of a run share ONE ENRICH_MAX_APPS_PER_RUN between them. */
+    fetchBudget?: number;
   },
 ): Promise<EnrichSummary> {
   const summary: EnrichSummary = {
@@ -150,6 +161,7 @@ export async function enrichApps(
     outOfBand: 0,
     requests: 0,
     cappedOut: 0,
+    budgetLeft: 0,
   };
 
   // Dedupe by (store, app_id).
@@ -168,7 +180,8 @@ export async function enrichApps(
   // Split into cached-terminal (no fetch) vs to-fetch, preserving order.
   const toFetchPlay: EnrichWorkItem[] = [];
   const toFetchApple: EnrichWorkItem[] = [];
-  let fetchBudget = ENRICH_MAX_APPS_PER_RUN;
+  let fetchBudget = Math.max(0, opts?.fetchBudget ?? ENRICH_MAX_APPS_PER_RUN);
+  const budgetAtStart = fetchBudget;
 
   const noteBand = (it: EnrichWorkItem, minInstalls: number | null) => {
     if (it.store !== 'google_play' || it.is_chart) return;
@@ -196,11 +209,17 @@ export async function enrichApps(
     else toFetchApple.push(it);
   }
 
+  summary.budgetLeft = fetchBudget;
   if (summary.cappedOut > 0) {
-    onLog?.('warn', `enrich: hit ENRICH_MAX_APPS_PER_RUN (${ENRICH_MAX_APPS_PER_RUN}); ${summary.cappedOut} apps deferred to a later run`);
+    onLog?.(
+      'warn',
+      `enrich: fetch budget exhausted (${budgetAtStart} of the run's ${ENRICH_MAX_APPS_PER_RUN}); ` +
+        `${summary.cappedOut} apps deferred to a later run`,
+    );
   }
 
-  // The two stores throttle independently (Play 1 req/s, iTunes 1 req/6s), so
+  // The two stores throttle independently (Play ~5 req/s across 5 concurrent
+  // streams, iTunes 1 req/3s), so
   // their fetch streams run CONCURRENTLY — same requests, same politeness,
   // wall-clock is max(streams) instead of their sum. Both streams mutate the
   // shared summary; JS is single-threaded, so the counters stay coherent.
@@ -375,13 +394,35 @@ function failedRow(
 
 // ── offline unit tests (install-band gate) ───────────────────────────────────
 
-export function runStoreEnrichTests(): { passed: number; failed: number; failures: string[] } {
+export async function runStoreEnrichTests(): Promise<{ passed: number; failed: number; failures: string[] }> {
   let passed = 0;
   const failures: string[] = [];
   const check = (cond: boolean, desc: string) => {
     if (cond) passed++;
     else failures.push(`FAIL: ${desc}`);
   };
+
+  // Fetch-budget threading: the pipeline runs TWO enrichment passes per run and
+  // they must share ONE ENRICH_MAX_APPS_PER_RUN. The regression this guards is a
+  // silent 2x overspend — measured at 5,682 Play fetches against a stated 4,000.
+  // An empty worklist touches neither DB nor network, so this stays hermetic.
+  {
+    const explicit = await enrichApps([], undefined, { fetchBudget: 1234 });
+    check(explicit.budgetLeft === 1234, `unspent budget is reported back (got ${explicit.budgetLeft})`);
+    check(explicit.apps === 0 && explicit.requests === 0, 'empty worklist makes no requests');
+
+    const defaulted = await enrichApps([]);
+    check(
+      defaulted.budgetLeft === ENRICH_MAX_APPS_PER_RUN,
+      `an omitted budget defaults to ENRICH_MAX_APPS_PER_RUN (got ${defaulted.budgetLeft})`,
+    );
+
+    const zero = await enrichApps([], undefined, { fetchBudget: 0 });
+    check(zero.budgetLeft === 0, 'a fully-spent budget threads through as 0, not as the default');
+
+    const negative = await enrichApps([], undefined, { fetchBudget: -5 });
+    check(negative.budgetLeft === 0, 'a negative budget clamps to 0 rather than re-opening the cap');
+  }
 
   // Install-band gate boundaries (TAIL_MIN=50k, TAIL_MAX=5M by default).
   check(isInInstallBand(TAIL_MIN_INSTALLS) === true, `band: min boundary ${TAIL_MIN_INSTALLS} in-band`);
@@ -415,8 +456,9 @@ const isMain =
   process.argv[1] &&
   (process.argv[1].endsWith('storeEnrich.js') || process.argv[1].endsWith('storeEnrich.ts'));
 if (isMain) {
-  const { passed, failed, failures } = runStoreEnrichTests();
-  console.log(`storeEnrich tests: ${passed} passed, ${failed} failed`);
-  for (const f of failures) console.log('  ' + f);
-  process.exit(failed === 0 ? 0 : 1);
+  void runStoreEnrichTests().then(({ passed, failed, failures }) => {
+    console.log(`storeEnrich tests: ${passed} passed, ${failed} failed`);
+    for (const f of failures) console.log('  ' + f);
+    process.exit(failed === 0 ? 0 : 1);
+  });
 }

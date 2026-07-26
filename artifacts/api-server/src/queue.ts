@@ -1,6 +1,5 @@
 import {
-  getNextPendingJob,
-  getNextPendingCapExemptJob,
+  listRunnableJobs,
   markJobRunning,
   markJobCompleted,
   markJobFailed,
@@ -16,7 +15,7 @@ import {
   deferJob,
   JobRow,
 } from './db.js';
-import { JobCancelledError, throwIfCancelled, clearCancelState } from './jobControl.js';
+import { JobCancelledError, throwIfCancelled, clearCancelState, beginJobRun, endJobRun } from './jobControl.js';
 import {
   BudgetExceededError,
   nextJerusalemMidnightMs,
@@ -25,7 +24,7 @@ import {
 } from './llmBudget.js';
 import { scrapeQuery, RawAd, closeBrowser } from './scraper.js';
 import { classify } from './classifier.js';
-import { buildCsv } from './csv.js';
+import { buildCsv, selectExportRows, normalizeMaxLeads } from './csv.js';
 import { keywordsFor } from './keywords.js';
 import { notifyJobCompleted, notifyJobFailed } from './notifier.js';
 import { runAffplusJob } from './affplusPipeline.js';
@@ -36,60 +35,96 @@ import { runHqSplit } from './hqSplit.js';
 import { log } from './logger.js';
 
 const POLL_INTERVAL_MS = 2000;
+/**
+ * Global ceiling on jobs in flight at once — bounds browsers, proxy traffic and
+ * LLM spend bursts, NOT fairness (fairness is the per-user rule below).
+ */
+const MAX_CONCURRENT_JOBS = Math.max(1, Math.min(8, Number(process.env.QUEUE_MAX_CONCURRENT_JOBS) || 3));
 let running = false;
+
+/**
+ * CONCURRENT dispatcher — parallel ACROSS users, serial WITHIN a user.
+ *
+ * The old loop ran ONE job at a time globally, so another user's first job sat
+ * behind whatever was already running. Policy now:
+ *   • A user's FIRST pending job starts immediately (up to MAX_CONCURRENT_JOBS
+ *     in flight overall) — never queued behind another person's job.
+ *   • A user's SECOND job waits for their own first (per-user serialization),
+ *     which is what keeps one person from monopolizing the worker pool.
+ * Shared-state safety under concurrency: the store rate limiters are global (so
+ * politeness holds across any number of jobs), meta uses an isolated browser
+ * context per query, and the GATC session reset is guarded by the active-run
+ * registry (googleAdsPipeline skips the reset while another GATC job runs).
+ */
+const inFlightJobs = new Set<string>();
+const inFlightByUser = new Map<string, string>(); // user key → job id
 
 export function startQueue() {
   if (running) return;
   running = true;
-  log.info('queue processor started');
+  log.info(`queue processor started (parallel per user, max ${MAX_CONCURRENT_JOBS} concurrent)`);
   void tick();
 }
 
 async function tick() {
   while (running) {
     try {
-      let job = getNextPendingJob();
-      // Already at/over the daily cap: do not start the head job. Starting it
-      // would scrape (non-LLM) and then defer at the first LLM call, churning
-      // the whole queue. Leave it untouched and wait for the Jerusalem-day
-      // reset, at which point spend resets and dispatch resumes.
-      //
-      // store_first is EXEMPT: discovery, enrichment and GATC/Meta confirmation
-      // are all plain HTTP, so the job cannot defer on spend and holding it back
-      // just stalls discovery for a whole day. Its ONE LLM-spending step is the
-      // trailing HQ split that builds the Excel bundle, and that step checks the
-      // cap itself and skips (buildExcelBundle) — so the exemption cannot be used
-      // to spend past the cap, it only lets the free 99% of the job run. The
-      // exemption must not depend on the exempt job being the HEAD: the blocked
-      // head never leaves 'pending', so a store_first job queued behind it
-      // would otherwise be head-of-line blocked until midnight. When the head
-      // is cap-parked, run the oldest exempt job behind it instead.
-      if (job && job.source !== 'store_first' && spentTodayUsd() >= DAILY_CAP_USD) {
-        job = getNextPendingCapExemptJob();
-      }
-      if (job) {
-        // Fresh cancellation state for this run: a job id can re-enter the worker
-        // (deferred jobs replay), and the control cache's "cancelled" answer is
-        // deliberately sticky within a run.
-        clearCancelState(job.id);
-        if (job.source === 'affplus') {
-          await runAffplusJob(job);
-        } else if (job.source === 'appgoblin') {
-          await runAppgoblinJob(job);
-        } else if (job.source === 'google_ads') {
-          await runGoogleAdsJob(job);
-        } else if (job.source === 'store_first') {
-          await runStoreDiscoveryJob(job);
-        } else {
-          await runMetaJob(job);
-        }
-      } else {
-        await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
-      }
+      dispatchRunnable();
     } catch (err) {
       log.error('queue tick error', err);
-      await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
     }
+    await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+  }
+}
+
+function dispatchRunnable() {
+  if (inFlightJobs.size >= MAX_CONCURRENT_JOBS) return;
+  // Daily LLM cap: do not START a non-exempt job — it would scrape (non-LLM)
+  // and then defer at the first LLM call, churning the queue. store_first is
+  // EXEMPT: its pipeline is plain HTTP and its one LLM step (the trailing HQ
+  // split) checks the cap itself and skips, so the exemption cannot overspend.
+  const capReached = spentTodayUsd() >= DAILY_CAP_USD;
+  for (const job of listRunnableJobs(50)) {
+    if (inFlightJobs.size >= MAX_CONCURRENT_JOBS) break;
+    if (inFlightJobs.has(job.id)) continue; // launched a tick ago, still 'pending' in DB
+    const userKey = job.created_by_user_id || '(no-user)';
+    if (inFlightByUser.has(userKey)) continue; // per-user serial: their next job waits for their current one
+    if (capReached && job.source !== 'store_first') continue; // cap-parked until the Jerusalem-day reset
+    launchJob(job, userKey);
+  }
+}
+
+function launchJob(job: JobRow, userKey: string) {
+  inFlightJobs.add(job.id);
+  inFlightByUser.set(userKey, job.id);
+  beginJobRun(job.source);
+  // Fresh cancellation state for this run: a job id can re-enter the worker
+  // (deferred/resumed jobs replay), and the control cache's "cancelled" answer
+  // is deliberately sticky within a run.
+  clearCancelState(job.id);
+  void runJob(job)
+    .catch((err) => {
+      // Runners settle their own job rows; this only guards the dispatcher.
+      log.error(`job ${job.id} escaped its pipeline's error handling`, err);
+    })
+    .finally(() => {
+      endJobRun(job.source);
+      inFlightJobs.delete(job.id);
+      if (inFlightByUser.get(userKey) === job.id) inFlightByUser.delete(userKey);
+    });
+}
+
+async function runJob(job: JobRow): Promise<void> {
+  if (job.source === 'affplus') {
+    await runAffplusJob(job);
+  } else if (job.source === 'appgoblin') {
+    await runAppgoblinJob(job);
+  } else if (job.source === 'google_ads') {
+    await runGoogleAdsJob(job);
+  } else if (job.source === 'store_first') {
+    await runStoreDiscoveryJob(job);
+  } else {
+    await runMetaJob(job);
   }
 }
 
@@ -201,10 +236,16 @@ async function runMetaJob(job: JobRow) {
     setJobPhase(job.id, 'building_csv', `writing CSV (${matched} matched rows)`);
 
     const allResults = getResults(job.id);
+    // Operator-chosen lead cap (20/50/100/all) — caps the CSV and, below, the
+    // HQ-split rows, so the Excel never disagrees with the CSV.
+    const metaMaxLeads = normalizeMaxLeads(
+      job.source_params ? (JSON.parse(job.source_params) as Record<string, unknown>).maxLeads : null,
+    );
     const { path: csvPath, rowsWritten } = buildCsv({
       jobId: job.id,
       productType: job.product_type,
       results: allResults,
+      maxRows: metaMaxLeads,
     });
     onLog('info', `CSV written: ${csvPath} (${rowsWritten} rows)`);
 
@@ -214,7 +255,11 @@ async function runMetaJob(job: JobRow) {
       throwIfCancelled(job.id);
       setJobPhase(job.id, 'hq_splitting', `resolving HQ for ${rowsWritten} apps`);
       try {
-        const outcome = await runHqSplit({ jobId: job.id, results: allResults, onLog });
+        const outcome = await runHqSplit({
+          jobId: job.id,
+          results: selectExportRows(allResults, job.product_type, metaMaxLeads),
+          onLog,
+        });
         if (outcome.zipPath) {
           setJobHqZipPath(job.id, outcome.zipPath);
           const summary = Object.entries(outcome.perCountryCounts)
@@ -250,7 +295,10 @@ async function runMetaJob(job: JobRow) {
       let csvPath: string | null = null;
       let kept = 0;
       try {
-        const partial = buildCsv({ jobId: job.id, productType: job.product_type, results: getResults(job.id) });
+        const cap = normalizeMaxLeads(
+          job.source_params ? (JSON.parse(job.source_params) as Record<string, unknown>).maxLeads : null,
+        );
+        const partial = buildCsv({ jobId: job.id, productType: job.product_type, results: getResults(job.id), maxRows: cap });
         csvPath = partial.path;
         kept = partial.rowsWritten;
       } catch {

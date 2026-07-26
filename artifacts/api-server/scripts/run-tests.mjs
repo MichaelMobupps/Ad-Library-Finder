@@ -10,8 +10,8 @@
  * non-zero if any of them fails.
  *
  * Modules are DISCOVERED, not hardcoded: any src/*.ts exporting a
- * `run<Name>Tests` function is picked up automatically, so a new module with
- * tests is covered the moment it lands. Modules whose suites need the network
+ * `run<Name>Tests` function (sync or async) is picked up automatically, so a new
+ * module with tests is covered the moment it lands. Modules whose suites need the network
  * are listed in NETWORK_MODULES and skipped by default (pass --all to include).
  */
 
@@ -36,7 +36,7 @@ if (!existsSync(DIST)) {
 
 const modules = readdirSync(SRC)
   .filter((f) => f.endsWith('.ts') && !f.endsWith('.d.ts'))
-  .filter((f) => /^export function run[A-Za-z0-9]*Tests\b/m.test(readFileSync(path.join(SRC, f), 'utf8')))
+  .filter((f) => /^export (?:async )?function run[A-Za-z0-9]*Tests\b/m.test(readFileSync(path.join(SRC, f), 'utf8')))
   .map((f) => f.replace(/\.ts$/, ''))
   .sort();
 

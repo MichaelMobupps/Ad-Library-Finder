@@ -16,6 +16,8 @@
 import gplayDefault from 'google-play-scraper';
 import {
   PLAY_REQUEST_INTERVAL_MS,
+  PLAY_CONCURRENCY,
+  PLAY_BLOCK_BACKOFF_MS,
   PLAY_CHART_NUM,
   PLAY_SEARCH_NUM,
   PLAY_DEV_CATALOG_NUM,
@@ -29,7 +31,41 @@ const gplay: any = gplayDefault as unknown;
 
 export type LogFn = (level: 'info' | 'warn' | 'error' | 'debug', msg: string) => void;
 
-const limiter = new RateLimiter(PLAY_REQUEST_INTERVAL_MS);
+const limiter = new RateLimiter(PLAY_REQUEST_INTERVAL_MS, PLAY_CONCURRENCY);
+
+/**
+ * Does this failure look like Google pushing back (rather than an ordinary
+ * missing listing)? google-play-scraper surfaces HTTP failures as Error messages
+ * carrying the status, so match on those rather than on a typed field the library
+ * does not promise.
+ *
+ * Exported for tests. Deliberately NARROW: a false positive here idles every Play
+ * stream for PLAY_BLOCK_BACKOFF_MS, so only unambiguous rate-limit/forbidden
+ * signals qualify — a 404 (app delisted) must never trip it.
+ */
+export function playRequestBlocked(err: unknown): boolean {
+  const msg = ((err as Error)?.message || String(err ?? '')).toLowerCase();
+  return (
+    msg.includes('429') ||
+    msg.includes('too many requests') ||
+    msg.includes('403') ||
+    msg.includes('forbidden') ||
+    msg.includes('captcha') ||
+    msg.includes('unusual traffic')
+  );
+}
+
+/** Trip the shared adaptive backoff when a call looks blocked. Every Play stream
+ *  behind the limiter holds off, so a penalty-boxed exit IP slows the harvest
+ *  instead of being hammered into a longer ban. */
+function notePlayFailure(err: unknown, where: string, onLog?: LogFn): void {
+  if (!playRequestBlocked(err)) return;
+  const already = limiter.penaltyRemainingMs();
+  limiter.penalize(PLAY_BLOCK_BACKOFF_MS);
+  if (already <= 0) {
+    onLog?.('warn', `play: blocked on ${where} — backing off all Play streams for ${Math.round(PLAY_BLOCK_BACKOFF_MS / 1000)}s`);
+  }
+}
 
 /** A chart/search/similar list item (partial detail). */
 export interface PlayListApp {
@@ -124,6 +160,7 @@ export async function playChart(
     } catch (err) {
       // warn, not debug: a whole chart returning zero apps is a harvest-wide
       // hole and must never be invisible again.
+      notePlayFailure(err, `chart ${category}/${chart}/${country}`, onLog);
       onLog?.('warn', `play chart ${category}/${chart}/${country} failed: ${(err as Error).message}`);
       return [];
     }
@@ -150,6 +187,7 @@ export async function playSimilar(appId: string, country: string, onLog?: LogFn)
       if (NO_SIMILAR_CLUSTER.test(msg)) {
         onLog?.('debug', `play similar ${appId}/${country}: no similar-apps cluster on the listing`);
       } else {
+        notePlayFailure(err, `similar ${appId}/${country}`, onLog);
         onLog?.('debug', `play similar ${appId}/${country} failed: ${msg}`);
       }
       return [];
@@ -190,6 +228,7 @@ export async function playDeveloper(devId: string, country = 'us', onLog?: LogFn
     try {
       return coerceList(await gplay.developer({ devId: decoded, country, num: PLAY_DEV_CATALOG_NUM }));
     } catch (err) {
+      notePlayFailure(err, `developer ${decoded}`, onLog);
       onLog?.('debug', `play developer ${decoded} failed: ${(err as Error).message}`);
       return [];
     }
@@ -202,6 +241,7 @@ export async function playSearch(term: string, country: string, onLog?: LogFn): 
     try {
       return coerceList(await gplay.search({ term, country, num: PLAY_SEARCH_NUM }));
     } catch (err) {
+      notePlayFailure(err, `search "${term}"/${country}`, onLog);
       onLog?.('debug', `play search "${term}"/${country} failed: ${(err as Error).message}`);
       return [];
     }
@@ -229,6 +269,7 @@ export async function playAppDetail(appId: string, country = 'us', onLog?: LogFn
         offersIAP: typeof a.offersIAP === 'boolean' ? a.offersIAP : null,
       };
     } catch (err) {
+      notePlayFailure(err, `app ${appId}/${country}`, onLog);
       onLog?.('debug', `play app ${appId}/${country} failed: ${(err as Error).message}`);
       return null;
     }
@@ -260,6 +301,7 @@ export async function playAppLiveness(
     } catch (err) {
       const msg = (err as Error).message || '';
       if (PLAY_APP_NOT_FOUND.test(msg)) return 'gone';
+      notePlayFailure(err, `liveness ${appId}/${country}`, onLog);
       onLog?.('debug', `play liveness ${appId}/${country} inconclusive: ${msg}`);
       return 'unknown';
     }
@@ -287,6 +329,33 @@ export function runPlaySourceTests(): { passed: number; failed: number; failures
     if (cond) passed++;
     else failures.push(`FAIL: ${desc}`);
   };
+
+  // Adaptive-backoff classifier. It must fire on unambiguous rate-limit/block
+  // signals and STAY SILENT otherwise: a false positive idles every Play stream
+  // for PLAY_BLOCK_BACKOFF_MS, and 404s are routine long-tail noise.
+  for (const msg of [
+    'Request failed with status code 429',
+    'Too Many Requests',
+    'Request failed with status code 403',
+    'Forbidden',
+    'Our systems have detected unusual traffic',
+    'captcha required',
+  ]) {
+    check(playRequestBlocked(new Error(msg)), `blocked: "${msg}" trips the backoff`);
+  }
+  for (const msg of [
+    'App not found (404)',
+    'Cannot read properties of null (reading \'0\')',
+    'Invalid collection',
+    'socket hang up',
+    'ETIMEDOUT',
+    'Request failed with status code 500',
+  ]) {
+    check(!playRequestBlocked(new Error(msg)), `not blocked: "${msg}" must not trip the backoff`);
+  }
+  check(!playRequestBlocked(null), 'null error does not trip the backoff');
+  check(!playRequestBlocked(undefined), 'undefined error does not trip the backoff');
+  check(playRequestBlocked('HTTP 429 from play'), 'a bare string carrying 429 is recognised');
 
   const collections = Object.values((gplay.category ? gplay.collection : {}) as Record<string, string>);
   check(collections.length > 0, 'library exposes a collection enum');

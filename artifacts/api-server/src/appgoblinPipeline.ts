@@ -45,7 +45,7 @@ import {
 import { JobCancelledError, throwIfCancelled } from './jobControl.js';
 import { BudgetExceededError, nextJerusalemMidnightMs, DAILY_CAP_USD } from './llmBudget.js';
 import { scrapeAppgoblin, type AppgoblinApp } from './appgoblinScraper.js';
-import { buildCsv } from './csv.js';
+import { buildCsv, selectExportRows, normalizeMaxLeads } from './csv.js';
 import { notifyJobCompleted, notifyJobFailed } from './notifier.js';
 import { runHqSplit } from './hqSplit.js';
 import { log } from './logger.js';
@@ -53,6 +53,8 @@ import { log } from './logger.js';
 export interface AppgoblinSourceParams {
   category?: string | null;
   adNetworkDomain?: string | null;
+  /** Operator-chosen cap on exported leads; null/absent = as many as found. */
+  maxLeads?: number | null;
 }
 
 function classifyApp(app: AppgoblinApp): 'mobile_google_play' | 'mobile_app_store' | null {
@@ -180,18 +182,28 @@ export async function runAppgoblinJob(job: JobRow): Promise<void> {
     setJobProgress(job.id, 85); // CSV + HQ split close out; completion pins 100
     setJobPhase(job.id, 'building_csv', `writing CSV (${inserted} rows)`);
 
+    // Operator-chosen lead cap (20/50/100/all) applies to the CSV and the HQ
+    // split alike, so the Excel never disagrees with the CSV.
     const allResults = getResults(job.id);
+    const agMaxLeads = normalizeMaxLeads(
+      params.maxLeads ?? null,
+    );
     const { path: csvPath, rowsWritten } = buildCsv({
       jobId: job.id,
       productType: job.product_type,
       results: allResults,
+      maxRows: agMaxLeads,
     });
     onLog('info', `appgoblin: CSV written: ${csvPath} (${rowsWritten} rows)`);
 
     if (job.product_type === 'mobile') {
       setJobPhase(job.id, 'hq_splitting', `resolving HQ for ${rowsWritten} apps`);
       try {
-        const outcome = await runHqSplit({ jobId: job.id, results: allResults, onLog });
+        const outcome = await runHqSplit({
+          jobId: job.id,
+          results: selectExportRows(allResults, job.product_type, agMaxLeads),
+          onLog,
+        });
         if (outcome.zipPath) {
           setJobHqZipPath(job.id, outcome.zipPath);
           const summary = Object.entries(outcome.perCountryCounts)
@@ -223,7 +235,10 @@ export async function runAppgoblinJob(job: JobRow): Promise<void> {
       let csvPath: string | null = null;
       let kept = 0;
       try {
-        const partial = buildCsv({ jobId: job.id, productType: job.product_type, results: getResults(job.id) });
+        const cap = normalizeMaxLeads(
+          job.source_params ? (JSON.parse(job.source_params) as Record<string, unknown>).maxLeads : null,
+        );
+        const partial = buildCsv({ jobId: job.id, productType: job.product_type, results: getResults(job.id), maxRows: cap });
         csvPath = partial.path;
         kept = partial.rowsWritten;
       } catch { /* best-effort */ }
