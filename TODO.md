@@ -605,6 +605,282 @@ Builds ✓ both packages. **28 modules, 689 assertions ✓, 0 failed.**
 - ☐ Deferred by user choice, still open: Fix 3 (demand-driven enrichment) and Fix 4 (discovery
   outruns enrichment; search battery amplifier via `ITUNES_SEARCH_LIMIT=200`).
 
+## Custom lead count (user ask, 2026-07-26)  ☑
+
+**Ask:** next to "How many leads do you want?" give a fillable textbox so the user can pick any number.
+
+- **Server needed no change** — `normalizeMaxLeads` was already deliberately permissive about the
+  VALUE (any positive integer) and the route never whitelisted against `LEAD_LIMIT_CHOICES`. This was
+  purely a UI gap.
+- **New `parseCustomLeadCount(raw)` + `LEAD_LIMIT_CUSTOM_MAX` (100,000)** in `csv.ts`. Digits only —
+  REJECTS decimals rather than flooring them (typing "2.5" meant something; silently exporting 2 is
+  the quiet surprise this codebase avoids), rejects 0/negative/`1e3`/`+7`/trailing junk, tolerates
+  whitespace and leading zeros. The max is a typo guard for the form, NOT a server restriction — the
+  API still honours anything positive for ops/direct callers.
+- **Form**: 20 / 50 / 100 / "As many as found" / **Custom + number box**, inline in the Custom row
+  (`.checkbox-row` stacks vertically, so the input lives inside the label). Focusing or typing selects
+  Custom, so a number can never be entered and then silently ignored because a preset was still on.
+  Explicit `useCustomLeads` mode flag rather than deriving "is custom" from "not a preset" — the
+  latter would deselect the box the instant someone typed 20 and would discard mid-edit text.
+
+### Audit findings on this change → both auto-fixed
+
+1. **Dead-end UX**: Custom selected with an EMPTY box disabled Start with no explanation at all. Split
+   `customLeadsMissing` (always explained, gates Start) from `customLeadsInvalid` (also styled red).
+   A `type=number` input reports `''` for un-parseable text like "abc", so blank can mean "untouched"
+   OR "browser rejected the keystrokes" — both now get the hint.
+2. **Mirror drift risk**: the dashboard is a separate package and MIRRORS the validator (same pattern
+   as `LEAD_LIMIT_CHOICES` / `countries.ts`). A "keep in sync" comment enforces nothing, so:
+   **new `scripts/check-lead-mirror.mjs`** runs BOTH implementations over 20 inputs and fails on any
+   disagreement, wired into `npm test` as its own gate step. **Negative-tested both ways** — injecting
+   constant drift (100k→50k) and logic drift (UI accepting decimals) each made the script exit 1 and
+   the whole suite fail with `✗ failing modules: lead-cap-mirror`; restoring returned it to green.
+
+### Smoke (single clean server on :3917/:3918)
+
+- Custom values reach `source_params` verbatim: 7 → 7, 33 → 33, 250 → 250, 99999 → 99999.
+- Other sources carry a custom cap too: google_ads / meta / affplus all stored `maxLeads=37`.
+- **Cap actually limits the export**: corpus seeded with 9 confirmed publishers, asked for 3 →
+  `completed leads=3`, delivered CSV had exactly **3 rows**.
+- Blast radius: preset path unchanged; `LEAD_LIMIT_CHOICES` still drives the radios.
+
+Builds ✓ both packages. **28 modules, 709 assertions ✓** (+20 from this change), mirror gate ✓.
+Dev DB restored (128 publishers / 0 confirmed / 0 stray jobs); `.replit` reverted.
+
+## NEXT LEVEL SPEED — confirm-before-enrich fast lane (2026-07-26 evening)  ☑ DONE
+
+**User:** *"The current progress of scraping is still relatively slow, I need to find a much faster
+way to scrape and get leads. We need to make it next level."*
+
+### What the production log (markets=[ca], 9 verticals) actually shows
+
+    19:17:57  job started
+    19:18:46  charts done: 9,717 sightings; 8,105 distinct rows      <- 49 SECONDS. Charts are FAST.
+    19:18:46  checkpoint "top charts": 0 lead(s)
+    19:18:46  similar depth 0: 7,206 seeds
+    19:18:12..19:24:17  rollup: 0 publishers  (every 15s, forever)
+
+**The gate is ENRICHMENT, and the reason is architectural, not throughput.**
+`rollupPublishers` reads its whole world through `allDoneAppDetails()` — apps with
+`enrich_status='done'`. On a cold corpus NOTHING is enriched, so 8,105 discovered apps roll up to
+**0 publishers**, and 0 publishers means 0 confirmations means 0 leads. The pump then spins doing
+nothing until enrichment finishes: 8,105 Play detail fetches at ~5 req/s ≈ **27 minutes** before the
+first lead can even be attempted. Play detail pages are ~1.2 MB each — we download ~9.7 GB of HTML
+per run to extract a developer name, email and install count.
+
+### THE IDEA THAT CHANGES THE ORDER OF MAGNITUDE — confirm BEFORE enrich
+
+Two facts already true in the codebase:
+
+1. **Chart/search/similar list responses ALREADY carry publisher identity.** `PlayListApp` is
+   `{ appId, title, developer, developerId }` (playSource.ts) — the developer is in the LIST payload
+   we have already paid for. Apple's RSS gives `artistName` likewise. We do NOT need a 1.2 MB detail
+   fetch to know who publishes an app.
+2. **Confirmation only needs a name/domain.** `confirmOne` queries GATC by publisher name and by
+   website domain. The name is available from step 1 the moment the charts land.
+
+So the funnel is currently **inverted**. Today: discover 8,105 → enrich ALL 8,105 (27 min, ~9.7 GB) →
+roll up → confirm ~66 (budget 200 ÷ ~3 calls) → export 20. We enrich ~400 apps for every publisher we
+can afford to check, and ~8,000 for every 20 leads delivered.
+
+**Proposed: discover → roll up a PROVISIONAL publisher from list-payload identity → confirm → enrich
+ONLY the confirmed winners (for email/website/installs, which are needed for the deliverable, not for
+the verdict).** Enrichment drops from ~8,105 apps to ~60. Leads become possible at **~1 minute**
+instead of ~27, and the run stops paying for HTML nobody reads.
+
+Work required (non-trivial, needs its own design pass):
+- A provisional publisher row keyed on `developer_id` / `artistName` from list payloads, which the
+  full rollup later merges into (the merge machinery already exists — UnionFind on domain/name).
+- `listPublishersForConfirmation` must accept provisional rows (today it gates on `is_charted` /
+  `in_band`, and `in_band` needs installs, i.e. enrichment).
+- Scoring/export must tolerate a publisher whose apps are not enriched yet (email/website null →
+  enrich on demand before export).
+- Keep the existing path as the fallback for anything the provisional path cannot resolve.
+
+### ✅ SHIPPED — measured result
+
+**A complete 3-lead job on a COLD corpus, with real Ads Transparency, in 20 seconds:**
+
+    +2.8s   charts done: 500 sightings / 484 distinct
+    +3.0s   fast lane: 356 publisher(s) from list data alone (NO detail fetch)
+    +5.7s   first GATC confirm calls
+    +7.5s   confirm: lead target reached after 7/356 publishers (10 calls)
+    +7.5s   winners: enriching 7 app(s) across 3 confirmed publisher(s)
+    +10.1s  CSV written — 3 publisher leads
+    +20.4s  store-first job completed early
+
+Real leads with full contact details: Block, Inc. (support@squareup.com, 27 GATC ads), Green Dot
+(appsupport@GO2bank.com, 40 ads), Branch Messenger (20 ads). **7 publishers checked and 7 apps
+enriched — instead of enriching ~8,000 apps before the first confirmation could even run.**
+Live HTTP smoke on an EXISTING database: 2-lead job complete in 24s, CSV downloadable at +13.8s,
+8 API calls, 3 app fetches.
+
+Before: the reported production run spent 2h34m and delivered 0 leads.
+
+### How it works
+
+1. **Persist the identity the list payload already carries.** New `discovered_apps.list_developer` /
+   `list_developer_id` (+ migration + index), filled at all four Play ingestion sites (charts,
+   similar, search, catalogs). Costs zero extra requests — the data was being discarded.
+2. **`rollupProvisionalPlayPublishers()`** builds real publisher rows from that identity alone, so a
+   charted publisher is confirmable seconds into a run instead of after full enrichment.
+3. **`enrichConfirmedWinners()`** detail-fetches ONLY publishers that already confirmed as
+   advertisers, to fill email/website. Bounded by `WINNER_ENRICH_MAX_PUBLISHERS` (40) and
+   `WINNER_ENRICH_APPS_PER_PUBLISHER` (3), drawing on the run's SHARED enrichment budget — it
+   re-prioritises fetches toward leads rather than adding any.
+
+### MEASURED CORRECTION — the original plan's premise was wrong
+
+The plan above assumed Play's chart list returns `developerId`. **It does not.** Verified live against
+google-play-scraper 10.1.3:
+
+| endpoint | developer | developerId |
+|---|---|---|
+| `list()` (charts) | "Block, Inc." | **undefined** |
+| `similar()` | name | undefined |
+| `developer()` | name | undefined |
+| `search()` | name | the NAME (Play uses the name as id for non-numeric devs) |
+
+So identity is the developer NAME. The design was reworked to group on `mergeNameKey(developer)` and
+register identity key `n:<key>` — which `identityKeysFor()` ALSO emits for every rolled-up publisher
+(via `mergeableNames`, one per app, unconditionally). That is what makes the full rollup land on the
+SAME row. Name merging is looser than id merging, but it is exactly the merge evidence the existing
+rollup already uses, so no new class of risk.
+
+### Godlike audit → 4 real problems found and fixed
+
+1. **FATAL BOOT BUG — would have taken production down on deploy.** `CREATE INDEX ... ON
+   discovered_apps(list_developer)` sat inside the schema `exec()` block that runs BEFORE
+   `addColumnIfMissing`. On any EXISTING database `CREATE TABLE IF NOT EXISTS` is a no-op, so the
+   column did not exist yet → `SqliteError: no such column: list_developer` → server refuses to
+   start. Caught by booting against the real dev DB. Index now created only after the migration.
+2. **4 SECONDS PER PUMP TICK.** The fast-lane query used two correlated subqueries per group for the
+   preview app; on a corpus the size of the real run (8,000 apps / 2,000 devs) that measured
+   **3,526 ms** of a 4.8 s pass — a quarter of every 15 s tick, competing with the scrape. Rewritten
+   to use SQLite's documented min()/max() bare-column rule (one pass, no subquery) and the index
+   corrected to the column actually grouped on. **3,526 ms → 11 ms.**
+3. **Repeat passes on an unchanged corpus.** Added `countPlayListIdentityRows()` change detection
+   (+ `resetFastLaneCache()` at run start so a new job never inherits the previous verdict).
+   **Steady-state tick 3,970 ms → 1 ms.**
+4. **Provisional rows would have vanished from the Publishers view.** They were written with a
+   synthetic `source_mix: {list: N}`, but the view FILTERS on source_mix — so any source filter would
+   have hidden them. Now emits the real per-source counts (chart/search/similar/developer_catalog).
+
+### Gate
+
+New `scripts/check-fast-lane.mjs` (wired into `npm test`, runs in a throwaway DB) pins **14
+invariants**, including the load-bearing one: a provisional row and the later full rollup are the
+SAME publisher row id — never a duplicate. Also: no invented email/website, `in_band=0` without
+installs, no downgrade of enriched data, two spellings fold into one publisher, unchanged corpus
+short-circuits, a new discovery re-arms it. **28 modules, 709 assertions, both gates green.**
+
+### Godlike audit #6 — round 3 on the fast lane  ☑
+
+**SEVERE BUG FOUND AND FIXED — silent data loss on partially-enriched publishers.**
+
+`upsertPublisher`'s ON CONFLICT clause COALESCEs `email`/`website` (so those were safe) but assigns
+`both_stores`, `in_band`, `is_game_publisher`, `app_count`, `source_mix`, `countries_*`, `verticals`
+and the previews **unconditionally from `excluded`**. That is correct for the full rollup, which
+recomputed the world — but a PROVISIONAL row knows none of those facts and writes 0/null.
+
+So a publisher that already had enriched apps, and then gained ONE new unenriched app from a chart
+sighting, was rewritten to `in_band=0, both_stores=0, is_game_publisher=0`. Proven with a probe:
+
+    BEFORE fast lane: {in_band:1, both_stores:1, is_game:1, app_count:3, email:"x@clob.example"}
+    AFTER  fast lane: {in_band:0, both_stores:0, is_game:0, app_count:3, email:"x@clob.example"}
+
+`in_band=0` is the damaging one: `listPublishersForConfirmation` gates on `is_charted=1 OR
+in_band=1`, so a TAIL publisher zeroed this way silently drops out of the confirmation queue and can
+never become a lead. The earlier fast-lane gate missed it because it only covered the
+fully-unenriched and fully-enriched cases, never the partially-enriched one in between.
+
+**Fix:** new `upsertPublisher(..., { preserveEnriched: true })` mode used by the fast lane only. Its
+conflict clause never lowers enrichment-derived facts, and only RAISES counters
+(`app_count`/`charted_app_count`/`is_charted` via MAX, `best_rank` via MIN, previews via COALESCE).
+Re-probed: every field preserved. Two new gate invariants pin it (partially-enriched preservation,
+and that counters still rise), bringing the fast-lane gate to **16 invariants**.
+
+**Checked and cleared (no action needed):**
+- **absorb path**: `mergePublisherFields` picks `is_game_publisher` from whichever row has more apps,
+  and a provisional row can have a higher `app_count` while always reporting 0 — but absorbs run
+  BEFORE the INSERT…ON CONFLICT, which then overwrites `is_game_publisher` with the correctly
+  computed value. Self-healing; verified by reading the statement order.
+- **export quality**: provisional rows carry `score 0` and no contact details, but the export is
+  confirmed-only, so an unconfirmed provisional row can never reach a CSV.
+- **real-data integrity**: on the live dev corpus, 9 publishers matched the "clobber signature"
+  (enriched but all-zero facts) — each was checked against its own enriched apps and all 9 are
+  **legitimately** zero (single app, out of install band, single store, non-game). No damage.
+- **`unenrichedAppsForPlayDevelopers([p.name])`** looks up winners by the publisher's display name,
+  so if two spellings folded into one group only the primary spelling's apps are found. Harmless at
+  the configured budget (3 apps per publisher is almost always satisfied by the primary spelling).
+
+**Blast radius:** boots clean against the EXISTING database (the fatal-migration case from audit #5);
+all 5 sources create and settle `cancelled`; guards fire (appgoblin no-axis, market `zz`); custom
+lead count 137 stored verbatim; live run shows `fast lane: 327 publishers at +3.0s`, checkpoint at
++3.3s, stop kept 2 leads. Dev DB restored, `.replit` reverted, both packages build,
+**28 modules / 709 assertions / both gates green.**
+
+### Godlike audit #7 — pre-publish pass  ☑
+
+**Found and fixed: the provisional preview app relied on UNDEFINED SQLite behaviour.**
+
+The fast-lane query picked its preview app (which becomes the lead's `store_url`) using SQLite's
+min()/max() "bare column" rule. That guarantee holds only when a query contains **exactly one**
+min/max aggregate — this query has three (`MAX(developer_id)`, `MIN(best_rank)`, `MIN(preview_sort)`).
+With more than one, the row backing a bare column is explicitly implementation-defined.
+
+It happened to return the right app in every test, including an adversarial one (flagship inserted
+last, decoys interleaved, unrelated inserts) — i.e. it was correct **by luck of the current
+implementation**, and the failure mode would have been silent: leads pointing at an arbitrary app of
+the right publisher. Replaced with an explicit `ROW_NUMBER() OVER (PARTITION BY list_developer …)`
+CTE — defined behaviour. Cost: 11ms → 25ms on an 8,000-app corpus (vs 3,526ms before any of this),
+still ~1ms in steady state. Two gate invariants added (correct pick when the best app is inserted
+LAST; stable across unrelated inserts).
+
+**Verified clean this round (no action needed):**
+- **Resume path**: run → stop → `resumeJob()` → run again. 406 publishers before and after, **zero
+  duplicate publisher names**, CSV intact across the resume.
+- **Winner-enrichment budget math**: `spent = budget − res.budgetLeft`, deducted from the run's
+  single pool — correct, and self-limiting (a publisher whose apps carry no email stops producing
+  work once its apps are enriched).
+- **Concurrency**: `rollupProvisionalPlayPublishers` is fully synchronous, so under the per-user
+  parallel queue each pass is atomic; the module-global change detector is reset per run and at worst
+  costs one redundant pass.
+- **End-to-end after the rework**: 3 leads in 21s on a cold corpus, correct flagship store URLs
+  (Block, Inc. → com.squareup.cash), full contact details.
+
+**Trend across rounds:** #5 found a fatal boot failure and a 4s/tick regression, #6 found silent data
+loss, #7 found one latent (not-yet-manifesting) correctness risk. Severity is falling round over
+round, which is the signal that this has converged.
+
+### Other levers, ranked (measure before committing)
+
+1. **Persistent corpus — NOW THE TOP REMAINING ITEM.** Production shows 0 publishers at job start
+   and "0 past jobs" after a publish; the deploy filesystem looks EPHEMERAL, so every run starts
+   cold. The fast lane makes a cold start survivable (leads in seconds rather than never), but a
+   persistent corpus would still remove all repeat discovery work. **Verify first.**
+2. **Enrich only what can become a lead** (deferred "Fix 3"): today's budget enriches ~100x more apps
+   than the confirmation budget can ever examine.
+3. **Cap discovery to what enrichment can consume** (deferred "Fix 4"): discovery adds ~20k apps/run
+   while enrichment consumes ≤4k, so the backlog grows monotonically and never drains. The amplifier
+   is the search battery (`ITUNES_SEARCH_LIMIT=200`).
+4. **Raise `STORE_PLAY_CONCURRENCY`.** Measured clean at 8 (142 ms/req) vs the shipped 5 (211 ms/req);
+   the limiter and adaptive backoff already support it. Cheap, but only ~1.5x — a tuning knob, not
+   the answer.
+5. **A cheaper publisher-detail source.** If a lead needs an email, consider whether the Play
+   *developer page* (one fetch per DEVELOPER, ~hundreds) can replace per-APP detail fetches
+   (~thousands) for contact discovery.
+
+### Bugs fixed in this pass (found in that same log)
+
+- **Pump log spam.** `rollupPublishers`/`scoreAllPublishers` log at INFO unconditionally, so a quiet
+  background tick still emitted "rollup: 0 publishers" + "scoring: 0 publishers scored" every 15
+  seconds forever, burying the run's real story. Background passes now get a silent logger; barrier
+  passes keep full output.
+- **Pump did real work on an unchanged corpus.** Every tick ran a full rollup (loads every enriched
+  app + every sighting) even when nothing had moved. Now gated on a single indexed
+  `countDoneAppDetails()` plus the unchecked-publisher count — an idle tick costs one COUNT.
+
 ## Notes / decisions log
 
 - 2026-07-26: File created from user's request. Order chosen: background jobs first (user: "most important thing"), then UI unification, then speed.

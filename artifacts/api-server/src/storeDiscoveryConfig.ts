@@ -256,6 +256,22 @@ export const ITUNES_LOOKUP_BATCH = clampInt(process.env.STORE_ITUNES_BATCH, 100,
 export const ITUNES_SEARCH_LIMIT = clampInt(process.env.STORE_ITUNES_SEARCH_LIMIT, 200, 1, 200); // (env)
 /** Play store search page size (spec: 30). */
 export const PLAY_SEARCH_NUM = clampInt(process.env.STORE_PLAY_SEARCH_NUM, 30, 1, 250); // (env)
+/**
+ * Fast-lane winner enrichment (confirm-before-enrich).
+ *
+ * A publisher confirmed from list-payload identity alone still needs contact
+ * details before it can ship as a lead, so its apps are detail-fetched on
+ * demand. These bound ONE checkpoint's on-demand pass so a single harvest cannot
+ * balloon into a full enrichment run; the remaining publishers are picked up by
+ * the next pass. Spend comes out of the run's shared ENRICH_MAX_APPS_PER_RUN
+ * pool, so this re-prioritises fetches toward leads rather than adding any.
+ */
+export const WINNER_ENRICH_MAX_PUBLISHERS = clampInt(process.env.STORE_WINNER_ENRICH_MAX_PUBS, 40, 0, 2_000); // (env)
+/** Apps per confirmed publisher to enrich for contact details. A developer's
+ *  email/website is identical across their portfolio, so the first few charted
+ *  apps almost always answer it — fetching the whole catalog would be waste. */
+export const WINNER_ENRICH_APPS_PER_PUBLISHER = clampInt(process.env.STORE_WINNER_ENRICH_APPS, 3, 1, 50); // (env)
+
 /** Retry a failed enrichment at most this many times across runs, then give up. */
 export const MAX_ENRICH_ATTEMPTS = clampInt(process.env.STORE_MAX_ENRICH_ATTEMPTS, 3, 1, 10); // (env)
 /** Ceiling on apps enriched (network) per run — bounds a huge long-tail from

@@ -717,6 +717,22 @@ input[type="text"].input {
   flex-direction: column;
   gap: 12px;
 }
+
+/* Number box that sits INSIDE a .checkbox row (the custom lead count), so it
+   must not take the full-width .input treatment that stacked form fields get. */
+.input-inline {
+  width: 8.5em;
+  padding: 6px 10px;
+  margin-left: 4px;
+}
+.input-invalid,
+.input-invalid:focus {
+  border-color: var(--danger, #e5484d);
+  box-shadow: 0 0 0 3px rgba(229, 72, 77, 0.18);
+}
+.error-hint {
+  color: var(--danger, #e5484d);
+}
 .checkbox {
   display: flex !important;
   align-items: center;

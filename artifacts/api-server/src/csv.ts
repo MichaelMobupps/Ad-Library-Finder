@@ -55,6 +55,37 @@ export function normalizeMaxLeads(v: unknown): number | null {
   return Math.floor(n);
 }
 
+/**
+ * Upper bound the New Job form accepts in its custom lead box.
+ *
+ * NOT a server-side restriction — normalizeMaxLeads stays deliberately
+ * permissive so ops/API callers can pass anything. This is purely a
+ * typo guard for the UI: past this many leads the cap stops meaning
+ * anything (no run discovers a million publishers), so a stray extra
+ * digit should be caught at the keyboard rather than silently accepted
+ * as "effectively uncapped".
+ */
+export const LEAD_LIMIT_CUSTOM_MAX = 100_000;
+
+/**
+ * Validate a hand-typed lead count from the form's custom box.
+ *
+ * Returns the integer when the text is a usable whole number in range, else
+ * null. Shared with the dashboard (which imports it from this module) so the
+ * box and the server can never disagree about what "250" means. Deliberately
+ * REJECTS decimals rather than flooring them: someone typing "2.5" meant
+ * something, and silently exporting 2 leads is the kind of quiet surprise this
+ * codebase avoids everywhere else.
+ */
+export function parseCustomLeadCount(raw: string): number | null {
+  const t = raw.trim();
+  if (!t) return null;
+  if (!/^\d+$/.test(t)) return null; // digits only: no decimals, signs, spaces, 1e3
+  const n = Number(t);
+  if (!Number.isSafeInteger(n) || n <= 0 || n > LEAD_LIMIT_CUSTOM_MAX) return null;
+  return n;
+}
+
 export interface BuildCsvInput {
   jobId: string;
   productType: ProductType;
@@ -227,6 +258,33 @@ export function runCsvUnitTests(): { passed: number; failed: number; failures: s
   check(normalizeMaxLeads(0) === null && normalizeMaxLeads(-3) === null, 'cap: 0/negative → uncapped');
   check(normalizeMaxLeads('abc') === null && normalizeMaxLeads({}) === null, 'cap: junk → uncapped');
   check(LEAD_LIMIT_CHOICES.join(',') === '20,50,100', 'cap: offered choices are 20/50/100 (+ as many as found)');
+
+  // Custom lead box — the form lets the user type any number, so the parser is
+  // the only thing standing between a typo and a surprising export.
+  // Pin the VALUE, not just the behaviour: this constant is MIRRORED in
+  // dashboard/src/api/client.ts (separate workspace package), so a change here
+  // must fail loudly and prompt updating the copy — same guard style as
+  // LEAD_LIMIT_CHOICES above.
+  check(LEAD_LIMIT_CUSTOM_MAX === 100_000, 'custom: max is 100,000 — MIRRORED in dashboard api/client.ts');
+  check(parseCustomLeadCount('250') === 250, 'custom: a plain number parses');
+  check(parseCustomLeadCount('  75 ') === 75, 'custom: surrounding whitespace tolerated');
+  check(parseCustomLeadCount('1') === 1, 'custom: 1 is valid');
+  check(parseCustomLeadCount(String(LEAD_LIMIT_CUSTOM_MAX)) === LEAD_LIMIT_CUSTOM_MAX, 'custom: the max is inclusive');
+  check(parseCustomLeadCount(String(LEAD_LIMIT_CUSTOM_MAX + 1)) === null, 'custom: above the max rejected');
+  check(parseCustomLeadCount('') === null, 'custom: empty is not a number');
+  check(parseCustomLeadCount('   ') === null, 'custom: whitespace only is not a number');
+  check(parseCustomLeadCount('0') === null, 'custom: 0 rejected (would look like an empty export)');
+  check(parseCustomLeadCount('-5') === null, 'custom: negative rejected');
+  check(parseCustomLeadCount('2.5') === null, 'custom: decimals rejected, never silently floored');
+  check(parseCustomLeadCount('abc') === null, 'custom: junk rejected');
+  check(parseCustomLeadCount('1e3') === null, 'custom: exponent notation rejected');
+  check(parseCustomLeadCount('12a') === null, 'custom: trailing junk rejected');
+  check(parseCustomLeadCount('+7') === null, 'custom: signed input rejected');
+  check(parseCustomLeadCount('007') === 7, 'custom: leading zeros are still a number');
+  // Anything the box accepts must survive the server normalizer unchanged.
+  for (const t of ['1', '20', '250', '99999']) {
+    check(normalizeMaxLeads(parseCustomLeadCount(t)) === Number(t), `custom: ${t} survives normalizeMaxLeads unchanged`);
+  }
 
   return { passed, failed: failures.length, failures };
 }

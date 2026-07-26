@@ -203,6 +203,37 @@ export interface CreateJobOptions {
 /** Lead-count choices offered for the two high-volume sources. null = all. */
 export const LEAD_LIMIT_CHOICES: readonly number[] = [20, 50, 100];
 
+/**
+ * Upper bound for the New Job form's custom lead box.
+ *
+ * MIRROR of LEAD_LIMIT_CUSTOM_MAX in api-server/src/csv.ts — the dashboard is a
+ * separate workspace package and mirrors these the same way LEAD_LIMIT_CHOICES
+ * and countries.ts already do. The server pins this value in its offline
+ * assertions, so a change there fails the suite and flags this copy.
+ *
+ * It is a typo guard, not a server restriction: the API itself still honours any
+ * positive integer (normalizeMaxLeads), so ops can pass more via a direct call.
+ */
+export const LEAD_LIMIT_CUSTOM_MAX = 100_000;
+
+/**
+ * Validate a hand-typed lead count. Returns the integer, or null when the text
+ * is not a usable whole number in range.
+ *
+ * MIRROR of parseCustomLeadCount in api-server/src/csv.ts — keep the two in step.
+ * Rejects decimals rather than flooring them: someone typing "2.5" meant
+ * something, and quietly exporting 2 leads is exactly the sort of silent
+ * surprise this codebase avoids.
+ */
+export function parseCustomLeadCount(raw: string): number | null {
+  const t = raw.trim();
+  if (!t) return null;
+  if (!/^\d+$/.test(t)) return null; // digits only: no decimals, signs, spaces, 1e3
+  const n = Number(t);
+  if (!Number.isSafeInteger(n) || n <= 0 || n > LEAD_LIMIT_CUSTOM_MAX) return null;
+  return n;
+}
+
 export class AuthRequiredError extends Error {
   constructor() { super('authentication required'); this.name = 'AuthRequiredError'; }
 }

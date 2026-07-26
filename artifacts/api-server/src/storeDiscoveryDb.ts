@@ -122,9 +122,21 @@ export function ensureStoreDiscoveryTables(): void {
       first_seen_at INTEGER NOT NULL,
       last_seen_at INTEGER NOT NULL,
       last_rank INTEGER,
+      -- Publisher identity as it appeared in the LIST payload (chart/search/
+      -- similar/catalog). Play's list rows already carry developer + developerId,
+      -- so this costs no extra request and lets a publisher be rolled up and
+      -- confirmed BEFORE its 1.2 MB detail page is ever fetched. See
+      -- provisionalPlayPublishers().
+      list_developer TEXT,
+      list_developer_id TEXT,
       UNIQUE(store, app_id, country)
     );
     CREATE INDEX IF NOT EXISTS idx_discovered_apps_appid ON discovered_apps(store, app_id);
+    -- NB: the index on list_developer is created AFTER addColumnIfMissing below,
+    -- never here. On an existing database CREATE TABLE IF NOT EXISTS is a no-op,
+    -- so the column does not exist yet at this point and indexing it here is a
+    -- FATAL startup error ("no such column: list_developer") — i.e. every deploy
+    -- onto a live database would fail to boot.
     CREATE INDEX IF NOT EXISTS idx_discovered_apps_vertical ON discovered_apps(vertical, source);
 
     CREATE TABLE IF NOT EXISTS store_app_detail (
@@ -213,6 +225,13 @@ export function ensureStoreDiscoveryTables(): void {
   // unambiguous store "not found", never on a failed request.
   addColumnIfMissing('store_app_detail', 'last_live_check_at', 'INTEGER');
   addColumnIfMissing('store_app_detail', 'delisted_at', 'INTEGER');
+  // Publisher identity carried by the LIST payload — the basis of the fast lane
+  // (provisionalPlayPublishers), so it must exist on databases created before it.
+  addColumnIfMissing('discovered_apps', 'list_developer', 'TEXT');
+  addColumnIfMissing('discovered_apps', 'list_developer_id', 'TEXT');
+  getDb().exec(
+    `CREATE INDEX IF NOT EXISTS idx_discovered_apps_listdev ON discovered_apps(store, list_developer);`,
+  );
 
   backfillDiscoveryDepth();
 }
@@ -280,6 +299,13 @@ function backfillDiscoveryDepth(): void {
 
 // ── discovered_apps helpers ──────────────────────────────────────────────────
 
+/** '' is what the store list payloads use for "not provided" — store NULL so
+ *  COALESCE-based fill-in works and empty strings never masquerade as identity. */
+function emptyToNull(v: string | null | undefined): string | null {
+  const t = (v ?? '').trim();
+  return t ? t : null;
+}
+
 export interface UpsertAppInput {
   store: StoreKind;
   app_id: string;
@@ -290,6 +316,12 @@ export interface UpsertAppInput {
   discovery_depth?: number;
   chart?: string | null;
   rank?: number | null;
+  /** Publisher name from the list payload (Play `developer`, Apple `artistName`). */
+  list_developer?: string | null;
+  /** Play `developerId` from the list payload — the SAME value that later lands in
+   *  store_app_detail.developer_id, which is what makes the provisional publisher
+   *  merge cleanly with the full rollup instead of duplicating it. */
+  list_developer_id?: string | null;
 }
 
 /**
@@ -365,8 +397,9 @@ export function upsertDiscoveredApp(input: UpsertAppInput): { id: number; insert
     const info = db
       .prepare(
         `INSERT INTO discovered_apps
-           (store, app_id, title, vertical, country, source, discovery_depth, chart, rank, first_seen_at, last_seen_at, last_rank)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           (store, app_id, title, vertical, country, source, discovery_depth, chart, rank, first_seen_at, last_seen_at, last_rank,
+            list_developer, list_developer_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         input.store,
@@ -381,6 +414,8 @@ export function upsertDiscoveredApp(input: UpsertAppInput): { id: number; insert
         now,
         now,
         input.rank ?? null,
+        emptyToNull(input.list_developer),
+        emptyToNull(input.list_developer_id),
       );
     return { id: Number(info.lastInsertRowid), inserted: true };
   }
@@ -404,7 +439,13 @@ export function upsertDiscoveredApp(input: UpsertAppInput): { id: number; insert
             chart = CASE WHEN ? = 1 THEN ? ELSE chart END,
             rank = CASE WHEN ? = 1 THEN ? ELSE rank END,
             last_rank = CASE WHEN ? = 1 THEN ? ELSE last_rank END,
-            discovery_depth = CASE WHEN ? = 1 THEN MIN(discovery_depth, ?) ELSE discovery_depth END
+            discovery_depth = CASE WHEN ? = 1 THEN MIN(discovery_depth, ?) ELSE discovery_depth END,
+            -- COALESCE(existing, new): first writer wins, and a later sighting
+            -- that happens to omit the identity can never blank one we already
+            -- hold. (Same shape as title/vertical above, opposite argument order
+            -- because here the STORED value is the one to keep.)
+            list_developer = COALESCE(list_developer, ?),
+            list_developer_id = COALESCE(list_developer_id, ?)
       WHERE id = ?`,
   ).run(
     now,
@@ -424,6 +465,8 @@ export function upsertDiscoveredApp(input: UpsertAppInput): { id: number; insert
     // leave an existing graph depth untouched.
     isGraphSource(input.source) ? 1 : 0,
     input.discovery_depth ?? 0,
+    emptyToNull(input.list_developer),
+    emptyToNull(input.list_developer_id),
     existing.id,
   );
   return { id: existing.id, inserted: false };
@@ -750,7 +793,26 @@ function absorbPublisher(survivorId: number, orphanId: number): void {
  * runs over a growing corpus converge on one row, and folds in any duplicate an
  * earlier run already created.
  */
-export function upsertPublisher(p: PublisherUpsert, identityKeys: string[]): number {
+export function upsertPublisher(
+  p: PublisherUpsert,
+  identityKeys: string[],
+  opts?: {
+    /**
+     * Provisional (fast-lane) mode: this row was built from LIST payloads, which
+     * know LESS than a row built from enriched detail pages. The full rollup may
+     * legitimately overwrite everything (it recomputed the world); a provisional
+     * writer must not. In this mode the conflict clause:
+     *   • never lowers enrichment-derived facts (in_band, both_stores,
+     *     is_game_publisher, source_mix, countries, verticals, previews, name),
+     *   • only raises counters (app_count, charted_app_count, is_charted) and
+     *     only improves best_rank,
+     * so a partially-enriched publisher keeps every fact its detail pages earned.
+     * Regression this guards: a provisional upsert zeroed in_band/both_stores/
+     * is_game_publisher on a publisher whose new chart app hadn't enriched yet.
+     */
+    preserveEnriched?: boolean;
+  },
+): number {
   const now = Date.now();
   const db = getDb();
   const keys = [...new Set([p.merge_key, ...identityKeys])];
@@ -776,8 +838,30 @@ export function upsertPublisher(p: PublisherUpsert, identityKeys: string[]): num
         @charted_app_count, @app_count, @best_rank, @both_stores, @in_band, @source_mix, @gatc_advertiser_id,
         @gatc_ads_count, @meta_active_ads, @confirmed_advertiser, @is_game_publisher, @is_charted, @preview_url,
         @preview_title, @score, @now, @now)
-     ON CONFLICT(merge_key) DO UPDATE SET
-        name = excluded.name,
+     ON CONFLICT(merge_key) DO UPDATE SET ${
+       opts?.preserveEnriched
+         ? `name = publishers.name,
+        play_developer_id = COALESCE(publishers.play_developer_id, excluded.play_developer_id),
+        apple_seller_name = publishers.apple_seller_name,
+        website = publishers.website,
+        email = publishers.email,
+        countries_charted = publishers.countries_charted,
+        countries_seen = publishers.countries_seen,
+        verticals = publishers.verticals,
+        charted_app_count = MAX(publishers.charted_app_count, excluded.charted_app_count),
+        app_count = MAX(publishers.app_count, excluded.app_count),
+        best_rank = CASE
+          WHEN publishers.best_rank IS NULL THEN excluded.best_rank
+          WHEN excluded.best_rank IS NULL THEN publishers.best_rank
+          ELSE MIN(publishers.best_rank, excluded.best_rank) END,
+        both_stores = publishers.both_stores,
+        in_band = publishers.in_band,
+        source_mix = publishers.source_mix,
+        is_game_publisher = publishers.is_game_publisher,
+        is_charted = MAX(publishers.is_charted, excluded.is_charted),
+        preview_url = COALESCE(publishers.preview_url, excluded.preview_url),
+        preview_title = COALESCE(publishers.preview_title, excluded.preview_title),`
+         : `name = excluded.name,
         play_developer_id = COALESCE(excluded.play_developer_id, publishers.play_developer_id),
         apple_seller_name = COALESCE(excluded.apple_seller_name, publishers.apple_seller_name),
         website = COALESCE(excluded.website, publishers.website),
@@ -794,7 +878,8 @@ export function upsertPublisher(p: PublisherUpsert, identityKeys: string[]): num
         is_game_publisher = excluded.is_game_publisher,
         is_charted = excluded.is_charted,
         preview_url = excluded.preview_url,
-        preview_title = excluded.preview_title,
+        preview_title = excluded.preview_title,`
+     }
         updated_at = @now`,
   ).run({ ...p, now });
   const row = db.prepare(`SELECT id FROM publishers WHERE merge_key = ?`).get(p.merge_key) as { id: number };
@@ -956,6 +1041,23 @@ export function appleArtistsWithContact(): Array<{ id: string; country: string }
  * portfolio score. This is the single chokepoint for that rule — publisherRollup
  * reads its whole world through this function.
  */
+/**
+ * How many apps the rollup would actually see — the SAME predicate as
+ * allDoneAppDetails, as a COUNT.
+ *
+ * Exists for the background lead pump's change detection: a full rollup loads
+ * every enriched app and every discovery sighting, which is far too heavy to run
+ * on a 15-second timer just to discover that nothing moved. This is one indexed
+ * count, so an idle tick costs effectively nothing.
+ */
+export function countDoneAppDetails(): number {
+  return (
+    getDb()
+      .prepare(`SELECT COUNT(*) AS c FROM store_app_detail WHERE enrich_status = 'done' AND delisted_at IS NULL`)
+      .get() as { c: number }
+  ).c;
+}
+
 export function allDoneAppDetails(): StoreAppDetailRow[] {
   return getDb()
     .prepare(`SELECT * FROM store_app_detail WHERE enrich_status = 'done' AND delisted_at IS NULL`)
@@ -1084,6 +1186,175 @@ export function allDiscoveredLite(): DiscoveredLite[] {
  * so a publisher ranked below roughly the budget size was never confirmed no
  * matter how many times the job ran. Now each run advances through the backlog.
  */
+/**
+ * Play publishers derivable from LIST payloads alone — the fast lane.
+ *
+ * WHY THIS EXISTS. The normal rollup reads its world through allDoneAppDetails(),
+ * i.e. ENRICHED apps only. On a cold corpus that means a run can discover 8,000+
+ * apps in under a minute and still roll up ZERO publishers — so zero
+ * confirmations and zero leads — until ~27 minutes of 1.2 MB-per-app detail
+ * fetching completes. Measured on a real production run: charts done at +49s,
+ * then `rollup: 0 publishers` every 15s for the next six minutes.
+ *
+ * MEASURED CORRECTION (this cost a design iteration): Play's list endpoints do
+ * NOT all return a developerId. Verified live against google-play-scraper 10.1.3:
+ *   list()      → developer: "Block, Inc.", developerId: undefined
+ *   similar()   → developer only
+ *   developer() → developer only
+ *   search()    → developerId === the developer NAME (Play uses the name as the
+ *                 id for non-numeric developers)
+ * So the identity a list payload actually carries is the developer NAME. That is
+ * still enough, because it is the SAME string that later lands in
+ * store_app_detail.developer.
+ *
+ * MERGE SAFETY. Grouping is therefore on `mergeNameKey(developer)` and the row
+ * registers identity key `n:<that key>` — exactly what identityKeysFor() emits
+ * for every rolled-up publisher (`mergeableNames` adds one per app,
+ * unconditionally). So when the full rollup runs it resolves to the SAME
+ * publisher row and updates it. Name-based merging is looser than id-based, but
+ * it is precisely the merge evidence the existing rollup already uses, so this
+ * introduces no new class of risk.
+ *
+ * PLAY ONLY: Apple's list shape has no comparable field, and Apple enriches 100
+ * ids per request anyway, so there is nothing to win there.
+ */
+export interface ProvisionalPublisher {
+  /** mergeNameKey(developer) — the identity this group asserts. */
+  name_key: string;
+  /** Display name (the most common raw spelling seen). */
+  developer: string;
+  /** Every raw spelling that normalised into this group. */
+  raw_developers: string[];
+  /** developerId when a payload happened to carry one (search does). */
+  developer_id: string | null;
+  app_count: number;
+  charted_app_count: number;
+  best_rank: number | null;
+  preview_app_id: string | null;
+  preview_title: string | null;
+  countries: string[];
+  verticals: string[];
+  unenriched_apps: number;
+  /** Real per-source counts, using the SAME vocabulary the full rollup emits
+   *  (chart/search/similar/developer_catalog) — the Publishers view filters on
+   *  this, so a synthetic key would hide provisional rows behind any filter. */
+  source_mix: Record<string, number>;
+}
+
+interface RawDevGroup {
+  developer: string;
+  developer_id: string | null;
+  app_count: number;
+  charted_app_count: number;
+  best_rank: number | null;
+  unenriched_apps: number;
+  countries: string | null;
+  verticals: string | null;
+  preview_app_id: string | null;
+  preview_title: string | null;
+  src_chart: number;
+  src_search: number;
+  src_similar: number;
+  src_catalog: number;
+}
+
+/**
+ * Raw per-developer aggregates straight from SQL. Grouped on the RAW name here
+ * (SQL cannot call mergeNameKey); the caller folds these into normalised groups.
+ */
+export function rawPlayListDeveloperGroups(limit = 20_000): RawDevGroup[] {
+  return getDb()
+    .prepare(
+      `WITH preview AS (
+         -- The group's representative app, chosen DETERMINISTICALLY.
+         --
+         -- This used to lean on SQLite's min()/max() "bare column" rule, but that
+         -- guarantee holds only when the query contains EXACTLY ONE min/max
+         -- aggregate — and this one has three (developer_id, best_rank,
+         -- preview_sort). With more than one the row backing a bare column is
+         -- explicitly undefined, so the preview app was correct only by luck of
+         -- the current implementation. It is the lead's store_url, so a silent
+         -- drift here would point customers at the wrong app page. ROW_NUMBER is
+         -- defined behaviour and costs one windowed pass, not a subquery per group.
+         SELECT list_developer, app_id, title,
+                ROW_NUMBER() OVER (
+                  PARTITION BY list_developer
+                  ORDER BY CASE WHEN source = 'chart' THEN 0 ELSE 1 END,
+                           rank IS NULL, rank ASC, app_id ASC
+                ) AS rn
+           FROM discovered_apps
+          WHERE store = 'google_play' AND list_developer IS NOT NULL AND TRIM(list_developer) <> ''
+       )
+       SELECT d.list_developer                                       AS developer,
+              MAX(d.list_developer_id)                               AS developer_id,
+              COUNT(*)                                               AS app_count,
+              SUM(CASE WHEN d.source = 'chart' THEN 1 ELSE 0 END)    AS charted_app_count,
+              MIN(CASE WHEN d.source = 'chart' THEN d.rank END)      AS best_rank,
+              SUM(CASE WHEN sd.app_id IS NULL THEN 1 ELSE 0 END)     AS unenriched_apps,
+              -- Real per-source counts. The Publishers view filters on
+              -- source_mix, so inventing a synthetic key here would make every
+              -- provisional publisher disappear under any source filter — and
+              -- the honest counts are right there in the rows being grouped.
+              SUM(CASE WHEN d.source = 'chart' THEN 1 ELSE 0 END)     AS src_chart,
+              SUM(CASE WHEN d.source = 'search' THEN 1 ELSE 0 END)    AS src_search,
+              SUM(CASE WHEN d.source = 'similar' THEN 1 ELSE 0 END)   AS src_similar,
+              SUM(CASE WHEN d.source = 'developer_catalog' THEN 1 ELSE 0 END) AS src_catalog,
+              GROUP_CONCAT(DISTINCT d.country)                       AS countries,
+              GROUP_CONCAT(DISTINCT d.vertical)                      AS verticals,
+              -- From the CTE above: deterministic, not implementation-defined.
+              MAX(pv.app_id)                                         AS preview_app_id,
+              MAX(pv.title)                                          AS preview_title
+         FROM discovered_apps d
+         LEFT JOIN store_app_detail sd
+                ON sd.store = d.store AND sd.app_id = d.app_id AND sd.enrich_status = 'done'
+         LEFT JOIN preview pv
+                ON pv.list_developer = d.list_developer AND pv.rn = 1
+        WHERE d.store = 'google_play'
+          AND d.list_developer IS NOT NULL
+          AND TRIM(d.list_developer) <> ''
+        GROUP BY d.list_developer
+        ORDER BY charted_app_count DESC, app_count DESC
+        LIMIT ?`,
+    )
+    .all(limit) as RawDevGroup[];
+}
+
+/** Play rows carrying list identity — the fast lane's input size. One indexed
+ *  count, used to skip the whole pass when nothing new has been discovered. */
+export function countPlayListIdentityRows(): number {
+  return (
+    getDb()
+      .prepare(
+        `SELECT COUNT(*) AS c FROM discovered_apps
+          WHERE store = 'google_play' AND list_developer IS NOT NULL AND TRIM(list_developer) <> ''`,
+      )
+      .get() as { c: number }
+  ).c;
+}
+
+/** Apps of the given RAW developer names that still lack enrichment — the
+ *  "enrich only the winners" worklist. Chart apps first, so contact details come
+ *  from the publisher's most visible titles. */
+export function unenrichedAppsForPlayDevelopers(
+  rawDevelopers: string[],
+  limit = 25,
+): Array<{ app_id: string; country: string }> {
+  if (rawDevelopers.length === 0) return [];
+  const holes = rawDevelopers.map(() => '?').join(',');
+  return getDb()
+    .prepare(
+      `SELECT d.app_id, d.country
+         FROM discovered_apps d
+         LEFT JOIN store_app_detail sd
+                ON sd.store = d.store AND sd.app_id = d.app_id
+        WHERE d.store = 'google_play' AND d.list_developer IN (${holes})
+          AND (sd.app_id IS NULL OR sd.enrich_status <> 'done')
+        ORDER BY CASE WHEN d.source = 'chart' THEN 0 ELSE 1 END, d.rank IS NULL, d.rank ASC
+        LIMIT ?`,
+    )
+    .all(...rawDevelopers, limit) as Array<{ app_id: string; country: string }>;
+}
+
 export function listPublishersForConfirmation(): PublisherRow[] {
   return getDb()
     .prepare(

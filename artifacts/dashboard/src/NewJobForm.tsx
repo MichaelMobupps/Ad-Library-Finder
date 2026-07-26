@@ -2,6 +2,8 @@ import { useEffect, useMemo, useState } from 'react';
 import {
   api,
   LEAD_LIMIT_CHOICES,
+  LEAD_LIMIT_CUSTOM_MAX,
+  parseCustomLeadCount,
   ProductType,
   JobSource,
   Settings,
@@ -70,6 +72,25 @@ export default function NewJobForm({
   // null = "user hasn't touched the picker" → the defaults for the active source.
   const [selected, setSelected] = useState<string[] | null>(null);
   const [maxLeads, setMaxLeads] = useState<number | null>(100);
+  // The custom lead box. Kept as RAW TEXT with an explicit mode flag rather than
+  // being derived from maxLeads: deriving "is custom" from "the number isn't a
+  // preset" would make the box visually deselect the moment someone typed 20,
+  // and would throw away what they had typed while they were mid-edit.
+  const [useCustomLeads, setUseCustomLeads] = useState(false);
+  const [customLeadsText, setCustomLeadsText] = useState('');
+  const customLeads = parseCustomLeadCount(customLeadsText);
+  /** The cap actually submitted — the typed number in custom mode, else the radio. */
+  const effectiveMaxLeads = useCustomLeads ? customLeads : maxLeads;
+  /**
+   * Custom mode with no usable number — Start stays disabled, so this ALWAYS
+   * gets an explanation. Covers the empty box too: disabling the button with no
+   * visible reason is the dead end this guards against.
+   */
+  const customLeadsMissing = useCustomLeads && customLeads === null;
+  /** Typed something that is genuinely wrong (not merely blank) — also styled red.
+   *  NB a `type=number` input reports '' for un-parseable text like "abc", so a
+   *  blank box can mean "untouched" OR "browser rejected the keystrokes". */
+  const customLeadsInvalid = customLeadsMissing && customLeadsText.trim() !== '';
   const [recipientEmail, setRecipientEmail] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -189,7 +210,7 @@ export default function NewJobForm({
       productTypes: [mode],
       recipientEmail: recipientEmail.trim() || null,
       source,
-      maxLeads,
+      maxLeads: effectiveMaxLeads,
     };
     if (source === 'store_first') {
       if (sfVerticals.length === 0) {
@@ -240,7 +261,9 @@ export default function NewJobForm({
     }
   };
 
-  const startDisabled = submitting || (source === 'store_first' && !sfConfig);
+  // A custom box in an unusable state must not silently fall back to "as many as
+  // found" — that would hand the user a far bigger (and slower) job than asked.
+  const startDisabled = submitting || (source === 'store_first' && !sfConfig) || customLeadsMissing;
 
   return (
     <div className="panel form-panel">
@@ -352,15 +375,57 @@ export default function NewJobForm({
           <div className="checkbox-row">
             {LEAD_LIMIT_CHOICES.map((n) => (
               <label className="checkbox" key={n}>
-                <input type="radio" name="maxLeads" checked={maxLeads === n} onChange={() => setMaxLeads(n)} />
+                <input
+                  type="radio"
+                  name="maxLeads"
+                  checked={!useCustomLeads && maxLeads === n}
+                  onChange={() => { setUseCustomLeads(false); setMaxLeads(n); }}
+                />
                 <span>{n}</span>
               </label>
             ))}
             <label className="checkbox">
-              <input type="radio" name="maxLeads" checked={maxLeads === null} onChange={() => setMaxLeads(null)} />
+              <input
+                type="radio"
+                name="maxLeads"
+                checked={!useCustomLeads && maxLeads === null}
+                onChange={() => { setUseCustomLeads(false); setMaxLeads(null); }}
+              />
               <span>As many as found</span>
             </label>
+            {/* The box lives INSIDE the Custom row so it sits beside the radio —
+                .checkbox-row stacks its children vertically. */}
+            <label className="checkbox">
+              <input
+                type="radio"
+                name="maxLeads"
+                checked={useCustomLeads}
+                onChange={() => setUseCustomLeads(true)}
+              />
+              <span>Custom</span>
+              <input
+                type="number"
+                min={1}
+                max={LEAD_LIMIT_CUSTOM_MAX}
+                step={1}
+                className={`input input-inline${customLeadsInvalid ? ' input-invalid' : ''}`}
+                placeholder="e.g. 250"
+                value={customLeadsText}
+                aria-label="Custom number of leads"
+                aria-invalid={customLeadsInvalid || undefined}
+                // Focusing or typing selects Custom, so a number can never be
+                // entered and then silently ignored because a preset was still on.
+                onFocus={() => setUseCustomLeads(true)}
+                onChange={(e) => { setUseCustomLeads(true); setCustomLeadsText(e.target.value); }}
+              />
+              <span className="muted small">leads</span>
+            </label>
           </div>
+        {customLeadsMissing && (
+          <p className={`form-hint${customLeadsInvalid ? ' error-hint' : ''}`}>
+            Enter a whole number between 1 and {LEAD_LIMIT_CUSTOM_MAX.toLocaleString()} to start.
+          </p>
+        )}
         <p className="form-hint">
           Your file contains the best leads up to this number. The search keeps everything else it
           discovers, so nothing is wasted.

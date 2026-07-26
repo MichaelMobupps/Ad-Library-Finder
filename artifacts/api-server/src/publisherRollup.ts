@@ -31,6 +31,9 @@ import {
   type DiscoveredLite,
   type PublisherRow,
   type PublisherUpsert,
+  rawPlayListDeveloperGroups,
+  countPlayListIdentityRows,
+  type ProvisionalPublisher,
 } from './storeDiscoveryDb.js';
 import { isInInstallBand } from './storeEnrich.js';
 import { isSharedHost } from './storeDiscoveryConfig.js';
@@ -421,6 +424,157 @@ export function rollupPublishers(onLog?: LogFn): RollupResult {
 }
 
 /** Assemble one publishers-row upsert from a merged app group. Exported for tests. */
+/**
+ * Fold raw per-developer list aggregates into normalised publisher groups.
+ *
+ * SQL groups on the RAW developer string; this merges spellings that share a
+ * `mergeNameKey` ("Block, Inc." and "Block Inc"), which is the SAME normalisation
+ * the full rollup's union-find uses — so both sides agree on identity.
+ * Exported for tests.
+ */
+export function foldProvisionalPublishers(
+  raw: ReturnType<typeof rawPlayListDeveloperGroups>,
+): ProvisionalPublisher[] {
+  const byKey = new Map<string, ProvisionalPublisher>();
+  for (const r of raw) {
+    const key = mergeNameKey(r.developer);
+    if (!key) continue; // unnameable ⇒ not searchable on GATC ⇒ useless as a lead
+    const split = (v: string | null) => (v ? v.split(',').filter(Boolean) : []);
+    const mix: Record<string, number> = {};
+    if (r.src_chart) mix.chart = r.src_chart;
+    if (r.src_search) mix.search = r.src_search;
+    if (r.src_similar) mix.similar = r.src_similar;
+    if (r.src_catalog) mix.developer_catalog = r.src_catalog;
+    const cur = byKey.get(key);
+    if (!cur) {
+      byKey.set(key, {
+        source_mix: mix,
+        name_key: key,
+        developer: r.developer,
+        raw_developers: [r.developer],
+        developer_id: r.developer_id,
+        app_count: r.app_count,
+        charted_app_count: r.charted_app_count,
+        best_rank: r.best_rank,
+        preview_app_id: r.preview_app_id,
+        preview_title: r.preview_title,
+        countries: split(r.countries),
+        verticals: split(r.verticals),
+        unenriched_apps: r.unenriched_apps,
+      });
+      continue;
+    }
+    // Merge a second spelling into the existing group.
+    cur.raw_developers.push(r.developer);
+    cur.developer_id = cur.developer_id ?? r.developer_id;
+    cur.app_count += r.app_count;
+    cur.charted_app_count += r.charted_app_count;
+    cur.unenriched_apps += r.unenriched_apps;
+    if (r.best_rank != null && (cur.best_rank == null || r.best_rank < cur.best_rank)) {
+      cur.best_rank = r.best_rank;
+      cur.preview_app_id = r.preview_app_id;
+      cur.preview_title = r.preview_title;
+    }
+    cur.countries = [...new Set([...cur.countries, ...split(r.countries)])];
+    cur.verticals = [...new Set([...cur.verticals, ...split(r.verticals)])];
+    for (const [k, v] of Object.entries(mix)) cur.source_mix[k] = (cur.source_mix[k] ?? 0) + v;
+  }
+  return [...byKey.values()].sort(
+    (a, b) => b.charted_app_count - a.charted_app_count || b.app_count - a.app_count,
+  );
+}
+
+/**
+ * FAST LANE: create/refresh publisher rows straight from Play LIST identity,
+ * with no enrichment required.
+ *
+ * Runs inside every harvest pass so a charted publisher becomes confirmable
+ * within the first minute of a run, instead of after the whole corpus has been
+ * detail-fetched. Returns how many rows it touched.
+ *
+ * MERGE SAFETY — the property this design rests on: the identity key used here
+ * is `n:<mergeNameKey(developer)>`, which identityKeysFor() also emits for every
+ * rolled-up publisher (via mergeableNames, one per app, unconditionally). So the
+ * full rollup resolves to the SAME publisher row through publisher_identity and
+ * UPDATES it. A provisional row is never a duplicate; it is the same row,
+ * earlier and thinner.
+ *
+ * DELIBERATELY THIN. Only what a list payload can honestly support is written:
+ * name, portfolio size, chart facts, preview. Fields needing a detail page —
+ * email, website, install band, genre — stay null/0 for the full rollup to fill.
+ * in_band is 0 here on purpose: an unenriched app has no known install count,
+ * and claiming otherwise would let it skip the band gate.
+ *
+ * SKIPS fully-enriched publishers so it can never downgrade richer data.
+ */
+/** Input size at the last fast-lane pass, so an unchanged corpus is skipped. */
+let lastFastLaneInputRows = -1;
+
+/** Reset the fast lane's change detector — call at the start of a RUN so a new
+ *  job never inherits the previous job's "nothing changed" state. */
+export function resetFastLaneCache(): void {
+  lastFastLaneInputRows = -1;
+}
+
+export function rollupProvisionalPlayPublishers(onLog?: LogFn, limit = 20_000): { publishers: number; skipped: number } {
+  // The background pump calls this every 15s. On a corpus the size of a real run
+  // (8,000 apps / 2,000 developers) a full pass measured ~4s, so repeating it
+  // when nothing new has been discovered would burn a quarter of every tick
+  // competing with the scrape. One indexed COUNT settles it.
+  const inputRows = countPlayListIdentityRows();
+  if (inputRows === lastFastLaneInputRows) return { publishers: 0, skipped: 0 };
+  lastFastLaneInputRows = inputRows;
+
+  const groups = foldProvisionalPublishers(rawPlayListDeveloperGroups(limit));
+  let touched = 0;
+  let skipped = 0;
+
+  for (const p of groups) {
+    // Nothing left unenriched ⇒ the full rollup owns the complete picture, so
+    // skip the write entirely. (Partially-enriched publishers are protected a
+    // second way: the upsert below runs in preserveEnriched mode, which never
+    // lowers enrichment-derived facts.)
+    if (p.unenriched_apps === 0) {
+      skipped++;
+      continue;
+    }
+    const row: PublisherUpsert = {
+      merge_key: `n:${p.name_key}`,
+      name: p.developer,
+      play_developer_id: p.developer_id,
+      apple_seller_name: null,
+      website: null, // needs a detail page
+      email: null, // needs a detail page
+      countries_charted: JSON.stringify(p.charted_app_count > 0 ? p.countries : []),
+      countries_seen: JSON.stringify(p.countries),
+      verticals: JSON.stringify(p.verticals),
+      charted_app_count: p.charted_app_count,
+      app_count: p.app_count,
+      best_rank: p.best_rank,
+      both_stores: 0, // list identity is Play-only by construction
+      in_band: 0, // install count unknown until enrichment — see note above
+      source_mix: JSON.stringify(p.source_mix),
+      gatc_advertiser_id: null,
+      gatc_ads_count: null,
+      meta_active_ads: null,
+      confirmed_advertiser: 0,
+      is_game_publisher: 0, // genre needs a detail page
+      is_charted: p.charted_app_count > 0 ? 1 : 0,
+      preview_url: p.preview_app_id ? playStoreUrl(p.preview_app_id) : null,
+      preview_title: p.preview_title,
+      score: 0, // scoring runs separately
+    };
+    upsertPublisher(row, [`n:${p.name_key}`], { preserveEnriched: true });
+    touched++;
+  }
+
+  onLog?.(
+    'info',
+    `fast lane: ${touched} publisher(s) from list data alone (no detail fetch); ${skipped} already enriched`,
+  );
+  return { publishers: touched, skipped };
+}
+
 export function buildPublisherRow(apps: StoreAppDetailRow[], appAgg: Map<string, AppAgg>): PublisherUpsert {
   const countriesCharted = new Set<string>();
   const countriesSeen = new Set<string>();
