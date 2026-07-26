@@ -853,6 +853,58 @@ LAST; stable across unrelated inserts).
 loss, #7 found one latent (not-yet-manifesting) correctness risk. Severity is falling round over
 round, which is the signal that this has converged.
 
+### Godlike audit #8 — the Custom lead box was unusable in production  ☑
+
+**User report: "can't type here anything."** The custom lead-count box rendered as a tiny empty oval.
+
+**Root cause: a CSS specificity collision, not a React bug.** `.checkbox input { width: 18px; height:
+18px }` was written to size the tick/dot controls, but it matches **any** input nested in a
+`.checkbox` row. At specificity **0,1,1** it silently beat `.input-inline` (**0,1,0**) and squashed
+the new number box to 18×18. With `box-sizing: border-box` plus its own padding that leaves zero
+usable text area — so the control still existed, still focused, still held state, but had nowhere to
+render characters. Worse, at that size the entire control is the number **spinner**: clicking it
+incremented the value instead of placing a caret (the negative control reproduced this precisely —
+clicking then typing `250` yielded `1250`).
+
+Nothing threw. `tsc` was happy. All 709 assertions were happy. **Only a human looking at the page
+could see it, and the user saw it before we did** — this is the first defect in this repo that no
+amount of server-side testing could have caught.
+
+**Fix** (`artifacts/dashboard/src/styles.css`):
+- Type-qualified the sizing rules → `.checkbox input[type="checkbox"], .checkbox input[type="radio"]`
+  (same for the `:disabled` and `:disabled + span` variants).
+- `.input-inline` gained `flex: 0 0 auto` (it lives in a flex row, so a bare width is still
+  shrinkable) and `cursor: text` (`cursor` is an **inherited** property and `.checkbox` sets
+  `pointer`, which made the box read as a non-editable chip).
+
+**Verified with a real browser — now a durable repo script:**
+`scripts/check-custom-lead-box.mjs` (Playwright + the real production bundle behind a stub API built
+from the compiled server's own config constants). Not in the default gate — it needs a browser and a
+built dashboard, so it runs like the network suites:
+
+    pnpm --filter dashboard build && node artifacts/api-server/scripts/check-custom-lead-box.mjs
+
+It skips cleanly (exit 0) if the dashboard isn't built or Playwright can't launch, and dumps a
+full-page screenshot to the temp dir on failure. 19 assertions, all green:
+box is 128×37px; clicking focuses the number input (not the radio); keystrokes land; typing selects
+the Custom radio; the hint clears on a valid number and returns when emptied; Start enables/disables
+correctly; presets still clear Custom; radios and country checkboxes are still exactly 18×18; no
+horizontal overflow; `999999` / `0` / `2.5` / `-5` are all rejected; and **the typed number actually
+reaches the API payload** (`maxLeads: 250`).
+
+**Negative control** (the discipline that makes the above mean something): re-appending the old
+`.checkbox input` rule to the built CSS reproduced the bug exactly — 22×18px, `value="1250"`.
+
+**New permanent gate: `scripts/check-form-css.mjs`** (wired into `run-tests.mjs`, now 3 gates).
+Static scan, no browser or build needed. Forbids the general trap — an element-type descendant
+selector under a class that sets a box dimension, because it silently captures every control added
+to that container **later** — and pins `.input-inline`'s width/cursor/flex. All 5 negative controls
+confirmed to fail it (reintroduce the bug, shrink the width, drop `cursor: text`, drop `flex`, and a
+brand-new broad selector elsewhere in the file).
+
+**Lesson for this repo:** the test suite has no eyes. Any future change to a *rendered control* needs
+a browser probe or a static CSS gate — server-side assertions structurally cannot see layout.
+
 ### Other levers, ranked (measure before committing)
 
 1. **Persistent corpus — NOW THE TOP REMAINING ITEM.** Production shows 0 publishers at job start
