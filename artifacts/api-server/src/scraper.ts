@@ -1,6 +1,7 @@
 import { chromium, Browser, BrowserContext, Page } from 'playwright';
 import { log } from './logger.js';
 import { browserSpawnEnv, browserExecutablePath } from './browserSetup.js';
+import { withDeadline, DeadlineError } from './deadline.js';
 
 export interface RawAd {
   advertiser_name: string;
@@ -12,6 +13,15 @@ export interface RawAd {
 
 const ACTION_DELAY = Number(process.env.SCRAPE_ACTION_DELAY_MS) || 2500;
 const MAX_PAGES = Number(process.env.MAX_PAGES_PER_QUERY) || 5;
+/** Cap on any single renderer round-trip (page.evaluate has NO native timeout —
+ *  a wedged Ad Library main thread once hung a job, and the VM, for 40+ min). */
+const EVAL_TIMEOUT_MS = Number(process.env.SCRAPE_EVAL_TIMEOUT_MS) || 20_000;
+/** Belt-and-braces cap on one whole (country, keyword) query. */
+const QUERY_TIMEOUT_MS = Number(process.env.SCRAPE_QUERY_TIMEOUT_MS) || 300_000;
+/** Ad Library previews are video/image-heavy; we only read DOM text + hrefs,
+ *  so blocking media keeps the renderer (and the whole VM) light. Opt out with
+ *  SCRAPE_BLOCK_MEDIA=0. */
+const BLOCK_MEDIA = process.env.SCRAPE_BLOCK_MEDIA !== '0';
 
 function jitter(baseMs: number): number {
   // ±50% random
@@ -62,9 +72,29 @@ async function getBrowser(): Promise<Browser> {
 }
 
 export async function closeBrowser() {
-  if (sharedBrowser) {
-    await sharedBrowser.close();
-    sharedBrowser = null;
+  await forceRecycleBrowser('shutdown');
+}
+
+/**
+ * Kill the shared browser and forget it, so the NEXT query launches a fresh
+ * one. Called when a deadline breach marks the current renderer as wedged —
+ * a renderer that stopped answering must be killed, not reused: left alive it
+ * keeps devouring the VM's CPU/RAM and starves the whole app (this is exactly
+ * what took the site down on 2026-07-29).
+ *
+ * sharedBrowser is nulled FIRST so even a hung close() can't leave the wedged
+ * instance reachable. browser.close() force-kills the child process; it gets
+ * its own deadline so shutdown/recycle can never hang either.
+ */
+export async function forceRecycleBrowser(reason: string): Promise<void> {
+  const doomed = sharedBrowser;
+  sharedBrowser = null;
+  if (!doomed) return;
+  log.warn(`scraper: closing browser (${reason})`);
+  try {
+    await withDeadline(doomed.close(), 10_000, 'browser.close');
+  } catch (err) {
+    log.error(`scraper: browser close failed — abandoning instance`, (err as Error).message);
   }
 }
 
@@ -81,57 +111,103 @@ async function newContext(): Promise<BrowserContext> {
   await ctx.addInitScript(() => {
     Object.defineProperty(navigator, 'webdriver', { get: () => false });
   });
+  if (BLOCK_MEDIA) {
+    // The extractor only reads text + hrefs; ad preview videos/images are pure
+    // renderer load. Blocking them keeps Chromium's footprint small enough
+    // that it cannot starve the VM (the root cause of the 2026-07-29 outage).
+    await ctx.route('**/*', (route) => {
+      const t = route.request().resourceType();
+      if (t === 'image' || t === 'media' || t === 'font') return route.abort();
+      return route.continue();
+    });
+  }
   return ctx;
+}
+
+/** page.evaluate with a hard deadline — see deadline.ts for why this must exist. */
+function evalWithDeadline<T>(page: Page, fn: () => T, label: string): Promise<T> {
+  return withDeadline(page.evaluate(fn), EVAL_TIMEOUT_MS, label);
 }
 
 /**
  * Scrape the Ad Library for one (country, keyword) pair.
  * Returns deduped raw ads (advertiser-level dedup happens upstream in the queue).
+ *
+ * Every await in here runs under a deadline (and the whole query under
+ * QUERY_TIMEOUT_MS), so a wedged renderer fails the QUERY — never the job, and
+ * never the process. On a deadline breach the shared browser is recycled;
+ * whatever was extracted before the breach is still returned.
  */
 export async function scrapeQuery(
   country: string,
   keyword: string,
   onLog: (msg: string) => void
 ): Promise<RawAd[]> {
-  const ctx = await newContext();
-  const page = await ctx.newPage();
-  const url = buildAdLibraryUrl(country, keyword);
-
   const results: RawAd[] = [];
+  let ctx: BrowserContext | null = null;
 
   try {
-    onLog(`open ${url}`);
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60_000 });
-    await sleep(jitter(ACTION_DELAY));
-
-    // Dismiss any cookie/login overlays
-    await dismissOverlays(page);
-
-    for (let pageIdx = 0; pageIdx < MAX_PAGES; pageIdx++) {
-      await sleep(jitter(ACTION_DELAY));
-
-      const adsOnPage = await extractAdsFromDom(page, country);
-      onLog(`page ${pageIdx + 1}: ${adsOnPage.length} ads`);
-      results.push(...adsOnPage);
-
-      // Scroll for more
-      const beforeHeight = await page.evaluate(() => document.body.scrollHeight);
-      await page.evaluate(() => window.scrollBy(0, window.innerHeight * 3));
-      await sleep(jitter(ACTION_DELAY));
-      const afterHeight = await page.evaluate(() => document.body.scrollHeight);
-      if (afterHeight <= beforeHeight) {
-        onLog(`page ${pageIdx + 1}: no more results, stopping`);
-        break;
-      }
-    }
+    ctx = await withDeadline(newContext(), 60_000, 'browser launch/context');
+    const page = await withDeadline(ctx.newPage(), 30_000, 'new page');
+    page.setDefaultTimeout(15_000);
+    await withDeadline(
+      runQuery(page, country, keyword, results, onLog),
+      QUERY_TIMEOUT_MS,
+      `query ${country}/"${keyword}"`
+    );
   } catch (err) {
     log.error(`scrape failed for ${country}/${keyword}`, err);
     onLog(`error: ${(err as Error).message}`);
+    if (err instanceof DeadlineError) {
+      // The renderer stopped answering — the browser can't be trusted (and its
+      // context.close() would hang too). Kill it; next query starts fresh.
+      await forceRecycleBrowser((err as Error).message);
+      ctx = null; // died with the browser
+    }
   } finally {
-    await ctx.close();
+    if (ctx) {
+      await withDeadline(ctx.close(), 10_000, 'context.close').catch(() =>
+        forceRecycleBrowser('context.close hung')
+      );
+    }
   }
 
   return results;
+}
+
+async function runQuery(
+  page: Page,
+  country: string,
+  keyword: string,
+  results: RawAd[],
+  onLog: (msg: string) => void
+): Promise<void> {
+  const url = buildAdLibraryUrl(country, keyword);
+  onLog(`open ${url}`);
+  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+  await sleep(jitter(ACTION_DELAY));
+
+  // Dismiss any cookie/login overlays. Best-effort — but a deadline breach
+  // means a wedged renderer, and must propagate so the browser is recycled.
+  await withDeadline(dismissOverlays(page), 15_000, 'dismiss overlays');
+
+  for (let pageIdx = 0; pageIdx < MAX_PAGES; pageIdx++) {
+    await sleep(jitter(ACTION_DELAY));
+
+    const adsOnPage = await extractAdsFromDom(page, country);
+    onLog(`page ${pageIdx + 1}: ${adsOnPage.length} ads`);
+    results.push(...adsOnPage);
+
+    // Scroll for more
+    const beforeHeight = await evalWithDeadline(page, () => document.body.scrollHeight, 'read scroll height');
+    await evalWithDeadline(page, () => window.scrollBy(0, window.innerHeight * 3), 'scroll');
+    await sleep(jitter(ACTION_DELAY));
+    const afterHeight = await evalWithDeadline(page, () => document.body.scrollHeight, 'read scroll height');
+    if (afterHeight <= beforeHeight) {
+      onLog(`page ${pageIdx + 1}: no more results, stopping`);
+      break;
+    }
+  }
 }
 
 async function dismissOverlays(page: Page) {
@@ -191,7 +267,11 @@ async function extractAdsFromDom(page: Page, country: string): Promise<RawAd[]> 
   // (__name, etc.) being injected into the compiled function body — those
   // helpers reference module-scope vars that don't exist in the page context
   // and cause a ReferenceError at runtime.
-  return await page.evaluate(
+  //
+  // withDeadline: this evaluate walks the entire Ad Library DOM and is the
+  // single most renderer-dependent call in the pipeline — it is exactly where
+  // the 2026-07-29 wedge hung. It must never wait unboundedly.
+  return await withDeadline(page.evaluate(
     `(({ cc }) => {
       function decodeFbRedirect(href) {
         try {
@@ -356,5 +436,5 @@ async function extractAdsFromDom(page: Page, country: string): Promise<RawAd[]> 
 
       return results;
     })({ cc: ${JSON.stringify(country)} })`
-  ) as RawAd[];
+  ), EVAL_TIMEOUT_MS, 'extract ads from DOM') as RawAd[];
 }

@@ -13,6 +13,8 @@ import {
   getResults,
   getJob,
   deferJob,
+  jobHeartbeatAt,
+  requestJobCancel,
   JobRow,
 } from './db.js';
 import { JobCancelledError, throwIfCancelled, clearCancelState, beginJobRun, endJobRun } from './jobControl.js';
@@ -22,7 +24,7 @@ import {
   spentTodayUsd,
   DAILY_CAP_USD,
 } from './llmBudget.js';
-import { scrapeQuery, RawAd, closeBrowser } from './scraper.js';
+import { scrapeQuery, RawAd, closeBrowser, forceRecycleBrowser } from './scraper.js';
 import { classify } from './classifier.js';
 import { buildCsv, selectExportRows, normalizeMaxLeads } from './csv.js';
 import { keywordsFor } from './keywords.js';
@@ -40,6 +42,16 @@ const POLL_INTERVAL_MS = 2000;
  * LLM spend bursts, NOT fairness (fairness is the per-user rule below).
  */
 const MAX_CONCURRENT_JOBS = Math.max(1, Math.min(8, Number(process.env.QUEUE_MAX_CONCURRENT_JOBS) || 3));
+/**
+ * Stalled-job watchdog: a running job whose liveness signal (phase heartbeat OR
+ * last job-log line — see jobHeartbeatAt) hasn't moved for this long is dead —
+ * every pipeline phase logs or bumps phase far more often than this. The
+ * watchdog settles its row to 'failed', frees its in-flight slot (per-user
+ * serialization would otherwise pin that user's queue forever) and recycles
+ * the browser. Safety net for the wedge class behind the 2026-07-29 outage.
+ */
+const STALL_TIMEOUT_MS = Math.max(120_000, Number(process.env.JOB_STALL_TIMEOUT_MS) || 15 * 60_000);
+const WATCHDOG_INTERVAL_MS = 60_000;
 let running = false;
 
 /**
@@ -58,22 +70,58 @@ let running = false;
  */
 const inFlightJobs = new Set<string>();
 const inFlightByUser = new Map<string, string>(); // user key → job id
+/** job id → abort hook that loses the launchJob race and frees the job's slots. */
+const stallAborts = new Map<string, (err: Error) => void>();
 
 export function startQueue() {
   if (running) return;
   running = true;
-  log.info(`queue processor started (parallel per user, max ${MAX_CONCURRENT_JOBS} concurrent)`);
+  log.info(`queue processor started (parallel per user, max ${MAX_CONCURRENT_JOBS} concurrent, stall watchdog ${Math.round(STALL_TIMEOUT_MS / 60000)}min)`);
   void tick();
 }
 
 async function tick() {
+  let lastWatchdogSweep = Date.now();
   while (running) {
     try {
       dispatchRunnable();
+      if (Date.now() - lastWatchdogSweep >= WATCHDOG_INTERVAL_MS) {
+        lastWatchdogSweep = Date.now();
+        watchdogSweep();
+      }
     } catch (err) {
       log.error('queue tick error', err);
     }
     await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+  }
+}
+
+/**
+ * Kill wedged jobs. A pipeline promise can hang despite the per-step deadlines
+ * (a future pipeline forgetting them, an un-timeouted third-party call): when a
+ * running job's liveness signal goes silent past STALL_TIMEOUT_MS, settle its
+ * row as failed, ask the zombie to unwind (cancel flag — its later terminal
+ * writes are no-ops thanks to the status guards in db.ts), free its slots so
+ * the user's queue moves again, and recycle the shared browser for meta jobs.
+ */
+function watchdogSweep() {
+  const now = Date.now();
+  for (const jobId of [...inFlightJobs]) {
+    const job = getJob(jobId);
+    if (!job || job.status !== 'running') continue; // still starting, or already settled
+    const beat = jobHeartbeatAt(jobId) ?? job.started_at ?? now;
+    const silentMs = now - beat;
+    if (silentMs < STALL_TIMEOUT_MS) continue;
+
+    const mins = Math.round(silentMs / 60_000);
+    log.error(`watchdog: job ${jobId} silent for ${mins}min — killing it`);
+    requestJobCancel(jobId); // zombie unwinds at its next cancel checkpoint
+    markJobFailed(jobId, `stalled: no progress for ${mins} minutes — aborted by watchdog (partial results kept; use Resume to retry)`);
+    appendLog(jobId, 'error', `watchdog: no progress for ${mins} minutes — job aborted. Partial results are kept; Resume re-queues it.`);
+    if ((job.source ?? 'meta') === 'meta') {
+      void forceRecycleBrowser(`watchdog killed ${jobId}`);
+    }
+    stallAborts.get(jobId)?.(new Error(`watchdog: job ${jobId} stalled`));
   }
 }
 
@@ -102,12 +150,18 @@ function launchJob(job: JobRow, userKey: string) {
   // (deferred/resumed jobs replay), and the control cache's "cancelled" answer
   // is deliberately sticky within a run.
   clearCancelState(job.id);
-  void runJob(job)
+  // Raced against a stall hook so the watchdog can free this job's slots even
+  // when the pipeline promise is wedged and will never settle on its own. The
+  // race observes both branches, so a late zombie rejection can't surface as
+  // an unhandledRejection.
+  const stalled = new Promise<never>((_, reject) => stallAborts.set(job.id, reject));
+  void Promise.race([runJob(job), stalled])
     .catch((err) => {
       // Runners settle their own job rows; this only guards the dispatcher.
       log.error(`job ${job.id} escaped its pipeline's error handling`, err);
     })
     .finally(() => {
+      stallAborts.delete(job.id);
       endJobRun(job.source);
       inFlightJobs.delete(job.id);
       if (inFlightByUser.get(userKey) === job.id) inFlightByUser.delete(userKey);
@@ -329,11 +383,21 @@ async function runMetaJob(job: JobRow) {
   }
 }
 
-process.on('SIGTERM', async () => {
+// Graceful shutdown MUST end in process.exit: installing a SIGTERM/SIGINT
+// handler replaces node's default terminate, so without the exit the process
+// would keep serving until the platform SIGKILLs it. closeBrowser carries its
+// own deadline; the unref'd fallback timer is the backstop if even that wedges.
+async function shutdown(signal: string) {
+  if (!running) return process.exit(0); // second signal: exit immediately
   running = false;
-  await closeBrowser();
-});
-process.on('SIGINT', async () => {
-  running = false;
-  await closeBrowser();
-});
+  log.info(`${signal} received — closing browser and exiting`);
+  setTimeout(() => process.exit(0), 15_000).unref();
+  try {
+    await closeBrowser();
+  } catch {
+    /* deadline'd internally; nothing left to do */
+  }
+  process.exit(0);
+}
+process.on('SIGTERM', () => void shutdown('SIGTERM'));
+process.on('SIGINT', () => void shutdown('SIGINT'));

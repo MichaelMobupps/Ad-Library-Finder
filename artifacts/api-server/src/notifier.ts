@@ -3,7 +3,16 @@ import path from 'node:path';
 import { JobRow, setJobNotificationStatus, getUserById, getGmailTokensForUser, appendLog } from './db.js';
 import { sendEmailFromUser } from './gmail.js';
 import { getDefaultRecipientForUser } from './settings.js';
+import { withDeadline } from './deadline.js';
 import { log } from './logger.js';
+
+/**
+ * googleapis/gaxios ships with NO default timeout — on 2026-07-29 (starved VM)
+ * one token refresh dangled for 9 minutes before failing. Notifications are
+ * fire-and-forget, but an unbounded send still leaks a pending promise and can
+ * pile up; cap the whole send (token refresh + upload of CSV/zip attachments).
+ */
+const SEND_TIMEOUT_MS = Number(process.env.NOTIFY_SEND_TIMEOUT_MS) || 120_000;
 
 function resolveRecipient(job: JobRow): string | null {
   if (job.recipient_email) return job.recipient_email;
@@ -135,12 +144,16 @@ export async function notifyJobCompleted(job: JobRow) {
   }
 
   try {
-    await sendEmailFromUser(sender.userId, {
-      to,
-      subject,
-      htmlBody: html,
-      attachments,
-    });
+    await withDeadline(
+      sendEmailFromUser(sender.userId, {
+        to,
+        subject,
+        htmlBody: html,
+        attachments,
+      }),
+      SEND_TIMEOUT_MS,
+      'gmail send (completion)'
+    );
     appendLog(job.id, 'info', `completion email sent to ${to}${attachments.length ? ` with ${attachments.length} attachment(s)` : ''}`);
     setJobNotificationStatus(job.id, 'sent');
   } catch (err) {
@@ -181,7 +194,11 @@ export async function notifyJobFailed(job: JobRow) {
 </body></html>`;
 
   try {
-    await sendEmailFromUser(sender.userId, { to, subject, htmlBody: html });
+    await withDeadline(
+      sendEmailFromUser(sender.userId, { to, subject, htmlBody: html }),
+      SEND_TIMEOUT_MS,
+      'gmail send (failure)'
+    );
     appendLog(job.id, 'info', `failure email sent to ${to}`);
     setJobNotificationStatus(job.id, 'sent');
   } catch (err) {

@@ -24,10 +24,29 @@ import {
   type PlayChart,
 } from './storeDiscoveryConfig.js';
 import { RateLimiter } from './storeThrottle.js';
+import { withDeadline } from './deadline.js';
 
 // The library is CJS with a loose default-export type; cast once, isolate here.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-const gplay: any = gplayDefault as unknown;
+const gplayRaw: any = gplayDefault as unknown;
+
+/**
+ * google-play-scraper drives `got` with NO timeout configured (verified in its
+ * lib/utils/request.js), so every call can await forever — same unbounded-hang
+ * class that wedged the 2026-07-29 meta job. This proxy puts a hard deadline on
+ * every endpoint; the existing per-call catch blocks turn a breach into the
+ * same []/null degradation as any other failure.
+ */
+const PLAY_CALL_TIMEOUT_MS = Number(process.env.PLAY_CALL_TIMEOUT_MS) || 45_000;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const gplay: any = new Proxy(gplayRaw, {
+  get(target, prop) {
+    const v = target[prop];
+    if (typeof v !== 'function') return v;
+    return (...args: unknown[]) =>
+      withDeadline(Promise.resolve(v.apply(target, args)), PLAY_CALL_TIMEOUT_MS, `gplay.${String(prop)}`);
+  },
+});
 
 export type LogFn = (level: 'info' | 'warn' | 'error' | 'debug', msg: string) => void;
 
