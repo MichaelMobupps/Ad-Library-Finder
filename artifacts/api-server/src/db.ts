@@ -388,14 +388,21 @@ export function listRunnableJobs(limit = 50): JobRow[] {
     .all(Date.now(), limit) as JobRow[];
 }
 
+// Terminal-state guards ("AND status ..."): the queue watchdog can settle a
+// wedged job's row to 'failed' while its zombie pipeline promise is still
+// pending. If that zombie later wakes up (its browser was killed under it), its
+// terminal writes must be no-ops — a settled job is never resurrected or
+// flipped. Every transition below states which prior states may take it.
+
 export function markJobRunning(id: string) {
   const now = Date.now();
   // leads_found and progress_pct reset to 0: a deferred/resumed job replays
   // from the top (pipelines clear/skip their partials), so stale counters from
   // the prior attempt would overstate progress until the first live update.
+  // Guard: never resurrects a job stopped between dispatch and this write.
   getDb()
     .prepare(
-      `UPDATE jobs SET status='running', started_at=?, leads_found=0, progress_pct=0, phase='starting', phase_detail='launching browser', phase_updated_at=? WHERE id = ?`
+      `UPDATE jobs SET status='running', started_at=?, leads_found=0, progress_pct=0, phase='starting', phase_detail='launching browser', phase_updated_at=? WHERE id = ? AND status NOT IN ('completed','failed','cancelled')`
     )
     .run(now, now, id);
 }
@@ -404,7 +411,7 @@ export function markJobCompleted(id: string, csvPath: string, counts: { ads: num
   const now = Date.now();
   getDb()
     .prepare(
-      `UPDATE jobs SET status='completed', csv_path=?, completed_at=?, total_ads_scraped=?, total_advertisers=?, leads_found=?, progress_pct=100, phase='done', phase_detail='complete', phase_updated_at=? WHERE id = ?`
+      `UPDATE jobs SET status='completed', csv_path=?, completed_at=?, total_ads_scraped=?, total_advertisers=?, leads_found=?, progress_pct=100, phase='done', phase_detail='complete', phase_updated_at=? WHERE id = ? AND status='running'`
     )
     .run(csvPath, now, counts.ads, counts.advertisers, counts.advertisers, now, id);
 }
@@ -417,7 +424,9 @@ export function markJobCompleted(id: string, csvPath: string, counts: { ads: num
 export function setJobProgress(id: string, pct: number) {
   const clamped = Math.max(0, Math.min(100, pct));
   getDb()
-    .prepare(`UPDATE jobs SET progress_pct = MAX(progress_pct, ?) WHERE id = ?`)
+    .prepare(
+      `UPDATE jobs SET progress_pct = MAX(progress_pct, ?) WHERE id = ? AND status NOT IN ('completed','failed','cancelled')`
+    )
     .run(clamped, id);
 }
 
@@ -451,11 +460,13 @@ export function resumeJob(id: string): boolean {
 export function markJobCancelled(id: string, detail: string, csvPath?: string | null) {
   const now = Date.now();
   if (csvPath) {
+    // Unguarded on purpose: pointing csv_path at a partial export is useful
+    // even when the watchdog already failed the job.
     getDb().prepare(`UPDATE jobs SET csv_path=? WHERE id = ?`).run(csvPath, id);
   }
   getDb()
     .prepare(
-      `UPDATE jobs SET status='cancelled', completed_at=?, phase='cancelled', phase_detail=?, phase_updated_at=? WHERE id = ?`
+      `UPDATE jobs SET status='cancelled', completed_at=?, phase='cancelled', phase_detail=?, phase_updated_at=? WHERE id = ? AND status NOT IN ('completed','failed','cancelled')`
     )
     .run(now, detail.slice(0, 200), now, id);
 }
@@ -485,14 +496,16 @@ export function requestJobCancel(id: string): boolean {
 
 /** Live "leads so far" counter — cheap single-column update, called mid-run. */
 export function setJobLeadsFound(id: string, n: number) {
-  getDb().prepare(`UPDATE jobs SET leads_found = ? WHERE id = ?`).run(n, id);
+  getDb()
+    .prepare(`UPDATE jobs SET leads_found = ? WHERE id = ? AND status NOT IN ('completed','failed','cancelled')`)
+    .run(n, id);
 }
 
 export function markJobFailed(id: string, error: string) {
   const now = Date.now();
   getDb()
     .prepare(
-      `UPDATE jobs SET status='failed', error=?, completed_at=?, phase='failed', phase_detail=?, phase_updated_at=? WHERE id = ?`
+      `UPDATE jobs SET status='failed', error=?, completed_at=?, phase='failed', phase_detail=?, phase_updated_at=? WHERE id = ? AND status NOT IN ('completed','failed','cancelled')`
     )
     .run(error, now, error.slice(0, 200), now, id);
 }
@@ -507,16 +520,36 @@ export function deferJob(id: string, runAfter: number, detail: string) {
   const now = Date.now();
   getDb()
     .prepare(
-      `UPDATE jobs SET status='deferred', run_after=?, phase='deferred', phase_detail=?, phase_updated_at=? WHERE id = ?`
+      `UPDATE jobs SET status='deferred', run_after=?, phase='deferred', phase_detail=?, phase_updated_at=? WHERE id = ? AND status='running'`
     )
     .run(runAfter, detail.slice(0, 200), now, id);
 }
 
 export function setJobPhase(id: string, phase: JobPhase, detail?: string | null) {
   const now = Date.now();
+  // Guard: a watchdog-failed job's zombie pipeline must not make the row look
+  // alive again by stamping fresh phases onto it.
   getDb()
-    .prepare(`UPDATE jobs SET phase=?, phase_detail=?, phase_updated_at=? WHERE id = ?`)
+    .prepare(
+      `UPDATE jobs SET phase=?, phase_detail=?, phase_updated_at=? WHERE id = ? AND status NOT IN ('completed','failed','cancelled')`
+    )
     .run(phase, detail ?? null, now, id);
+}
+
+/**
+ * Most recent liveness signal for a job: the newer of its phase heartbeat and
+ * its last job_logs row (long phases — HQ split, store resolve — log without
+ * changing phase). The queue watchdog uses this to detect wedged jobs.
+ */
+export function jobHeartbeatAt(id: string): number | null {
+  const row = getDb()
+    .prepare(
+      `SELECT MAX(COALESCE(phase_updated_at, started_at, created_at),
+                  COALESCE((SELECT MAX(ts) FROM job_logs WHERE job_id = jobs.id), 0)) AS beat
+         FROM jobs WHERE id = ?`
+    )
+    .get(id) as { beat: number | null } | undefined;
+  return row?.beat ?? null;
 }
 
 export function setJobNotificationStatus(id: string, status: 'sent' | 'failed') {

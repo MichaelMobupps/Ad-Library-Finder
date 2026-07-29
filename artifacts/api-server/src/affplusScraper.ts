@@ -84,20 +84,27 @@ function buildSearchUrl(platform: Platform, page: number, geo?: string | null): 
 }
 
 async function fetchHtml(url: string): Promise<string | null> {
-  try {
-    const res = await fetch(url, {
-      headers: FETCH_HEADERS,
-      signal: AbortSignal.timeout(20_000),
-    });
-    if (!res.ok) {
-      log.warn(`affplus fetch ${url} → ${res.status}`);
-      return null;
+  // One retry on transport errors/timeouts: a single blip on page 1 of a
+  // platform sweep otherwise zeroes the whole listing (seen 2026-07-29 when a
+  // starved VM aborted both page-1 fetches → "0 offers" job). Non-OK statuses
+  // are NOT retried — the server answered.
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const res = await fetch(url, {
+        headers: FETCH_HEADERS,
+        signal: AbortSignal.timeout(20_000),
+      });
+      if (!res.ok) {
+        log.warn(`affplus fetch ${url} → ${res.status}`);
+        return null;
+      }
+      return await res.text();
+    } catch (err) {
+      log.warn(`affplus fetch ${url} failed (attempt ${attempt}/2): ${(err as Error).message}`);
+      if (attempt < 2) await sleep(3000);
     }
-    return await res.text();
-  } catch (err) {
-    log.warn(`affplus fetch ${url} failed: ${(err as Error).message}`);
-    return null;
   }
+  return null;
 }
 
 /**

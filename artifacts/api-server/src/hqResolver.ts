@@ -178,7 +178,12 @@ function getAnthropic(): Anthropic {
   if (!anthropicClient) {
     const apiKey = process.env.ANTHROPIC_API_KEY;
     if (!apiKey) throw new Error('ANTHROPIC_API_KEY not set');
-    anthropicClient = new Anthropic({ apiKey });
+    // Explicit timeout: the SDK default is 10 MINUTES per attempt — long enough
+    // to trip the queue's stall watchdog on a single resolve call.
+    anthropicClient = new Anthropic({
+      apiKey,
+      timeout: Number(process.env.HQ_LLM_TIMEOUT_MS) || 90_000,
+    });
   }
   return anthropicClient;
 }
