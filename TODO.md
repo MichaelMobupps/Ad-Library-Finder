@@ -21,11 +21,16 @@
 | O-1 | **Confirm `PUBLIC_BASE_URL` is actually set in production.** It defaults to `''`, and every emailed link is built as `${PUBLIC_URL}${path}`. If unset, every "Download CSV" / "Download HQ split" / "View full job log" link ever sent is a bare rooted path (`/api/jobs/<id>/csv`) — not clickable from an inbox. Pre-existing, unchanged by Bundle 1. Verify on the Reserved VM before cutover. | B1 discovery | OPEN — needs operator check |
 | O-2 | **Count live emailed links on production.** Cannot be determined from the workspace: the workspace `data/ad-library.sqlite` is the dev copy and is empty (0 jobs, 0 users, 0 sessions). Production data lives on the Reserved VM (`deploymentTarget = "vm"`). Run there: `SELECT COUNT(*) FROM jobs WHERE notification_status='sent';` | B1 discovery | OPEN — needs production query |
 | O-3 | Emailed download links carry a **job id, never a token, and never expire**. Access is re-checked per request by session cookie + `canReadJob` (`routes-jobs.ts:565`: owner or admin only). A link forwarded to a non-owning, non-admin colleague returns 404, not 403. Product decision, not a bug. Revisit if result sharing is ever wanted. | B1 discovery | OPEN — informational |
-| O-4 | `/api/auth/google/debug` still echoes the **raw** env var (`routes-auth.ts:57`), not the resolved config. Add `basePath`/`publicUrl` resolved values so a cutover can be diagnosed from one endpoint. Deliberately not changed in B1 (would alter a response body). | B1 audit | DEFERRED to Bundle 2 |
+| O-4 | `/api/auth/google/debug` still echoes the **raw** env var (`routes-auth.ts:57`), not the resolved config. Add `basePath`/`publicUrl` resolved values so a cutover can be diagnosed from one endpoint. | B1 audit | **Still open.** Bundle 2 deliberately did NOT take it: it changes a response body, and B2's DARK gate is byte-identity against the recorded baseline — which pins this exact response. Take it in the cutover bundle, and add the fields only while `IS_PREFIXED` so the unprefixed shape stays frozen. Boot logs already print the resolved config. |
 | O-5 | `urls.ts` ↔ `config.ts` are a mirror pair with **no automated drift gate**. The repo already has the pattern (`scripts/check-lead-mirror.mjs`). Add an equivalent so the two validators cannot diverge. | B1 audit | DEFERRED |
 | O-6 | Job ids are interpolated raw into emailed links (`notifier.ts:28,32,36`). Safe today — ids are `job_${nanoid(10)}`, URL-safe by construction — but not safe *by construction at the sink*. Add `encodeURIComponent` when a bundle can afford the behaviour delta. | B1 audit | DEFERRED |
-| O-7 | SPA catch-all is `app.get('*')` (`index.ts:79`), not scoped to the prefix. Must become prefix-aware or a prefixed deploy serves the SPA on every path. | B1 audit | DEFERRED to Bundle 2 (already in ROADMAP) |
 | O-8 | `artifacts/dashboard/tsconfig.tsbuildinfo` is tracked in git and churns on every build. Should be gitignored. Out of scope (repo hygiene, predates this bundle). | B1 audit | DEFERRED |
+| O-9 | **`.replit` lost its port mappings, and not from this bundle.** `3901`–`3917` (15 `[[ports]]` blocks) are deleted in the working tree; the change appeared mid-session without being authored here. Left uncommitted and unstaged deliberately. Restore with `git checkout -- .replit`, or keep it if the environment is now managing that file — **operator's call**. | B2 discovery | OPEN — needs operator decision |
+| O-10 | While prefixed, the app's own root `/` returns **404** — only `<prefix>/…` is served. Fine behind the gateway (it forwards `/leadfinder/*`), but anyone hitting the Repl's direct address gets nothing, and any HTTP health probe aimed at `/` would read as unhealthy. Confirm the Reserved VM's readiness check is port-based, not `GET /`. One-line mitigation if needed: redirect `/` to `BASE_PATH` when `IS_PREFIXED`. | B2 audit | OPEN — verify before cutover |
+| O-11 | `/version` — the autonomous deploy-detect poller's endpoint (`routes-health.ts:6`) — becomes `/leadfinder/version` at cutover. Whatever polls it lives outside this repo. Update it, or the poller reads every deploy as a failure. | B2 audit | OPEN — external, before cutover |
+| O-12 | **Emailed-link back-compatibility (its own order, post-cutover).** Now concrete: live links are `<old-address>/api/jobs/<id>/csv`, `/hq-zip` and `/#/jobs/<id>`. When the old address becomes a permanent redirect it must be **path-preserving AND prefix-adding** (`/api/…` → `<gateway>/leadfinder/api/…`), or every link ever emailed 404s. A bare redirect to the gateway root silently breaks all of them. Fragments (`/#/jobs/<id>`) survive a 301 on their own — browsers re-attach them. | B2 audit | OPEN — gateway-side work |
+| O-13 | The unprefixed SPA arm still uses `app.get('*')` (`index.ts:144`), which **throws at registration on Express 5** (this repo runs 4.22.2). The prefixed arm is already `app.use(BASE_PATH, …)` and is version-safe. Convert the unprefixed arm when Express is upgraded — it is a boot failure, not a warning. | B2 audit | DEFERRED — blocks an Express 5 upgrade |
+| O-14 | `pnpm dev:ui` (Vite dev server) is not prefix-aware: with `BASE_PATH` set, the dev server serves at `/leadfinder/` while its API proxy still matches only `/api`. Nothing in the workflow uses it (`.replit` runs `pnpm start`), so this is a developer-ergonomics gap, not a deploy one. | B2 audit | DEFERRED |
 
 ---
 
@@ -38,6 +43,29 @@ Bundle 1 records these; it does not change them. Each becomes a cutover item.*
 |---|---|---|---|---|
 | **Google Cloud Console — OAuth 2.0 Client** | Authorized redirect URI: `<app address>/api/auth/google/callback` | `artifacts/api-server/src/oauth.ts` | 14 (path const), 60 (header-derived), 68 (`PUBLIC_URL` fallback) | **Add** the new gateway URI in the Cloud Console *before* the cutover and **keep the old one** until the old address is retired. The app derives the URI from `x-forwarded-host`/`Host` at request time, so it follows the gateway automatically — but Google rejects any URI not on the allow-list, so sign-in breaks for everyone the moment the host changes without the console entry. |
 | (same, documented) | `<PUBLIC_BASE_URL>/api/auth/google/callback` | `SETUP_GOOGLE_OAUTH.md` | 36 | Update the doc when the address changes. |
+
+**The exact URIs to register, character for character.** Measured in the Bundle 2 LIT
+smoke by replaying the derivation with the gateway's `x-forwarded-host` — not composed
+by hand:
+
+```
+https://mobupps-tools-gateway.replit.app/leadfinder/api/auth/google/callback
+https://tools.mobupps.net/leadfinder/api/auth/google/callback
+```
+
+Add **both** in the Google Cloud Console **before** the cutover (the second only matters
+once the domain lands 2026-08-02) and **keep every existing URI** until the old address
+is retired. The app derives this at request time from `x-forwarded-proto` +
+`x-forwarded-host` plus its own `BASE_PATH`, so it follows the gateway automatically —
+but Google rejects any URI not on the allow-list, and sign-in breaks for everyone the
+moment the host changes without the console entry. Verified in the smoke: exactly one
+`/leadfinder` in the derived URI, no double prefix, for both hosts.
+
+**Depends on the gateway forwarding `x-forwarded-host`.** If it forwards the app's own
+hostname instead, the derived URI is the app's address and the console needs *that* URI
+too. Check this against the running gateway before cutover — it is a one-request test
+against `/leadfinder/api/auth/google/debug`, which echoes both the header and the
+derived URI.
 
 **No other external registration exists.** Every other outbound service is call-out-only
 and holds no address of ours — see the outbound analysis in the Bundle 1 ledger entry.
@@ -147,6 +175,233 @@ after. No scraping. No email dispatched. The running workflow was never touched.
 
 **7. Auto-fix** — both in-scope findings fixed and re-audited. Eight out-of-scope
 findings recorded as O-1..O-8 above and left untouched.
+
+---
+
+### Leadfinder Bundle 2 — base-path switch ☑ DONE (2026-08-01)
+
+Branch `bundle-2-base-path`. Ships **inactive**: with `BASE_PATH` unset nothing below
+changes, proved byte-for-byte against the Bundle-1 baseline.
+
+**0. Lineage check (Git safety rule 1) — PASS.** `main` `161b80e` (2026-08-01) is the
+newest lineage and is a descendant of every other local branch: `replit-agent`
+`18fc536`, `store-first-discovery-longtail` `d3dfaeb`, `snapshot-2026-07-30` `9cd17f3`,
+`claude/google-ad-transparency-scraper-tzi7js` `fdd5b27`, `bundle-1-url-centralization`
+`161b80e` (identical). `origin/main` is level with `main` — Bundle 1 did reach GitHub.
+Branch cut from `main`.
+
+**1. Blast radius (recorded before the first edit)**
+
+*Files to be touched — 5 code + 2 docs:*
+
+| File | Change |
+|---|---|
+| `artifacts/dashboard/vite.config.ts` | set `base` from `BASE_PATH`, validated through the existing `normalizeBase` in `src/config.ts` so an invalid value fails the build instead of being stamped into asset URLs |
+| `artifacts/api-server/src/urls.ts` | per-app cookie name when prefixed; pure `bareBasePathRedirect()` and `spaFallback()` decisions; **fix `buildPublicUrl` composition** (see below); prefix/PUBLIC_URL agreement check; new unit assertions |
+| `artifacts/api-server/src/index.ts` | bare-prefix redirect middleware; static mount at the prefix; prefix-scoped SPA catch-all |
+| `.env.example` | document `BASE_PATH` and the `PUBLIC_BASE_URL` naming trap |
+| `TODO.md` | this entry |
+
+*Not touched:* `db.ts`, every scraper and pipeline, `queue.ts`, `routes-jobs.ts`,
+`notifier.ts`, `oauth.ts` (the redirect-URI **derivation** is deliberately unchanged),
+`auth.ts` (it already re-exports the cookie name and Path from `urls.ts`), the
+`source-code/` mirror, `.replit`, the database, Replit Secrets.
+
+*Behaviours affected:* built asset URLs; the six route mounts + static mount; the SPA
+catch-all's scope; the session cookie's **name and Path**; the composition of emailed
+links; the path half of the OAuth redirect URI. **All six are inert while `BASE_PATH`
+is unset or `/`.**
+
+*Worst realistic failure, in order:*
+1. **Emailed-link composition.** Bundle 1 defined `publicUrl(p) = PUBLIC_URL + prefix + p`.
+   The cutover sets `PUBLIC_URL=https://tools.mobupps.net/leadfinder`, which **already
+   contains the prefix** — so that formula emits `…/leadfinder/leadfinder/api/…` and
+   every result link ever emailed after cutover 404s. Must be fixed in this bundle.
+   Same defect on the `PUBLIC_URL` fallback branch of the OAuth redirect URI.
+2. **Cookie name/Path drift.** If `Set-Cookie` and the clear-cookie disagree on either
+   name or Path, logout stops clearing the session and the user cannot sign out.
+3. **A self-redirect at the bare prefix.** Registering a route *at* `/leadfinder` makes
+   Express's non-strict routing match `/leadfinder/` too, redirecting it to itself and
+   taking the main page down. Three sibling apps hit this. Structurally prevented here
+   by an exact `req.path === BASE_PATH` compare in plain middleware.
+4. **Dark-mode drift** in the SPA catch-all, which today answers *every* path.
+
+*Rollback:* two independent levers. (a) Leave both env vars unset — every change is
+inert by construction. (b) `git revert` the bundle commits. No DB migration, no deploy
+dependency, no secret change.
+
+*Cutover note (not a defect):* renaming the cookie to `lf_session` **logs every user
+out exactly once**, at cutover, inside the announced downtime window. Old `als_session`
+cookies are left behind at `Path=/` on the old origin and expire on their own.
+
+**2. Implementation** — the blast radius held exactly: 5 code files, 2 docs, nothing else.
+
+| Surface | Unprefixed (today) | Prefixed |
+|---|---|---|
+| Built asset URLs | `/assets/…` | `/leadfinder/assets/…` (Vite `base`) |
+| API + static mounts | `/api/…`, `/` | `/leadfinder/api/…`, `/leadfinder` |
+| SPA fallback | `app.get('*')`, unchanged | `app.use(BASE_PATH, …)`, scoped |
+| Bare prefix | n/a — middleware not registered | `302` → `/leadfinder/` |
+| Session cookie | `als_session; Path=/` | `lf_session; Path=/leadfinder/` |
+| Emailed links | `PUBLIC_URL + path` | `PUBLIC_URL + path` (PUBLIC_URL carries the prefix) |
+| OAuth callback | `<host>/api/auth/google/callback` | `<host>/leadfinder/api/auth/google/callback` |
+
+Three decisions worth their own line:
+
+- **The two arms of the SPA fallback are separate branches on purpose.** Unprefixed, this
+  app answers `index.html` on *every* path including missing assets, and the darkness rule
+  makes that the contract. Only the prefixed arm gets the honest 404. Darkness is therefore
+  structural — the new code is not *registered* when `BASE_PATH` is unset — rather than a
+  claim that two code paths happen to agree.
+- **The bare-prefix redirect is plain middleware doing `req.path === BASE_PATH`.** A route
+  registered at the bare prefix would also match the trailing-slash form (Express routing is
+  non-strict) and redirect it to itself. `bare(prefix, bare(prefix, x))` is `null` for every
+  `x`, so a second hop cannot exist — asserted in the unit suite and over real HTTP.
+- **`app.use(BASE_PATH, …)`, never `app.get(BASE_PATH + '/*')`.** This repo runs Express
+  **4.22.2**, where both work; Express 5 rejects the wildcard string at registration. Mount
+  matching is stable across both. (The unprefixed arm still carries the old `app.get('*')` —
+  see O-13.)
+
+**3. Gates** — all green.
+
+| Gate | Command | Before | After |
+|---|---|---|---|
+| typecheck + build | `pnpm build` | pass | pass |
+| tests | `pnpm --filter api-server test` | 30 modules, 921 assertions | 30 modules, **927** assertions, 0 failed |
+| `urls` unit suite | (inside the above) | 206 | **212** assertions |
+
+`dist/index.html` is md5-identical (`d004b92d…`, 702 B) to the pre-bundle build with
+`BASE_PATH` unset — the frontend change is provably inert.
+
+New unit assertions pin: path joining in both modes; PUBLIC_URL/BASE_PATH composition
+(the prefix appears exactly once); the boot refusal matrix; cookie naming and scoping
+including an **RFC 6265 §5.1.4 path-match oracle** (the cookie reaches every prefixed
+path we serve, and is never sent to the gateway root, a sibling tool, or a
+prefix-lookalike); the bare-prefix redirect in **both** modes including the anti-loop and
+one-hop properties; and the SPA fallback decision table.
+
+**4. Godlike audit — closed on a clean round (5 rounds)**
+
+*Round 1 — 1 finding, security, confirmed by probe.* `PUBLIC_BASE_URL=https://tools.mobupps.net%40evil.com/leadfinder`
+passed validation. It does **not** reach `evil.com` — the WHATWG host parser percent-decodes
+`%40` to `@`, a forbidden domain code point, and refuses the URL outright, which is exactly
+why it slipped through: `new URL()` threw, so the validator filed it as a harmless *relative*
+value. Impact is not origin theft but silence: every emailed link would go out unopenable.
+**Fixed:** while prefixed, `PUBLIC_BASE_URL` must be an absolute http(s) URL — behind a
+gateway there is no legitimate relative public base. Unprefixed behaviour is untouched, so
+today's deploy cannot start failing whatever the secret holds.
+
+*Round 2 — 1 finding, operational.* Nothing detected a **dist built without the prefix being
+served with one** — the single most likely cutover mistake, and its symptom is a blank page
+for every user with nothing in the logs. **Fixed:** at boot, while prefixed only, the served
+`index.html` is scanned for rooted asset refs outside the mount and the mismatch is named in
+the log. Proved by a negative test: a LIT server over the DARK dist trips the detector and
+404s both assets.
+
+Also tightened in this round: the PUBLIC_URL↔BASE_PATH agreement check moved from `endsWith`
+to **exact equality**, because `endsWith` waved through the mirror-image mistake
+(`…/leadfinder/leadfinder`) that the check exists to stop.
+
+*Round 3 — clean.* Verified by probe rather than by reading: Express really does strip the
+mount before the fallback sees `req.path` (the dotted-API-path discriminator), the API mount
+wins over the catch-all, `POST` to a non-route is not swallowed, `HEAD` matches `GET`, and
+seven raw-socket traversal attempts (`..`, `%2e%2e`, `..%2f`, `..%5c`) disclose nothing.
+
+*Round 4 — 1 finding, documentation.* The `assertPublicUrlCarriesPrefix` doc still described
+`endsWith` after round 2 changed it to equality. Fixed.
+
+*Round 5 — clean.* Full re-run: 927 unit assertions, 317 security assertions, 14/14 boot
+cases, 112 client-config assertions, 40/40 DARK checks, 60/60 LIT checks.
+
+**Security framing — `new URL()` as the oracle throughout, never a string-shape check.**
+Bundle 2 hands `BASE_PATH` four sinks Bundle 1 did not have (a `Location` header, a
+`Set-Cookie` `Path`, an Express mount string, and — through Vite — an `src`/`href` attribute
+in every built page), so both Bundle-1 fixes were re-proved with the prefix **active**:
+
+- **No `BASE_PATH` value can break out of an HTML attribute.** 47 hostile shapes refused,
+  including RTL-override and zero-width-space homographs. Every value the allowlist *does*
+  accept was then pushed through all four sinks and asserted inert: no attribute-breaking
+  character, no `CR`/`LF` in a `Location`, no `;`/`,` in a cookie `Path`, no route-pattern
+  metacharacter in a mount string. What JS `trim()` silently eats (trailing space, NBSP) is
+  now pinned rather than assumed.
+- **No `PUBLIC_URL` with userinfo can redirect emailed links to another origin.** Userinfo,
+  protocol-relative, backslash, non-http(s), query/fragment and control-character forms all
+  refused on the real boot path (`normalizePublicUrl` → `assertPublicUrlCarriesPrefix`), and
+  every accepted value oracle-checked to stay on its own origin under every path we emit.
+- **The renamed cookie is never scoped wider than `BASE_PATH`.** `Path` is
+  `joinBasePath(prefix, '/')` = `/leadfinder/`, asserted `startsWith(prefix)` and `!== '/'`
+  for every legal prefix, plus the RFC 6265 path-match oracle above. Flags unchanged:
+  `HttpOnly; Secure; SameSite=Lax; Max-Age=2592000`.
+- **Boot refuses 8 misconfigurations and accepts 6 legitimate ones**, 14/14 as specified —
+  including the cutover pair, and including every unprefixed shape today's production could
+  possibly be in.
+
+**5. Smoke — two runs, both required, both green**
+
+Same safety envelope as Bundle 1: the harness assembles the same Express app from the same
+routers **without `startQueue()`**, so no scraper is dispatched and no email is sent; it runs
+from a throwaway cwd so `db.ts`'s `path.resolve('data')` makes a fresh sqlite file; it binds
+`127.0.0.1` on ports 3954/3955/3956, outside `.replit`'s mapped set. **Real database md5
+`e689c6fc…` identical before and after every run. The running workflow was never touched
+(none was running). No secret was written — the LIT env existed only for the child process.**
+
+*a. DARK (both env vars unset) — 40/40 checks, and the 17-probe endpoint table is
+**byte-for-byte identical** to the baseline recorded in the Bundle 1 ledger.* Same md5,
+`diff` clean, including `Set-Cookie=als_session=<TOK>; Path=/` and both 702-byte SPA
+responses.
+
+*b. LIT (`BASE_PATH=/leadfinder/`, `PUBLIC_BASE_URL=https://tools.mobupps.net/leadfinder`) —
+60/60 checks:*
+
+| Requirement | Result |
+|---|---|
+| main page at `/leadfinder/` | 200, 724 B |
+| deep links hard-load | `/leadfinder/some/deep/link`, `/leadfinder/jobs/deep/link` → 200 html |
+| zero asset 404s | every `src`/`href` in the served `index.html` → 200, all under the prefix |
+| a missing asset 404s | `/leadfinder/assets/definitely-not-here.js` → **404**, not 200 index.html |
+| API under the prefix | all 17 probes 200/401 as specified at `/leadfinder/api/…` |
+| bare prefix | `/leadfinder` → **302** `Location: /leadfinder/`; query preserved (`?a=1&b=2`) |
+| …and no loop | `/leadfinder/` → **200**, not another 302; chain-followed: **exactly 1 hop** |
+| session cookie | `lf_session=…; Path=/leadfinder/; HttpOnly; Secure; SameSite=Lax; Max-Age=2592000`; clear-cookie matches on name **and** Path |
+| download authenticates and serves | `/leadfinder/api/jobs/<id>/csv` + cookie → 200 with the file bytes and `Content-Disposition`; anonymous → 401; **no token in the URL** |
+| polling endpoints | job detail and job list under the prefix; counter 7→41, bar 12→63, step log 1→2 rows **across successive polls** |
+| OAuth redirect URI | exactly one prefix, for both gateway hosts (recorded above) |
+| nothing outside the mount | `/api/health`, `/`, `/some/deep/link`, `/assets/index.js` → 404 |
+
+A **long-running job's progress was simulated by moving the durable row** (`setJobPhase`,
+`setJobLeadsFound`, `setJobProgress`, `appendLog`) and re-polling through the prefixed
+endpoints — the same columns a real pipeline writes — because the queue is deliberately not
+started. What is proved is the transport under the prefix, not the scraper.
+
+*Emailed links* were verified through `publicUrl()` directly rather than by sending: the
+three private helpers in `notifier.ts` are one-line wrappers over it. All three resolve to
+`https://tools.mobupps.net/leadfinder/…`, one prefix, our origin.
+
+**Two behaviour deltas under the prefix, both deliberate, both recorded:**
+1. A missing asset returns 404 instead of 200 `index.html`. That is the requirement.
+2. `OPTIONS` on a non-route returns 404 (prefixed) vs 200 `Allow: GET,HEAD` (unprefixed) —
+   Express answers `OPTIONS` from its route table, and the two fallback arms register
+   differently. Same-origin requests never preflight and nothing in the SPA or the gateway
+   sends `OPTIONS`, so this is inert; noted so it is a known property, not a surprise.
+
+**6. Client half, proved on the real module.** `dashboard/src/config.ts` was compiled the way
+Vite compiles it (base defined in) and executed for both bases: all **21** SPA paths are the
+identity at `/`, all correctly prefixed at `/leadfinder/`, none double-prefixed or
+protocol-relative, and five hostile bases throw at module load.
+
+**An invalid `BASE_PATH` fails the build, loudly, before anything is written.** Confirmed
+explicitly: `BASE_PATH="/a'onmouseover=alert(1)"` exits 1 with
+`BasePathError: base segment … is not alphanumeric with . _ - inside` at config-load, no
+output directory is created, and the existing `dist` is md5-unchanged. Same for `//evil.com`
+and `/leadfinder/../evil`.
+
+**7. `artifact.toml` — re-confirmed absent.** `find` over the repo (excluding `node_modules`)
+returns **0** files. No routing table, health path or build pin to change. `.replit` carries
+the deployment config, and this bundle did not touch it (but see O-9).
+
+**8. Auto-fix** — both in-scope findings fixed and re-audited; O-7 (SPA catch-all under the
+prefix) is **closed by this bundle** and removed from Open items. Six new out-of-scope items
+recorded as O-9…O-14 and left untouched.
 
 ---
 

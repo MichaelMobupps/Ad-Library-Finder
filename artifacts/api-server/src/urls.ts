@@ -15,6 +15,21 @@
  *     which is the exact expression notifier.ts and oauth.ts used inline.
  * So publicUrl('/api/jobs/x/csv') === `${base}/api/jobs/x/csv`, unchanged.
  *
+ * Bundle 2 makes the prefix live. Every switched value below is guarded on a
+ * non-empty PREFIX, so "BASE_PATH unset" remains the identity in all of them:
+ * the cookie name, the bare-prefix redirect and the SPA fallback are each
+ * structurally inert at the default rather than merely equal to it.
+ *
+ * HOW THE TWO VARS COMPOSE (Bundle 2)
+ * PUBLIC_URL is this app's FULL public base and already contains the prefix —
+ * at cutover the pair is set together as
+ *   BASE_PATH=/leadfinder  PUBLIC_BASE_URL=https://tools.mobupps.net/leadfinder
+ * so an absolute link is PUBLIC_URL + path, NOT PUBLIC_URL + prefix + path.
+ * Adding the prefix a second time would email everyone
+ * ".../leadfinder/leadfinder/api/jobs/<id>/csv". The two are checked against
+ * each other at load (assertPublicUrlCarriesPrefix) so a half-configured
+ * deploy fails loudly instead of quietly emitting dead links.
+ *
  * SECURITY
  * Both env vars are operator-supplied and both end up inside links we email and
  * inside redirect targets. Hostile shapes are refused at module load rather than
@@ -192,15 +207,151 @@ export function joinBasePath(prefix: string, p: string): string {
 }
 
 /**
- * Build an absolute (or, when PUBLIC_URL is empty, relative) URL for a rooted path.
- * Mirrors the old `${base}${path}` concatenation exactly.
+ * Build an absolute (or, when PUBLIC_URL is empty, rooted) URL for a rooted path.
+ *
+ * PUBLIC_URL is the app's full public base and ALREADY carries the prefix (see
+ * the header note), so the prefix is applied to exactly one of the two halves:
+ *   - PUBLIC_URL set   -> `${PUBLIC_URL}${p}`      (prefix comes from PUBLIC_URL)
+ *   - PUBLIC_URL empty -> joinBasePath(prefix, p)  (prefix comes from BASE_PATH)
+ *
+ * Both branches are byte-identical to the old `${base}${path}` at the default,
+ * where prefix is '' and joinBasePath is the identity.
  */
 export function buildPublicUrl(publicUrl: string, prefix: string, p: string): string {
-  return `${publicUrl}${joinBasePath(prefix, p)}`;
+  if (publicUrl === '') return joinBasePath(prefix, p);
+  if (!p.startsWith('/')) {
+    throw new UrlConfigError(`path must be rooted, got ${JSON.stringify(p)}`);
+  }
+  return `${publicUrl}${p}`;
+}
+
+/**
+ * Refuse a configuration where a prefix is active but PUBLIC_URL does not name
+ * it. Such a deploy serves fine and emails links that 404 — the failure lands
+ * days later in someone's inbox, which is the worst place to discover it.
+ *
+ * Enforced ONLY while a prefix is active, so nothing about today's unprefixed
+ * deploy can start failing: whatever PUBLIC_BASE_URL holds now keeps behaving
+ * exactly as it does. Empty is allowed and warned about elsewhere — that is the
+ * pre-existing O-1 state, and refusing to boot over it would turn a long-
+ * standing wart into an outage.
+ *
+ * Two shapes are refused:
+ *   - a non-empty value that is not an absolute http(s) URL. Behind a gateway
+ *     there is no such thing as a legitimate relative public base, so this is
+ *     always a typo. `https://host%40evil.com/leadfinder` is the motivating
+ *     case: the WHATWG host parser rejects it outright (so it can never reach
+ *     another origin — but it can never be OPENED either), and every emailed
+ *     link would go out silently unclickable.
+ *   - an absolute URL whose path is not EXACTLY the prefix — which covers both
+ *     the missing-prefix and the double-prefix mistake.
+ */
+export function assertPublicUrlCarriesPrefix(publicUrl: string, prefix: string): void {
+  if (prefix === '' || publicUrl === '') return;
+
+  let parsed: URL | null = null;
+  try {
+    parsed = new URL(publicUrl);
+  } catch {
+    parsed = null;
+  }
+  if (!parsed || !ALLOWED_PROTOCOLS.has(parsed.protocol)) {
+    throw new UrlConfigError(
+      `PUBLIC_BASE_URL ${JSON.stringify(publicUrl)} is not an absolute http(s) URL, and ` +
+        `BASE_PATH ${JSON.stringify(prefix)} is set. Behind a gateway the public base must ` +
+        `be absolute or every emailed link is unusable, e.g. "https://tools.example.com${prefix}".`,
+    );
+  }
+
+  // EXACT equality, not endsWith. The gateway forwards the prefix intact, so
+  // the public path and the mount are the same string; anything else is a
+  // typo. endsWith would wave through the mirror-image mistake — a
+  // hand-written ".../leadfinder/leadfinder" — which is precisely the
+  // double-prefix this check exists to stop.
+  const pathname = parsed.pathname.replace(/\/+$/, '');
+  if (pathname !== prefix) {
+    throw new UrlConfigError(
+      `PUBLIC_BASE_URL ${JSON.stringify(publicUrl)} has path ${JSON.stringify(pathname || '/')} ` +
+        `but BASE_PATH is ${JSON.stringify(prefix)}. They are set together at cutover: ` +
+        `PUBLIC_BASE_URL is this app's full public base and its path must be exactly the ` +
+        `mount, e.g. "https://tools.example.com${prefix}".`,
+    );
+  }
+}
+
+/**
+ * Name of the session cookie for a given prefix.
+ *
+ * Unprefixed the app keeps the name it has always set. Once mounted under a
+ * shared gateway the four tools sit on one origin and one cookie namespace, so
+ * a generic name would let whichever tool wrote last clobber the others; the
+ * name becomes per-app at the same moment the Path narrows.
+ */
+export function sessionCookieName(prefix: string): string {
+  return prefix === '' ? 'als_session' : 'lf_session';
+}
+
+/**
+ * Location for the bare-prefix redirect, or null to leave the request alone.
+ *
+ * "/leadfinder" must reach "/leadfinder/" or the SPA loads with a broken
+ * relative asset base. The obvious implementation — registering a route at the
+ * bare prefix — is a trap: Express routing is non-strict, so a route at
+ * "/leadfinder" ALSO matches "/leadfinder/", and the handler then redirects the
+ * trailing-slash form to itself. Three sibling apps took their main page down
+ * that way.
+ *
+ * This compares the full request path for EXACT equality with the prefix, so
+ * "/leadfinder/" can never match and the loop is structurally impossible, not
+ * merely avoided. `bare(prefix, bare(prefix, x))` is null for every x — a
+ * second hop cannot exist. Returns null for the whole default configuration.
+ *
+ * `search` is the request's raw query string (leading "?", or empty). It is
+ * carried across so the redirect loses nothing, and it cannot affect the
+ * decision or the origin: the path half is a fixed literal built from the
+ * validated prefix, so the result always starts with "/<prefix>/".
+ */
+export function bareBasePathRedirect(
+  prefix: string,
+  reqPath: string,
+  search = '',
+): string | null {
+  if (prefix === '') return null;
+  if (reqPath !== prefix) return null;
+  return `${prefix}/${search}`;
+}
+
+/**
+ * Whether the prefix-scoped SPA fallback should answer with index.html.
+ *
+ * `mountRelPath` is the request path with the mount prefix already stripped by
+ * Express (so "/leadfinder/api/jobs/x" arrives as "/api/jobs/x").
+ *
+ *  - Non-GET/HEAD passes through, exactly as today's `app.get('*')` does.
+ *  - Anything under /api passes the decision through unchanged, so an unmatched
+ *    API path keeps returning what it returns today (the API routers are
+ *    mounted first and therefore still win).
+ *  - A request whose last segment looks like a file reached this point only
+ *    because express.static did not have it. It is a MISSING ASSET: answer 404
+ *    rather than 200 index.html, which is how a bad asset path masquerades as a
+ *    working page.
+ *  - Everything else is a deep link -> index.html.
+ */
+export function spaFallbackServesIndex(method: string, mountRelPath: string): boolean {
+  if (method !== 'GET' && method !== 'HEAD') return false;
+  const isApi = mountRelPath === '/api' || mountRelPath.startsWith('/api/');
+  if (!isApi) {
+    const last = mountRelPath.slice(mountRelPath.lastIndexOf('/') + 1);
+    if (last.includes('.')) return false;
+  }
+  return true;
 }
 
 /** Internal prefix: '' by default, else e.g. '/leadfinder'. */
 const PREFIX = normalizeBasePath(process.env.BASE_PATH);
+
+/** True once the app is mounted under a prefix. Every Bundle 2 switch keys off this. */
+export const IS_PREFIXED: boolean = PREFIX !== '';
 
 /** The mount prefix as a path. Default '/'. */
 export const BASE_PATH: string = PREFIX === '' ? '/' : PREFIX;
@@ -211,8 +362,26 @@ export const BASE_PATH: string = PREFIX === '' ? '/' : PREFIX;
  */
 export const PUBLIC_URL: string = normalizePublicUrl(process.env.PUBLIC_BASE_URL);
 
-/** Name of the session cookie. Bundle 2 makes this per-app. */
-export const SESSION_COOKIE_NAME = 'als_session';
+assertPublicUrlCarriesPrefix(PUBLIC_URL, PREFIX);
+
+/**
+ * The env var is PUBLIC_BASE_URL, not PUBLIC_URL — a legacy name Bundle 1 kept
+ * deliberately. The migration's own runbook calls it PUBLIC_URL, so an operator
+ * setting that name would get silently empty links (open item O-1's failure
+ * mode) instead of an error. Say so, loudly, at the only moment it matters.
+ */
+export const PUBLIC_URL_ENV_MISNAMED: boolean =
+  !process.env.PUBLIC_BASE_URL && !!process.env.PUBLIC_URL;
+
+/**
+ * Prefixed, but with no public address to build absolute links from. Not fatal
+ * — it is exactly the state O-1 describes and predates this bundle — but behind
+ * a gateway it means every emailed result link goes out as a bare rooted path.
+ */
+export const PUBLIC_URL_MISSING_WHILE_PREFIXED: boolean = IS_PREFIXED && PUBLIC_URL === '';
+
+/** Name of the session cookie — per-app once mounted under a prefix. */
+export const SESSION_COOKIE_NAME: string = sessionCookieName(PREFIX);
 
 /** Path attribute for the session cookie — scoped to the mount. Default '/'. */
 export const COOKIE_PATH: string = joinBasePath(PREFIX, '/');
@@ -273,11 +442,162 @@ export function runUrlsTests(): { passed: number; failed: number; failures: stri
   check(normalizeBasePath('  /leadfinder  ') === '/leadfinder', 'surrounding space trimmed');
   check(joinBasePath('/leadfinder', '/api/jobs') === '/leadfinder/api/jobs', 'prefixed join');
   check(joinBasePath('/leadfinder', '/') === '/leadfinder/', 'prefixed root keeps a slash');
+
+  // ---- PUBLIC_URL / BASE_PATH composition: the prefix appears EXACTLY once ----
+  // Cutover shape: PUBLIC_BASE_URL already carries the prefix, so buildPublicUrl
+  // must not add it a second time.
   check(
-    buildPublicUrl('https://g.example.com', '/leadfinder', '/api/jobs/x/csv') ===
+    buildPublicUrl('https://g.example.com/leadfinder', '/leadfinder', '/api/jobs/x/csv') ===
       'https://g.example.com/leadfinder/api/jobs/x/csv',
-    'prefixed absolute link',
+    'prefixed absolute link carries the prefix exactly once',
   );
+  check(
+    buildPublicUrl('https://g.example.com/leadfinder', '/leadfinder', '/#/jobs/x') ===
+      'https://g.example.com/leadfinder/#/jobs/x',
+    'prefixed emailed job link carries the prefix exactly once',
+  );
+  for (const p of ['/api/jobs/x/csv', '/api/jobs/x/hq-zip', '/#/jobs/x', '/api/auth/google/callback']) {
+    const link = buildPublicUrl('https://g.example.com/leadfinder', '/leadfinder', p);
+    const occurrences = link.split('/leadfinder').length - 1;
+    check(occurrences === 1, `${p}: prefix appears once, not ${occurrences} times`);
+    check(new URL(link).origin === 'https://g.example.com', `${p}: stays on our origin`);
+  }
+  // With no PUBLIC_URL the prefix has to come from BASE_PATH instead.
+  check(
+    buildPublicUrl('', '/leadfinder', '/api/jobs/x/csv') === '/leadfinder/api/jobs/x/csv',
+    'empty PUBLIC_URL falls back to a prefixed rooted path',
+  );
+
+  // The two vars must agree, or the deploy refuses to boot.
+  assertPublicUrlCarriesPrefix('', ''); passed++;
+  assertPublicUrlCarriesPrefix('https://g.example.com', ''); passed++;
+  assertPublicUrlCarriesPrefix('', '/leadfinder'); passed++;
+  assertPublicUrlCarriesPrefix('https://g.example.com/leadfinder', '/leadfinder'); passed++;
+  assertPublicUrlCarriesPrefix('https://g.example.com/leadfinder/', '/leadfinder'); passed++;
+  assertPublicUrlCarriesPrefix('example.com', ''); passed++; // unprefixed: untouched, as always
+  throws(
+    () => assertPublicUrlCarriesPrefix('https://g.example.com/leadfinder/leadfinder', '/leadfinder'),
+    'PUBLIC_BASE_URL that already double-prefixes refused',
+  );
+  throws(
+    () => assertPublicUrlCarriesPrefix('https://g.example.com/sub/leadfinder', '/leadfinder'),
+    'PUBLIC_BASE_URL whose path is deeper than the mount refused',
+  );
+  throws(
+    () => assertPublicUrlCarriesPrefix('https://g.example.com', '/leadfinder'),
+    'PUBLIC_BASE_URL without the prefix refused while prefixed',
+  );
+  throws(
+    () => assertPublicUrlCarriesPrefix('https://g.example.com/other', '/leadfinder'),
+    'PUBLIC_BASE_URL naming a different prefix refused',
+  );
+  throws(
+    () => assertPublicUrlCarriesPrefix('https://g.example.com/xleadfinder', '/leadfinder'),
+    'PUBLIC_BASE_URL whose last segment merely ENDS with the prefix refused',
+  );
+  throws(
+    () => assertPublicUrlCarriesPrefix('https://g.example.com/leadfinder/api', '/leadfinder'),
+    'PUBLIC_BASE_URL pointing below the mount refused',
+  );
+  // Behind a gateway there is no legitimate relative public base: a value that
+  // will not parse can only be a typo, and it emails links nobody can open.
+  throws(
+    () => assertPublicUrlCarriesPrefix('example.com', '/leadfinder'),
+    'scheme-less PUBLIC_BASE_URL refused while prefixed',
+  );
+  throws(
+    () => assertPublicUrlCarriesPrefix('https://g.example.com%40evil.com/leadfinder', '/leadfinder'),
+    'PUBLIC_BASE_URL with a percent-encoded @ in the host refused while prefixed',
+  );
+
+  // ---- session cookie: name switches with the mount, Path never widens ----
+  check(sessionCookieName('') === 'als_session', 'unprefixed cookie name unchanged');
+  check(sessionCookieName('/leadfinder') === 'lf_session', 'prefixed cookie name is per-app');
+  check(sessionCookieName('/a/b') === 'lf_session', 'nested prefix also renames');
+  check(joinBasePath('', '/') === '/', 'unprefixed cookie Path is "/"');
+  check(joinBasePath('/leadfinder', '/') === '/leadfinder/', 'prefixed cookie Path is the mount');
+  for (const prefix of ['/leadfinder', '/a/b']) {
+    const cookiePath = joinBasePath(prefix, '/');
+    check(cookiePath.startsWith(prefix), `cookie Path ${cookiePath} is never wider than ${prefix}`);
+    check(cookiePath !== '/', `cookie Path ${cookiePath} is not the whole origin`);
+    // RFC 6265 §5.1.4 path-match, as the browser applies it. The cookie must
+    // reach every path we serve and nothing outside the mount.
+    const pathMatches = (reqPath: string) =>
+      reqPath === cookiePath ||
+      (reqPath.startsWith(cookiePath) &&
+        (cookiePath.endsWith('/') || reqPath[cookiePath.length] === '/'));
+    check(pathMatches(`${prefix}/api/jobs/x/csv`), 'cookie reaches prefixed download URLs');
+    check(pathMatches(`${prefix}/api/me`), 'cookie reaches prefixed API calls');
+    check(pathMatches(`${prefix}/`), 'cookie reaches the app root');
+    check(!pathMatches('/'), 'cookie is NOT sent to the gateway root');
+    check(!pathMatches('/other/api/me'), 'cookie is NOT sent to a sibling tool');
+    check(!pathMatches(`${prefix}x/api/me`), 'cookie is NOT sent to a prefix-lookalike path');
+  }
+
+  // ---- bare-prefix redirect: one hop, and a self-loop is impossible ----
+  check(bareBasePathRedirect('', '/') === null, 'unprefixed: root is left alone');
+  check(bareBasePathRedirect('', '/leadfinder') === null, 'unprefixed: nothing ever redirects');
+  check(bareBasePathRedirect('', '/api/jobs') === null, 'unprefixed: API paths untouched');
+  check(
+    bareBasePathRedirect('/leadfinder', '/leadfinder') === '/leadfinder/',
+    'bare prefix redirects to the trailing-slash form',
+  );
+  // THE loop guard. A route registered at the bare prefix would match this too.
+  check(
+    bareBasePathRedirect('/leadfinder', '/leadfinder/') === null,
+    'trailing-slash form does NOT redirect (no self-loop)',
+  );
+  check(
+    bareBasePathRedirect('/leadfinder', bareBasePathRedirect('/leadfinder', '/leadfinder')!) === null,
+    'the redirect target does not itself redirect — exactly one hop, ever',
+  );
+  check(bareBasePathRedirect('/leadfinder', '/leadfinder/api/me') === null, 'API paths pass through');
+  check(bareBasePathRedirect('/leadfinder', '/leadfinderX') === null, 'prefix-lookalike untouched');
+  check(bareBasePathRedirect('/leadfinder', '/') === null, 'origin root is not ours to redirect');
+  check(bareBasePathRedirect('/leadfinder', '/other') === null, 'sibling tool path untouched');
+  check(
+    bareBasePathRedirect('/leadfinder', '/leadfinder', '?a=1') === '/leadfinder/?a=1',
+    'the query string survives the redirect',
+  );
+  {
+    // A hostile query may not move the target off our origin, and may not turn
+    // the redirect into a second hop.
+    const origin = 'https://self.example.com';
+    for (const search of [
+      '',
+      '?a=1',
+      '?next=//evil.com',
+      '?next=https://evil.com',
+      '?a=%2F%2Fevil.com',
+      '?a=b#/../..',
+    ]) {
+      const target = bareBasePathRedirect('/leadfinder', '/leadfinder', search)!;
+      check(target.startsWith('/leadfinder/'), `target stays under the mount for ${search || '(none)'}`);
+      check(!target.startsWith('//'), `target is not protocol-relative for ${search || '(none)'}`);
+      check(!BACKSLASH.test(target), `target has no backslash for ${search || '(none)'}`);
+      const resolved = new URL(target, origin);
+      check(resolved.origin === origin, `target stays same-origin for ${search || '(none)'}`);
+      check(resolved.pathname === '/leadfinder/', `target path is exactly the mount for ${search || '(none)'}`);
+      check(
+        bareBasePathRedirect('/leadfinder', resolved.pathname) === null,
+        `no second hop for ${search || '(none)'}`,
+      );
+    }
+  }
+
+  // ---- SPA fallback: deep links yes, missing assets no, API untouched ----
+  check(spaFallbackServesIndex('GET', '/') === true, 'root serves the SPA');
+  check(spaFallbackServesIndex('GET', '/jobs/abc') === true, 'deep link serves the SPA');
+  check(spaFallbackServesIndex('HEAD', '/jobs/abc') === true, 'HEAD deep link serves the SPA');
+  check(spaFallbackServesIndex('GET', '/assets/missing.js') === false, 'missing asset 404s honestly');
+  check(spaFallbackServesIndex('GET', '/favicon.ico') === false, 'missing icon 404s honestly');
+  check(spaFallbackServesIndex('POST', '/jobs/abc') === false, 'POST falls through, as app.get("*") did');
+  check(spaFallbackServesIndex('PUT', '/') === false, 'PUT falls through');
+  check(spaFallbackServesIndex('GET', '/api/nope') === true, 'unmatched API path answers as it does today');
+  check(spaFallbackServesIndex('GET', '/api') === true, 'bare /api answers as it does today');
+  check(spaFallbackServesIndex('GET', '/api/x.y') === true, 'API path with a dot is still API');
+  check(spaFallbackServesIndex('GET', '/apiary/x') === true, 'an /api lookalike is a deep link');
+  check(spaFallbackServesIndex('GET', '/apiary/x.js') === false, 'an /api lookalike file still 404s');
 
   // ---- security: BASE_PATH cannot introduce an authority or escape itself ----
   throws(() => normalizeBasePath('//evil.com'), 'BASE_PATH protocol-relative refused');
