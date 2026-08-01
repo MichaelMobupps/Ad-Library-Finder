@@ -2,7 +2,16 @@ import { google, oauth2_v2 } from 'googleapis';
 import { OAuth2Client, Credentials } from 'google-auth-library';
 import type { Request } from 'express';
 import { getGmailTokensForUser, upsertGmailTokens } from './db.js';
+import { basePath, publicUrl, PUBLIC_URL } from './urls.js';
 import { log } from './logger.js';
+
+/**
+ * Path Google redirects back to. Registered in the Google Cloud Console as an
+ * Authorized redirect URI — see TODO.md "External registrations discovered".
+ * Changing the app's address or base path requires adding the new URI there
+ * BEFORE the cutover, or sign-in breaks for everyone.
+ */
+const OAUTH_CALLBACK_PATH = '/api/auth/google/callback';
 
 /**
  * Scopes requested at sign-in:
@@ -33,7 +42,7 @@ function requireEnv(name: string): string {
  *   1. The actual deployed host as seen by Replit's edge proxy
  *      (x-forwarded-proto + x-forwarded-host).
  *   2. Host header on the incoming request.
- *   3. PUBLIC_BASE_URL environment variable (legacy fallback).
+ *   3. PUBLIC_URL from urls.ts (env PUBLIC_BASE_URL — legacy fallback).
  *
  * The authorize-step and token-exchange step MUST produce the same string;
  * because both /api/auth/google and /api/auth/google/callback are hit on
@@ -48,16 +57,15 @@ export function getRedirectUriFromReq(req: Request): string {
   const host = xfHost || hostHeader;
 
   if (host) {
-    return `${proto}://${host}/api/auth/google/callback`;
+    return `${proto}://${host}${basePath(OAUTH_CALLBACK_PATH)}`;
   }
 
-  const base = (process.env.PUBLIC_BASE_URL || '').replace(/\/$/, '');
-  if (!base) {
+  if (!PUBLIC_URL) {
     throw new Error(
       'Cannot determine OAuth redirect URI: no x-forwarded-host / host header and PUBLIC_BASE_URL is not set'
     );
   }
-  return `${base}/api/auth/google/callback`;
+  return publicUrl(OAUTH_CALLBACK_PATH);
 }
 
 export function createOAuthClient(redirectUri?: string): OAuth2Client {

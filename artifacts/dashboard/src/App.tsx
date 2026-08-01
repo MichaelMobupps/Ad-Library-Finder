@@ -70,7 +70,7 @@ function LoginScreen() {
         </div>
         <p className="empty-title">Sign in to continue</p>
         <p className="empty-sub">Access is limited to @mobupps.com Google accounts.</p>
-        <a className="btn primary" href="/api/auth/google" style={{ marginTop: 16, display: 'inline-block' }}>
+        <a className="btn primary" href={api.startGoogleSignInUrl()} style={{ marginTop: 16, display: 'inline-block' }}>
           Sign in with Google
         </a>
       </div>
@@ -822,7 +822,7 @@ function SettingsView({ settings, onChange }: { settings: Settings | null; onCha
           </div>
         ) : (
           <div>
-            <a href="/api/auth/google" className="btn primary">Connect my Gmail</a>
+            <a href={api.startGoogleSignInUrl()} className="btn primary">Connect my Gmail</a>
             <p className="form-hint" style={{ marginTop: 10 }}>
               Re-authorize Google to grant Gmail-send permission. Job completion emails will be sent from your Gmail.
             </p>

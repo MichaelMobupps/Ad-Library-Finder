@@ -10,6 +10,7 @@ import { authRouter } from './routes-auth.js';
 import { settingsRouter } from './routes-settings.js';
 import { prepareStableLibraryClosure } from './browserSetup.js';
 import { startQueue } from './queue.js';
+import { basePath, BASE_PATH, PUBLIC_URL } from './urls.js';
 import { log } from './logger.js';
 import {
   userContextMiddleware,
@@ -45,12 +46,14 @@ async function main() {
   app.use(userContextMiddleware);
 
   // ---- Public routes ----
-  app.use('/api/health', healthRouter);
-  app.use('/version', versionRouter);
-  app.use('/api/auth', authRouter);
+  // Mount paths resolve through urls.ts: with BASE_PATH unset basePath() is the
+  // identity, so these are the same strings the app has always mounted.
+  app.use(basePath('/api/health'), healthRouter);
+  app.use(basePath('/version'), versionRouter);
+  app.use(basePath('/api/auth'), authRouter);
 
   // ---- /api/me — returns current user or 401 (used by SPA to detect login) ----
-  app.get('/api/me', (req: Request, res: Response) => {
+  app.get(basePath('/api/me'), (req: Request, res: Response) => {
     const user = (req as RequestWithUser).user;
     if (!user) return res.status(401).json({ error: 'not signed in' });
     res.json({
@@ -62,13 +65,17 @@ async function main() {
   });
 
   // ---- Protected API routes ----
-  app.use('/api/jobs', requireAuth, jobsRouter);
-  app.use('/api/settings', requireAuth, settingsRouter);
+  app.use(basePath('/api/jobs'), requireAuth, jobsRouter);
+  app.use(basePath('/api/settings'), requireAuth, settingsRouter);
 
   // ---- Static SPA (login screen + app — SPA decides which to show via /api/me) ----
   const dashboardDist = path.resolve(__dirname, '../../dashboard/dist');
   if (existsSync(dashboardDist)) {
-    app.use(express.static(dashboardDist));
+    // basePath('/') is '/' by default, and app.use('/', h) === app.use(h).
+    app.use(basePath('/'), express.static(dashboardDist));
+    // NOTE: the catch-all stays '*' in this bundle. Scoping the SPA fallback to
+    // the prefix is Bundle 2 work (ROADMAP: "SPA catch-all under prefix") and
+    // changing it here would alter routing today.
     app.get('*', (_req, res) => {
       res.sendFile(path.join(dashboardDist, 'index.html'));
     });
@@ -81,6 +88,8 @@ async function main() {
   const port = Number(process.env.PORT) || 3001;
   app.listen(port, '0.0.0.0', () => {
     log.info(`api-server listening on :${port}`);
+    // Resolved URL config, so a cutover can be confirmed from the logs alone.
+    log.info(`url config: BASE_PATH=${BASE_PATH} PUBLIC_URL=${PUBLIC_URL || '(unset)'}`);
   });
 }
 

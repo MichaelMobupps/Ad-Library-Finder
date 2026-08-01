@@ -1,3 +1,5 @@
+import { apiPath } from '../config';
+
 export type ProductType = 'mobile' | 'cps';
 export type JobStatus = 'pending' | 'running' | 'completed' | 'failed' | 'deferred' | 'cancelled';
 export type JobSource = 'meta' | 'affplus' | 'appgoblin' | 'google_ads' | 'store_first';
@@ -255,48 +257,48 @@ async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
-  health: () => fetchJson<{ ok: boolean }>('/api/health'),
+  health: () => fetchJson<{ ok: boolean }>(apiPath('/api/health')),
 
   // ---- auth / me ----
-  getMe: () => fetchJson<Me>('/api/me'),
-  logout: () => fetchJson<{ ok: boolean }>('/api/auth/logout', { method: 'POST' }),
-  startGoogleSignInUrl: () => '/api/auth/google',
+  getMe: () => fetchJson<Me>(apiPath('/api/me')),
+  logout: () => fetchJson<{ ok: boolean }>(apiPath('/api/auth/logout'), { method: 'POST' }),
+  startGoogleSignInUrl: () => apiPath('/api/auth/google'),
 
   // ---- jobs ----
-  listJobs: () => fetchJson<{ jobs: Job[] }>('/api/jobs').then((r) => r.jobs),
+  listJobs: () => fetchJson<{ jobs: Job[] }>(apiPath('/api/jobs')).then((r) => r.jobs),
 
-  getJob: (id: string) => fetchJson<{ job: Job; logs: JobLog[] }>(`/api/jobs/${id}`),
+  getJob: (id: string) => fetchJson<{ job: Job; logs: JobLog[] }>(apiPath(`/api/jobs/${id}`)),
 
   createJobs: (opts: CreateJobOptions) =>
-    fetchJson<{ jobs: Job[] }>('/api/jobs', {
+    fetchJson<{ jobs: Job[] }>(apiPath('/api/jobs'), {
       method: 'POST',
       body: JSON.stringify(opts),
     }),
 
   /** Stop a running/pending job. Partial results are kept. */
   stopJob: (id: string) =>
-    fetchJson<{ job: Job }>(`/api/jobs/${id}/stop`, { method: 'POST' }).then((r) => r.job),
+    fetchJson<{ job: Job }>(apiPath(`/api/jobs/${id}/stop`), { method: 'POST' }).then((r) => r.job),
 
   /** Re-queue a stopped/failed job under the same id — it continues where the
    *  durable state left off (store_first resumes exactly; others replay safely). */
   resumeJob: (id: string) =>
-    fetchJson<{ job: Job }>(`/api/jobs/${id}/resume`, { method: 'POST' }).then((r) => r.job),
+    fetchJson<{ job: Job }>(apiPath(`/api/jobs/${id}/resume`), { method: 'POST' }).then((r) => r.job),
 
   /** Admin only: every user's jobs, for the Activity view. */
-  activity: () => fetchJson<{ jobs: ActivityJob[] }>('/api/jobs/activity').then((r) => r.jobs),
+  activity: () => fetchJson<{ jobs: ActivityJob[] }>(apiPath('/api/jobs/activity')).then((r) => r.jobs),
 
-  csvUrl: (id: string) => `/api/jobs/${id}/csv`,
-  hqZipUrl: (id: string) => `/api/jobs/${id}/hq-zip`,
+  csvUrl: (id: string) => apiPath(`/api/jobs/${id}/csv`),
+  hqZipUrl: (id: string) => apiPath(`/api/jobs/${id}/hq-zip`),
 
   // ---- appgoblin ----
   appgoblinCategories: () =>
-    fetchJson<{ categories: AppgoblinCategory[] }>('/api/jobs/appgoblin-categories').then((r) => r.categories),
+    fetchJson<{ categories: AppgoblinCategory[] }>(apiPath('/api/jobs/appgoblin-categories')).then((r) => r.categories),
 
   // ---- google ads ----
-  googleAdsMeta: () => fetchJson<GoogleAdsMeta>('/api/jobs/google-ads-verticals'),
+  googleAdsMeta: () => fetchJson<GoogleAdsMeta>(apiPath('/api/jobs/google-ads-verticals')),
 
   // ---- store-first discovery ----
-  storeFirstConfig: () => fetchJson<StoreFirstConfig>('/api/jobs/store-first-config'),
+  storeFirstConfig: () => fetchJson<StoreFirstConfig>(apiPath('/api/jobs/store-first-config')),
 
   /**
    * `params` is a pre-encoded query string of the active Publishers filters —
@@ -305,25 +307,25 @@ export const api = {
    * sits below the cap by score.
    */
   publishers: (params = '') =>
-    fetchJson<PublishersResponse>(`/api/jobs/publishers${params ? `?${params}` : ''}`),
+    fetchJson<PublishersResponse>(apiPath(`/api/jobs/publishers${params ? `?${params}` : ''}`)),
 
   /** `params` is a pre-encoded query string of the active Publishers filters. */
-  publishersCsvUrl: (params = '') => `/api/jobs/publishers.csv${params ? `?${params}` : ''}`,
+  publishersCsvUrl: (params = '') => apiPath(`/api/jobs/publishers.csv${params ? `?${params}` : ''}`),
 
   // ---- settings ----
-  getSettings: () => fetchJson<Settings>('/api/settings'),
+  getSettings: () => fetchJson<Settings>(apiPath('/api/settings')),
 
   setRecipient: (email: string) =>
-    fetchJson<{ defaultRecipient: string | null }>('/api/settings/recipient', {
+    fetchJson<{ defaultRecipient: string | null }>(apiPath('/api/settings/recipient'), {
       method: 'PUT',
       body: JSON.stringify({ email }),
     }),
 
   disconnectGmail: () =>
-    fetchJson<{ ok: boolean }>('/api/settings/disconnect-gmail', { method: 'POST' }),
+    fetchJson<{ ok: boolean }>(apiPath('/api/settings/disconnect-gmail'), { method: 'POST' }),
 
   sendTestEmail: () =>
-    fetchJson<{ ok: boolean }>('/api/settings/test-email', { method: 'POST' }),
+    fetchJson<{ ok: boolean }>(apiPath('/api/settings/test-email'), { method: 'POST' }),
 };
 
 // ---------- phase helpers ----------

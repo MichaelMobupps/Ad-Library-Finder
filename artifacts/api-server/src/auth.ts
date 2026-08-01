@@ -1,8 +1,10 @@
 import type { Request, Response, NextFunction } from 'express';
 import { getSessionUser, UserRow, createSession, deleteSession } from './db.js';
+import { basePath, COOKIE_PATH, SESSION_COOKIE_NAME } from './urls.js';
 
 export const ALLOWED_DOMAIN = 'mobupps.com';
-export const SESSION_COOKIE = 'als_session';
+/** Re-exported from urls.ts so cookie name and Path move together in Bundle 2. */
+export const SESSION_COOKIE = SESSION_COOKIE_NAME;
 export const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 
 /**
@@ -69,15 +71,19 @@ export function readSessionCookie(req: Request): string | null {
 
 /**
  * Build the Set-Cookie header value for a session token.
- * HttpOnly + Secure + SameSite=Lax + Path=/.
+ * HttpOnly + Secure + SameSite=Lax + Path=COOKIE_PATH (default "/").
+ *
+ * Path MUST match buildClearCookie below: a cookie is only overwritten by a
+ * Set-Cookie with the same name AND path, so a mismatch would leave a stale
+ * session cookie that logout cannot clear.
  */
 export function buildSessionCookie(token: string): string {
   const maxAgeSec = Math.floor(SESSION_TTL_MS / 1000);
-  return `${SESSION_COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${maxAgeSec}`;
+  return `${SESSION_COOKIE}=${encodeURIComponent(token)}; Path=${COOKIE_PATH}; HttpOnly; Secure; SameSite=Lax; Max-Age=${maxAgeSec}`;
 }
 
 export function buildClearCookie(): string {
-  return `${SESSION_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0`;
+  return `${SESSION_COOKIE}=; Path=${COOKIE_PATH}; HttpOnly; Secure; SameSite=Lax; Max-Age=0`;
 }
 
 /**
@@ -151,7 +157,7 @@ export function accessRestrictedHtml(deniedEmail: string): string {
     <p>Sign-in is limited to <strong>@${ALLOWED_DOMAIN}</strong> Google accounts.</p>
     <p>The account <code>${safe}</code> is not allowed. No session has been created.</p>
     <p>Sign out of that Google account or switch profiles, then try again.</p>
-    <a class="btn" href="/">Back to login</a>
+    <a class="btn" href="${basePath('/')}">Back to login</a>
   </div>
 </body>
 </html>`;

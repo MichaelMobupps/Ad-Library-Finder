@@ -4,6 +4,7 @@ import { JobRow, setJobNotificationStatus, getUserById, getGmailTokensForUser, a
 import { sendEmailFromUser } from './gmail.js';
 import { getDefaultRecipientForUser } from './settings.js';
 import { withDeadline } from './deadline.js';
+import { publicUrl } from './urls.js';
 import { log } from './logger.js';
 
 /**
@@ -20,19 +21,20 @@ function resolveRecipient(job: JobRow): string | null {
   return null;
 }
 
+// Links that land in someone's inbox and are clicked days later. They resolve
+// through urls.ts so a base-path/public-URL change moves them as one.
+// jobId is interpolated raw, exactly as before — ids are `job_${nanoid(10)}`
+// and URL-safe by construction. See TODO.md for the encoding hardening item.
 function publicJobUrl(jobId: string): string {
-  const base = (process.env.PUBLIC_BASE_URL || '').replace(/\/$/, '');
-  return `${base}/#/jobs/${jobId}`;
+  return publicUrl(`/#/jobs/${jobId}`);
 }
 
 function publicCsvUrl(jobId: string): string {
-  const base = (process.env.PUBLIC_BASE_URL || '').replace(/\/$/, '');
-  return `${base}/api/jobs/${jobId}/csv`;
+  return publicUrl(`/api/jobs/${jobId}/csv`);
 }
 
 function publicHqZipUrl(jobId: string): string {
-  const base = (process.env.PUBLIC_BASE_URL || '').replace(/\/$/, '');
-  return `${base}/api/jobs/${jobId}/hq-zip`;
+  return publicUrl(`/api/jobs/${jobId}/hq-zip`);
 }
 
 function escapeHtml(s: string): string {

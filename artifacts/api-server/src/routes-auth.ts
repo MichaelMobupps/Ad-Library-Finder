@@ -16,6 +16,7 @@ import {
   RequestWithUser,
   ALLOWED_DOMAIN,
 } from './auth.js';
+import { basePath } from './urls.js';
 import { log } from './logger.js';
 
 export const authRouter: Router = Router();
@@ -97,7 +98,9 @@ authRouter.get('/google/callback', async (req: Request, res: Response) => {
 
     log.info(`Sign-in OK: ${email} (user=${user.id})`);
     res.setHeader('Set-Cookie', cookie);
-    res.redirect('/');
+    // Server-side redirect to the app root. basePath() keeps it a same-origin
+    // rooted path — it is never operator-controlled and never carries a token.
+    res.redirect(basePath('/'));
   } catch (err) {
     log.error('OAuth callback failed', err);
     res.status(500).send(`OAuth exchange failed: ${(err as Error).message}`);
