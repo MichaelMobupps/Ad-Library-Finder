@@ -1,9 +1,43 @@
-# TODO — UI Simplification + Background Jobs + Scraper Speedup
+# TODO — Leadfinder
 
 > **Purpose of this file:** durable task record so work can resume if SSH disconnects.
 > **If you are picking this up fresh:** read this whole file, check the ☐/☑ status marks,
 > read the "Repo map" section (filled in during Phase 0), and continue from the first
 > unfinished item. Update status marks as you go.
+>
+> **Two efforts live in this file.** The migration sections below (Open items / External
+> registrations / Ledger) belong to the unified-domain migration defined in `ROADMAP.md`.
+> Everything from "Standing protocol" down is the earlier UI + background-jobs + scraper
+> effort, kept append-only as history. Do not delete it.
+
+---
+
+## Open items
+
+*Live section. Migration work only. Items are removed when closed, not struck through.*
+
+| # | Item | Origin | Status |
+|---|---|---|---|
+| — | *(none yet — Bundle 1 in progress)* | | |
+
+---
+
+## External registrations discovered
+
+*Every place this app's URL is registered with an external service. File and line.
+Bundle 1 records these; it does not change them. Each becomes a cutover item.*
+
+| Service | What is registered | File | Line | Cutover action |
+|---|---|---|---|---|
+| — | *(discovery pending)* | | | |
+
+---
+
+## Ledger
+
+*Append-only. One entry per bundle, with full Standing Bundle Ritual results.*
+
+<!-- ledger entries appended below this line -->
 
 ---
 
