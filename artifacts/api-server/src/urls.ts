@@ -243,8 +243,10 @@ export function buildPublicUrl(publicUrl: string, prefix: string, p: string): st
  *     case: the WHATWG host parser rejects it outright (so it can never reach
  *     another origin — but it can never be OPENED either), and every emailed
  *     link would go out silently unclickable.
- *   - an absolute URL whose path is not EXACTLY the prefix — which covers both
- *     the missing-prefix and the double-prefix mistake.
+ *   - an absolute URL whose path is not EXACTLY the prefix — which covers the
+ *     missing-prefix mistake, the double-prefix mistake, and the doubled
+ *     trailing slash (".../leadfinder//"), whose links resolve to a path no
+ *     mount matches and are therefore answered with the SPA page.
  */
 export function assertPublicUrlCarriesPrefix(publicUrl: string, prefix: string): void {
   if (prefix === '' || publicUrl === '') return;
@@ -263,18 +265,28 @@ export function assertPublicUrlCarriesPrefix(publicUrl: string, prefix: string):
     );
   }
 
-  // EXACT equality, not endsWith. The gateway forwards the prefix intact, so
-  // the public path and the mount are the same string; anything else is a
-  // typo. endsWith would wave through the mirror-image mistake — a
-  // hand-written ".../leadfinder/leadfinder" — which is precisely the
-  // double-prefix this check exists to stop.
-  const pathname = parsed.pathname.replace(/\/+$/, '');
-  if (pathname !== prefix) {
+  // EXACT equality, on the pathname as the URL parser reports it — no endsWith,
+  // and no trailing-slash forgiveness either.
+  //
+  // endsWith would wave through the mirror-image mistake — a hand-written
+  // ".../leadfinder/leadfinder" — which is precisely the double-prefix this
+  // check exists to stop.
+  //
+  // Forgiving a trailing slash HERE was its own hole, because the composition
+  // in buildPublicUrl does not forgive one. normalizePublicUrl strips exactly
+  // one trailing slash, so ".../leadfinder//" arrives here as ".../leadfinder/"
+  // — pathname "/leadfinder/" — and every emitted link becomes
+  // ".../leadfinder//api/jobs/<id>/csv". That path does not match the
+  // "/leadfinder/api/jobs" mount, so the prefixed SPA fallback answers it with
+  // 200 index.html: the user clicks "Download CSV" in their inbox and gets the
+  // app page, with no error anywhere and the auth check never reached. Compare
+  // what will actually be concatenated, not a tidied-up version of it.
+  if (parsed.pathname !== prefix) {
     throw new UrlConfigError(
-      `PUBLIC_BASE_URL ${JSON.stringify(publicUrl)} has path ${JSON.stringify(pathname || '/')} ` +
+      `PUBLIC_BASE_URL ${JSON.stringify(publicUrl)} has path ${JSON.stringify(parsed.pathname)} ` +
         `but BASE_PATH is ${JSON.stringify(prefix)}. They are set together at cutover: ` +
         `PUBLIC_BASE_URL is this app's full public base and its path must be exactly the ` +
-        `mount, e.g. "https://tools.example.com${prefix}".`,
+        `mount — no trailing slash, no extra segment — e.g. "https://tools.example.com${prefix}".`,
     );
   }
 }
@@ -473,7 +485,10 @@ export function runUrlsTests(): { passed: number; failed: number; failures: stri
   assertPublicUrlCarriesPrefix('https://g.example.com', ''); passed++;
   assertPublicUrlCarriesPrefix('', '/leadfinder'); passed++;
   assertPublicUrlCarriesPrefix('https://g.example.com/leadfinder', '/leadfinder'); passed++;
-  assertPublicUrlCarriesPrefix('https://g.example.com/leadfinder/', '/leadfinder'); passed++;
+  // A trailing slash the operator typed is stripped by normalizePublicUrl BEFORE
+  // this check ever sees it, so assert the REAL pipeline rather than the check
+  // in isolation — the two disagreeing is what let the doubled slash through.
+  assertPublicUrlCarriesPrefix(normalizePublicUrl('https://g.example.com/leadfinder/'), '/leadfinder'); passed++;
   assertPublicUrlCarriesPrefix('example.com', ''); passed++; // unprefixed: untouched, as always
   throws(
     () => assertPublicUrlCarriesPrefix('https://g.example.com/leadfinder/leadfinder', '/leadfinder'),
@@ -509,6 +524,43 @@ export function runUrlsTests(): { passed: number; failed: number; failures: stri
     () => assertPublicUrlCarriesPrefix('https://g.example.com%40evil.com/leadfinder', '/leadfinder'),
     'PUBLIC_BASE_URL with a percent-encoded @ in the host refused while prefixed',
   );
+  // The DOUBLED trailing slash. normalizePublicUrl strips exactly one, so this
+  // reaches the check as ".../leadfinder/" and used to pass — after which every
+  // emitted link read ".../leadfinder//api/...", matched no mount, and was
+  // answered with 200 index.html instead of the file.
+  throws(
+    () => assertPublicUrlCarriesPrefix(normalizePublicUrl('https://g.example.com/leadfinder//'), '/leadfinder'),
+    'PUBLIC_BASE_URL with a doubled trailing slash refused while prefixed',
+  );
+  throws(
+    () => assertPublicUrlCarriesPrefix('https://g.example.com/leadfinder/', '/leadfinder'),
+    'a public base whose pathname still ends in "/" is refused — composition would double it',
+  );
+  throws(
+    () => assertPublicUrlCarriesPrefix(normalizePublicUrl('https://g.example.com/leadfinder/.'), '/leadfinder'),
+    'PUBLIC_BASE_URL with a dot segment after the mount refused while prefixed',
+  );
+
+  // COMPOSITION PROPERTY: every value the boot path accepts must compose to a
+  // pathname that is exactly prefix + path. Checked with the URL oracle, on the
+  // real pipeline (normalizePublicUrl -> assert -> buildPublicUrl), because the
+  // hole was precisely a disagreement between the check and the concatenation.
+  for (const raw of [
+    'https://g.example.com/leadfinder',
+    'https://g.example.com/leadfinder/',
+    '  https://g.example.com/leadfinder  ',
+    'https://g.example.com:8443/leadfinder',
+  ]) {
+    const pub = normalizePublicUrl(raw);
+    assertPublicUrlCarriesPrefix(pub, '/leadfinder'); passed++;
+    for (const p of ['/api/jobs/x/csv', '/api/jobs/x/hq-zip', '/api/auth/google/callback', '/#/jobs/x', '/']) {
+      const link = buildPublicUrl(pub, '/leadfinder', p);
+      const parsed = new URL(link);
+      check(!parsed.pathname.includes('//'), `${raw} + ${p}: no doubled slash in ${link}`);
+      check(parsed.pathname.startsWith('/leadfinder/'), `${raw} + ${p}: stays under the mount (${parsed.pathname})`);
+      check(parsed.origin === new URL(raw.trim()).origin, `${raw} + ${p}: stays on our origin`);
+    }
+  }
 
   // ---- session cookie: name switches with the mount, Path never widens ----
   check(sessionCookieName('') === 'als_session', 'unprefixed cookie name unchanged');

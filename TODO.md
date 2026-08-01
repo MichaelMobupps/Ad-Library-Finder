@@ -18,19 +18,20 @@
 
 | # | Item | Origin | Status |
 |---|---|---|---|
-| O-1 | **Confirm `PUBLIC_BASE_URL` is actually set in production.** It defaults to `''`, and every emailed link is built as `${PUBLIC_URL}${path}`. If unset, every "Download CSV" / "Download HQ split" / "View full job log" link ever sent is a bare rooted path (`/api/jobs/<id>/csv`) — not clickable from an inbox. Pre-existing, unchanged by Bundle 1. Verify on the Reserved VM before cutover. | B1 discovery | OPEN — needs operator check |
+| O-1 | **Confirm `PUBLIC_BASE_URL` is actually set in production.** It defaults to `''`, and every emailed link is built as `${PUBLIC_URL}${path}`. If unset, every "Download CSV" / "Download HQ split" / "View full job log" link ever sent is a bare rooted path (`/api/jobs/<id>/csv`) — not clickable from an inbox. Pre-existing, unchanged by Bundle 1. Verify on the Reserved VM before cutover. **V1 partial evidence:** in the *workspace* environment it IS set, to `https://leadfindermobupps.replit.app` (read from `process.env`, no secret printed). That is the workspace's own env, which is not necessarily the Reserved VM's — the check still has to run there. | B1 discovery | OPEN — needs operator check on the VM |
 | O-2 | **Count live emailed links on production.** Cannot be determined from the workspace: the workspace `data/ad-library.sqlite` is the dev copy and is empty (0 jobs, 0 users, 0 sessions). Production data lives on the Reserved VM (`deploymentTarget = "vm"`). Run there: `SELECT COUNT(*) FROM jobs WHERE notification_status='sent';` | B1 discovery | OPEN — needs production query |
 | O-3 | Emailed download links carry a **job id, never a token, and never expire**. Access is re-checked per request by session cookie + `canReadJob` (`routes-jobs.ts:565`: owner or admin only). A link forwarded to a non-owning, non-admin colleague returns 404, not 403. Product decision, not a bug. Revisit if result sharing is ever wanted. | B1 discovery | OPEN — informational |
 | O-4 | `/api/auth/google/debug` still echoes the **raw** env var (`routes-auth.ts:57`), not the resolved config. Add `basePath`/`publicUrl` resolved values so a cutover can be diagnosed from one endpoint. | B1 audit | **Still open.** Bundle 2 deliberately did NOT take it: it changes a response body, and B2's DARK gate is byte-identity against the recorded baseline — which pins this exact response. Take it in the cutover bundle, and add the fields only while `IS_PREFIXED` so the unprefixed shape stays frozen. Boot logs already print the resolved config. |
 | O-5 | `urls.ts` ↔ `config.ts` are a mirror pair with **no automated drift gate**. The repo already has the pattern (`scripts/check-lead-mirror.mjs`). Add an equivalent so the two validators cannot diverge. | B1 audit | DEFERRED |
 | O-6 | Job ids are interpolated raw into emailed links (`notifier.ts:28,32,36`). Safe today — ids are `job_${nanoid(10)}`, URL-safe by construction — but not safe *by construction at the sink*. Add `encodeURIComponent` when a bundle can afford the behaviour delta. | B1 audit | DEFERRED |
 | O-8 | `artifacts/dashboard/tsconfig.tsbuildinfo` is tracked in git and churns on every build. Should be gitignored. Out of scope (repo hygiene, predates this bundle). | B1 audit | DEFERRED |
-| O-9 | **`.replit` lost its port mappings, and not from this bundle.** `3901`–`3917` (15 `[[ports]]` blocks) are deleted in the working tree; the change appeared mid-session without being authored here. Left uncommitted and unstaged deliberately. Restore with `git checkout -- .replit`, or keep it if the environment is now managing that file — **operator's call**. | B2 discovery | OPEN — needs operator decision |
+| O-9 | **`.replit` lost its port mappings, and not from any bundle.** `3901`–`3917` (15 `[[ports]]` blocks) are deleted in the working tree. **V1 attribution:** file mtime `2026-08-01 08:11:39`, i.e. mid-Bundle-2-session (`ROADMAP.md` 07:25, `TODO.md` 08:30) and hours before the V1 session's first write (16:23) — so neither session authored it. Every prior commit touching `.replit` is an automated *"Published your App"*; the deleted blocks are exactly Replit's auto-generated forwarding table (3901→3000 … 3917→9000), and the one mapping the app actually uses (`3001`→`80`, matching `PORT=3001`) survives. Platform-authored pruning on the balance of evidence — no platform log exists to prove it outright. Harmless either way; still **uncommitted and unstaged deliberately**. Restore with `git checkout -- .replit`, or keep it — **operator's call**. | B2 discovery, V1 attribution | OPEN — needs operator decision |
 | O-10 | While prefixed, the app's own root `/` returns **404** — only `<prefix>/…` is served. Fine behind the gateway (it forwards `/leadfinder/*`), but anyone hitting the Repl's direct address gets nothing, and any HTTP health probe aimed at `/` would read as unhealthy. Confirm the Reserved VM's readiness check is port-based, not `GET /`. One-line mitigation if needed: redirect `/` to `BASE_PATH` when `IS_PREFIXED`. | B2 audit | OPEN — verify before cutover |
 | O-11 | `/version` — the autonomous deploy-detect poller's endpoint (`routes-health.ts:6`) — becomes `/leadfinder/version` at cutover. Whatever polls it lives outside this repo. Update it, or the poller reads every deploy as a failure. | B2 audit | OPEN — external, before cutover |
 | O-12 | **Emailed-link back-compatibility (its own order, post-cutover).** Now concrete: live links are `<old-address>/api/jobs/<id>/csv`, `/hq-zip` and `/#/jobs/<id>`. When the old address becomes a permanent redirect it must be **path-preserving AND prefix-adding** (`/api/…` → `<gateway>/leadfinder/api/…`), or every link ever emailed 404s. A bare redirect to the gateway root silently breaks all of them. Fragments (`/#/jobs/<id>`) survive a 301 on their own — browsers re-attach them. | B2 audit | OPEN — gateway-side work |
 | O-13 | The unprefixed SPA arm still uses `app.get('*')` (`index.ts:144`), which **throws at registration on Express 5** (this repo runs 4.22.2). The prefixed arm is already `app.use(BASE_PATH, …)` and is version-safe. Convert the unprefixed arm when Express is upgraded — it is a boot failure, not a warning. | B2 audit | DEFERRED — blocks an Express 5 upgrade |
 | O-14 | `pnpm dev:ui` (Vite dev server) is not prefix-aware: with `BASE_PATH` set, the dev server serves at `/leadfinder/` while its API proxy still matches only `/api`. Nothing in the workflow uses it (`.replit` runs `pnpm start`), so this is a developer-ergonomics gap, not a deploy one. | B2 audit | DEFERRED |
+| O-15 | **Mount matching is case-INsensitive, the cookie `Path` is case-sensitive.** Express's default (`case sensitive routing` off, unchanged by any bundle) means `/LEADFINDER/api/me` matches the mount and is served — but RFC 6265 path-match is byte-exact, so the browser would not attach `lf_session` (`Path=/leadfinder/`) and the user reads as signed out. Confirmed by probe: `/LEADFINDER/api/me` → `401`. Not reachable through the gateway, which forwards the exact prefix, and unprefixed it cannot happen at all (`Path=/` matches everything). New only because Bundle 2 narrowed the cookie Path. One line if it is ever wanted: `app.set('case sensitive routing', true)`. | V1 audit | OPEN — informational |
 
 ---
 
@@ -402,6 +403,178 @@ the deployment config, and this bundle did not touch it (but see O-9).
 **8. Auto-fix** — both in-scope findings fixed and re-audited; O-7 (SPA catch-all under the
 prefix) is **closed by this bundle** and removed from Open items. Six new out-of-scope items
 recorded as O-9…O-14 and left untouched.
+
+---
+
+### Leadfinder Verification order V1 — independent re-verification of Bundle 2 ☑ DONE (2026-08-01)
+
+Branch `bundle-2-verification-v1`. Ordered after the Bundle-2 session was cut off, to
+establish what had actually completed and close the ritual. **Nothing was re-implemented.**
+
+**0. What the cut-off session had actually left behind**
+
+The premise of the order was that the Bundle 2 ledger entry was missing. It is **not** —
+`9b3dedd` committed it along with the code (`TODO.md +259`), and `main`, `origin/main` and
+`bundle-2-base-path` are all level at `9b3dedd`. Bundle 2 was committed, merged and pushed
+**with** its ledger entry. Nothing was missing; the entry above is the Bundle-2 session's own.
+
+So V1 became what it should be: verify that entry's claims independently rather than trust
+them. Every load-bearing claim was **re-derived from the artefacts, not read**:
+
+| Claim in the Bundle 2 entry | Re-derived independently | Verdict |
+|---|---|---|
+| blast radius held: 5 code + 2 docs | `git diff --stat 161b80e..9b3dedd` = exactly those 5 files | ✅ |
+| `pnpm build` passes | re-run | ✅ |
+| 30 modules, 927 assertions | re-run: 30 modules, **927**, 0 failed | ✅ exact |
+| `urls` suite 212 assertions | re-run: **212** | ✅ exact |
+| `dist/index.html` md5 `d004b92d…`, 702 B | `d004b92db95a913e6dfda70e7d3d9460`, 702 B | ✅ exact |
+| real DB md5 `e689c6fc…` untouched | `e689c6fc55e6276acf296f7e9bada157` before and after every V1 run | ✅ exact |
+| Express is 4.22.2 (the `app.get(prefix+'/*')` argument) | `4.22.2` | ✅ |
+| DARK is byte-identical to the 17-probe baseline | rebuilt the harness from scratch, re-ran, `diff` clean | ✅ md5 `0b9f472c…` both sides |
+| LIT main page 724 B | 724 B | ✅ |
+| OAuth URIs for both gateway hosts | re-derived through `/api/auth/google/debug` | ✅ character-identical |
+
+One inaccuracy, cosmetic: O-5 cites `scripts/check-lead-mirror.mjs`; the file is at
+`artifacts/api-server/scripts/check-lead-mirror.mjs`. The item itself stands.
+
+**1. Scope of the Bundle 2 work order, item by item** — ROADMAP §"per-app migration cycle"
+step 4, plus the order's named surfaces. All delivered; evidence is V1's own, not the entry's.
+
+| Work-order item | Delivered | Proof |
+|---|---|---|
+| config becomes switchable | `IS_PREFIXED` + guarded exports in `urls.ts`; Vite `base` from `BASE_PATH` | boot matrix 14/14; DARK↔LIT both boot to spec |
+| per-app session cookie **name** | `als_session` → `lf_session`, only while prefixed | `Set-Cookie` observed over HTTP in both modes |
+| cookie **scoping** | `Path=/` → `Path=/leadfinder/`; clear-cookie agrees on name **and** Path | RFC 6265 §5.1.4 oracle + live logout probe |
+| SPA catch-all under prefix | `app.use(BASE_PATH, …)`, honest 404 for missing assets; unprefixed arm untouched | missing asset → 404; deep link → 200; DARK still 200 everywhere |
+| prefix-aware / bare-prefix redirect | `/leadfinder` → 302 `/leadfinder/`, query preserved, exactly one hop | chain-followed; `bare(p, bare(p, x)) === null`; POST/HEAD too |
+| downloads | CSV **and** hq-zip authenticate and serve real bytes under the prefix | 200 + exact bytes + `Content-Disposition`; anonymous → 401 both |
+| polling endpoints | job detail **and** job list under the prefix | durable row moved between polls: leads 0→7→41, bar 0→12→63, log 0→1→2 |
+| ships inactive | every switch structurally unregistered while unset | DARK table byte-identical to the pre-Bundle-1 baseline |
+
+**2. Gates** — all green. `pnpm build` pass. Tests **994** assertions across 30 modules
+(was 927; the V1 fix below adds 67, `urls` 212 → **279**), 0 failed.
+
+**3. Godlike audit — 4 rounds, closed on a fully clean one**
+
+*Round 1 — 1 finding, security/operational, confirmed by probe and then end to end over HTTP.*
+`PUBLIC_BASE_URL=https://tools.mobupps.net/leadfinder//` (a **doubled trailing slash**) was
+**accepted at boot** while prefixed. `normalizePublicUrl` strips exactly one trailing slash, so
+the value reached `assertPublicUrlCarriesPrefix` as `…/leadfinder/`; that check compared
+`parsed.pathname.replace(/\/+$/, '')`, forgiving a trailing slash the concatenation in
+`buildPublicUrl` does **not** forgive. Every emitted absolute URL then read
+`https://tools.mobupps.net/leadfinder//api/jobs/<id>/csv`.
+
+Its failure shape is the bad one. Proved over real HTTP:
+
+```
+GET /leadfinder//api/jobs/job_abc/csv  -> 200 text/html 724B   <-- the SPA page
+GET /leadfinder/api/jobs/job_abc/csv   -> 401 application/json <-- the real endpoint
+```
+
+`//api/…` matches no mount, so the prefixed SPA fallback answers it with `200 index.html`:
+the user clicks **Download CSV** in their inbox and gets the app page. No 404, nothing in the
+logs, and `requireAuth` never runs. The same defect hit the `PUBLIC_URL` fallback branch of
+the OAuth redirect URI. This is exactly the class `assertPublicUrlCarriesPrefix` exists to
+stop, and its own doc comment already claimed "path is not EXACTLY the prefix" — the code
+simply did not match the doc.
+
+**Fixed:** compare `parsed.pathname !== prefix` — the string that will actually be
+concatenated, with no tidying. Prefixed-only by construction (the function returns early when
+`prefix === ''`), so **DARK cannot change**, and the DARK byte-identity gate was re-run
+afterwards to prove it rather than assert it. Legitimate operator input is unaffected: a single
+trailing slash is still stripped by `normalizePublicUrl` before the check sees it. Also refused
+now: `…/leadfinder/.` and any other path that normalises to the mount but composes past it.
+
+*Round 2 — 0 product findings.* Env/unit framing 233/233. HTTP framing raised one alarm that
+did **not** survive inspection: a percent-encoded `%0d%0a` in the bare-prefix redirect's query.
+Dumping the raw socket response showed the text appearing only *inside* the `Location` value,
+still encoded, with no injected header line — the alarm was the audit's own regex reading its
+own `Location` header. Corrected the check, not the product. A raw `CR` in the request target
+never reaches Express: the HTTP layer rejects the request.
+
+*Round 3 — clean, on four angles the earlier rounds never touched:*
+- **Negative test:** a LIT server over the **DARK** dist — the likeliest cutover mistake. The
+  boot detector names both stray assets (`/assets/index-*.js`, `/assets/index-*.css`).
+- **Build refusal:** `BASE_PATH="/a'onmouseover=alert(1)"`, `//evil.com`, `/leadfinder/../evil`
+  and `/a b` each exit **1** with `BasePathError` at Vite config-load; **no output directory is
+  created** and the existing `dist` is md5-unchanged.
+- **Client half on the real module:** `dashboard/src/config.ts` compiled and executed with the
+  base substituted the way Vite's `define` substitutes it — **22/22** SPA paths are the identity
+  at `/`, all correctly prefixed at `/leadfinder/`, none doubled or protocol-relative; five
+  hostile bases throw `BasePathError` at module load.
+- **Bypass sweep:** no `fetch(` outside `api/client.ts`, no rooted `href`/`window.open` in the
+  SPA, no `/api/` literal outside `config.ts`/`client.ts`, no own-address literal anywhere in
+  either `src` tree.
+
+*Round 4 — fully clean.* Everything re-run in one pass after the fix: build ✓, 994 assertions ✓,
+env/unit audit 233/0, HTTP audit LIT 19/0 and DARK 17/0, DARK smoke 33/0 **byte-identical**,
+LIT smoke 90/0.
+
+**Bundle 1's two fixes re-proved under the SWITCHED state** (the order's specific ask), with
+`new URL()` as the oracle throughout and boot refusals probed in **real child processes**,
+because module-load side effects are the thing under test:
+
+- **Fix 1 — the BASE_PATH segment allowlist holds.** 50 hostile shapes refused at boot with
+  the prefix active, including protocol-relative and backslash authorities, dot segments,
+  absolute URLs, control characters, quote/angle-bracket/`@`/`:`/`;` forms, and the invisible
+  ones — NBSP, zero-width space, RTL override, BOM. (A NUL byte cannot reach a real env at all —
+  `execve` refuses it — so that one is asserted against the validator directly and said so.)
+  Every value the allowlist *does* accept was then pushed through all **four** sinks Bundle 2
+  added and asserted inert: no `CR`/`LF` in a `Location`, no `;`/`,`/whitespace in a cookie
+  `Path`, no route metacharacter (`:*?+()[]{}`) in a mount string, no attribute-breaking or
+  invisible character in the HTML-attribute sink.
+- **Fix 2 — PUBLIC_URL cannot borrow an origin.** 16 hostile values refused on the real boot
+  path while prefixed (userinfo, `user:pass@`, protocol-relative, backslash, non-http(s),
+  query/fragment, control characters, percent-encoded `@`, dot-escape, and now the doubled
+  slash), and the four Bundle-1 shapes re-checked **unprefixed** so the original fix is proved
+  not to have regressed. Every accepted pair was oracle-checked: emitted links stay on their own
+  origin, carry the prefix exactly once, and contain no doubled slash.
+
+**4. Smokes — both re-run with a harness rebuilt from scratch** (the Bundle-2 session's
+scratchpad is gone). Same envelope as Bundle 1: the app is assembled from the **same compiled
+routers minus `startQueue()`** — so no scraper is dispatched and no email is sent — plus minus
+`prepareStableLibraryClosure()` (a Chromium library snapshot, not a routing concern). Each run
+uses **its own throwaway cwd**, so `db.ts`'s module-level `path.resolve('data')` makes a fresh
+sqlite file, and binds `127.0.0.1` on **separate ports** (3962 DARK / 3963 LIT; audits on
+3965/3966/3968). **Real DB md5 `e689c6fc…` identical before and after every run; real
+`dist/index.html` md5 `d004b92d…` unchanged; no secret written — the LIT env existed only for
+the child process; no workflow was running and none was touched.**
+
+*a. DARK (`BASE_PATH` and `PUBLIC_BASE_URL` both unset) — 33/33 checks, and the 17-probe table
+is **byte-for-byte identical** to the baseline recorded in the Bundle 1 ledger.* `diff` clean,
+md5 `0b9f472cd1fcb63fb9c93396cc198b06` on both sides, including
+`Set-Cookie=als_session=<TOK>; Path=/` and both 702-byte SPA responses. Re-run **again** after
+the round-1 fix landed, still byte-identical. *(One redaction note for whoever diffs this next:
+`<TOK>` on the logout line is the redactor rewriting `als_session=[^;]*`; the real cleared value
+is empty. The baseline was recorded with the same rule, which is why the two match.)*
+
+*b. LIT (`BASE_PATH=/leadfinder/`, `PUBLIC_BASE_URL=https://tools.mobupps.net/leadfinder`,
+set for the child process only) — 90/90 checks.* `BASE_PATH` was given **with** its trailing
+slash on purpose, to exercise the normalisation on the way in. Everything in the Bundle-2
+entry's LIT table reproduced, plus: hq-zip download bytes and `Content-Disposition`, anonymous
+hq-zip → 401, hostile-query redirects (4 shapes, all staying same-origin at exactly the mount),
+prefix-lookalike paths (`/leadfinderX`, `/leadfinder2/`) not swallowed, `POST`/`PUT`/`DELETE`/
+`PATCH` to a non-route → 404, and 7 traversal attempts disclosing nothing.
+
+**5. The OAuth redirect URI under LIT, character for character** — re-derived by replaying the
+real sink (`getRedirectUriFromReq` via `/leadfinder/api/auth/google/debug`) with the gateway's
+forwarded headers, not composed by hand. Identical to what the Bundle 2 entry recorded:
+
+```
+https://mobupps-tools-gateway.replit.app/leadfinder/api/auth/google/callback
+https://tools.mobupps.net/leadfinder/api/auth/google/callback
+```
+
+The `PUBLIC_URL`-fallback branch (no `Host`, no `x-forwarded-host`) independently yields
+`https://tools.mobupps.net/leadfinder/api/auth/google/callback` — the same string, which is the
+property that matters, since the authorize step and the token exchange must agree.
+
+**6. Auto-fix** — the one in-scope finding fixed and re-audited to a clean round. Its regression
+gate lives in the suite, not just in this entry: `urls` gained 67 assertions pinning the doubled
+slash, the dot-segment form, the real `normalizePublicUrl → assert → buildPublicUrl` pipeline,
+and a **composition property** (every accepted public base composes to a pathname that is
+exactly `prefix + path`, oracle-checked). One new out-of-scope item recorded as **O-15**; O-1
+and O-9 updated with V1 evidence and left open.
 
 ---
 
