@@ -11,66 +11,6 @@ run = ["sh", "-c", "pnpm start"]
 localPort = 3001
 externalPort = 80
 
-[[ports]]
-localPort = 3901
-externalPort = 3000
-
-[[ports]]
-localPort = 3902
-externalPort = 3001
-
-[[ports]]
-localPort = 3903
-externalPort = 3002
-
-[[ports]]
-localPort = 3904
-externalPort = 3003
-
-[[ports]]
-localPort = 3905
-externalPort = 4200
-
-[[ports]]
-localPort = 3906
-externalPort = 5000
-
-[[ports]]
-localPort = 3907
-externalPort = 5173
-
-[[ports]]
-localPort = 3908
-externalPort = 6000
-
-[[ports]]
-localPort = 3909
-externalPort = 6800
-
-[[ports]]
-localPort = 3910
-externalPort = 8000
-
-[[ports]]
-localPort = 3911
-externalPort = 8008
-
-[[ports]]
-localPort = 3912
-externalPort = 8080
-
-[[ports]]
-localPort = 3913
-externalPort = 8081
-
-[[ports]]
-localPort = 3914
-externalPort = 8099
-
-[[ports]]
-localPort = 3917
-externalPort = 9000
-
 [env]
 NODE_ENV = "production"
 PORT = "3001"
