@@ -18,7 +18,14 @@
 
 | # | Item | Origin | Status |
 |---|---|---|---|
-| — | *(none yet — Bundle 1 in progress)* | | |
+| O-1 | **Confirm `PUBLIC_BASE_URL` is actually set in production.** It defaults to `''`, and every emailed link is built as `${PUBLIC_URL}${path}`. If unset, every "Download CSV" / "Download HQ split" / "View full job log" link ever sent is a bare rooted path (`/api/jobs/<id>/csv`) — not clickable from an inbox. Pre-existing, unchanged by Bundle 1. Verify on the Reserved VM before cutover. | B1 discovery | OPEN — needs operator check |
+| O-2 | **Count live emailed links on production.** Cannot be determined from the workspace: the workspace `data/ad-library.sqlite` is the dev copy and is empty (0 jobs, 0 users, 0 sessions). Production data lives on the Reserved VM (`deploymentTarget = "vm"`). Run there: `SELECT COUNT(*) FROM jobs WHERE notification_status='sent';` | B1 discovery | OPEN — needs production query |
+| O-3 | Emailed download links carry a **job id, never a token, and never expire**. Access is re-checked per request by session cookie + `canReadJob` (`routes-jobs.ts:565`: owner or admin only). A link forwarded to a non-owning, non-admin colleague returns 404, not 403. Product decision, not a bug. Revisit if result sharing is ever wanted. | B1 discovery | OPEN — informational |
+| O-4 | `/api/auth/google/debug` still echoes the **raw** env var (`routes-auth.ts:57`), not the resolved config. Add `basePath`/`publicUrl` resolved values so a cutover can be diagnosed from one endpoint. Deliberately not changed in B1 (would alter a response body). | B1 audit | DEFERRED to Bundle 2 |
+| O-5 | `urls.ts` ↔ `config.ts` are a mirror pair with **no automated drift gate**. The repo already has the pattern (`scripts/check-lead-mirror.mjs`). Add an equivalent so the two validators cannot diverge. | B1 audit | DEFERRED |
+| O-6 | Job ids are interpolated raw into emailed links (`notifier.ts:28,32,36`). Safe today — ids are `job_${nanoid(10)}`, URL-safe by construction — but not safe *by construction at the sink*. Add `encodeURIComponent` when a bundle can afford the behaviour delta. | B1 audit | DEFERRED |
+| O-7 | SPA catch-all is `app.get('*')` (`index.ts:79`), not scoped to the prefix. Must become prefix-aware or a prefixed deploy serves the SPA on every path. | B1 audit | DEFERRED to Bundle 2 (already in ROADMAP) |
+| O-8 | `artifacts/dashboard/tsconfig.tsbuildinfo` is tracked in git and churns on every build. Should be gitignored. Out of scope (repo hygiene, predates this bundle). | B1 audit | DEFERRED |
 
 ---
 
@@ -29,7 +36,11 @@ Bundle 1 records these; it does not change them. Each becomes a cutover item.*
 
 | Service | What is registered | File | Line | Cutover action |
 |---|---|---|---|---|
-| — | *(discovery pending)* | | | |
+| **Google Cloud Console — OAuth 2.0 Client** | Authorized redirect URI: `<app address>/api/auth/google/callback` | `artifacts/api-server/src/oauth.ts` | 14 (path const), 60 (header-derived), 68 (`PUBLIC_URL` fallback) | **Add** the new gateway URI in the Cloud Console *before* the cutover and **keep the old one** until the old address is retired. The app derives the URI from `x-forwarded-host`/`Host` at request time, so it follows the gateway automatically — but Google rejects any URI not on the allow-list, so sign-in breaks for everyone the moment the host changes without the console entry. |
+| (same, documented) | `<PUBLIC_BASE_URL>/api/auth/google/callback` | `SETUP_GOOGLE_OAUTH.md` | 36 | Update the doc when the address changes. |
+
+**No other external registration exists.** Every other outbound service is call-out-only
+and holds no address of ours — see the outbound analysis in the Bundle 1 ledger entry.
 
 ---
 
@@ -38,6 +49,104 @@ Bundle 1 records these; it does not change them. Each becomes a cutover item.*
 *Append-only. One entry per bundle, with full Standing Bundle Ritual results.*
 
 <!-- ledger entries appended below this line -->
+
+### Leadfinder Bundle 1 — URL centralization ☑ DONE (2026-08-01)
+
+Branch `bundle-1-url-centralization`. Commits `76ab08f`, `e67bd06`, `c50fc24`.
+
+**0. Lineage check (Git safety rule 1) — FAILED FIRST, then corrected**
+
+`main` was at `9cd17f3` (2026-07-23). Two branches shared an identical newer tree
+`dc07c90` (2026-07-29): `replit-agent` `18fc536` and `store-first-discovery-longtail`
+`d3dfaeb`. `main` was a **strict ancestor** of both — 89 commits / 57 files /
++14,535 −588 behind, including whole subsystems (`storeDiscoveryPipeline`,
+`publisherRollup`, `appleSource`, `playSource`, `storeConfirm`, `NewJobForm`,
+`Publishers`) and modified versions of every file this bundle touches
+(`notifier.ts`, `routes-jobs.ts`, `api/client.ts`, `auth.ts`).
+
+Work was **halted and reported** rather than started on the stale tree. Michael chose
+fast-forward. `main` fast-forwarded to `18fc536` — a clean FF, no rewrite, no
+force-push; the old tip `9cd17f3` already survives under `snapshot-2026-07-30`.
+
+Also noted: **`snapshot-2026-07-30` has the same tree as the old `main`** — the Phase 0
+snapshot for this repo captured the 07-23 tree, not the 07-29 work it is named for.
+
+**1. Blast radius** — 10 files (2 new). Server: `urls.ts` (new), `notifier.ts`,
+`oauth.ts`, `routes-auth.ts`, `auth.ts`, `index.ts`. Client: `config.ts` (new),
+`api/client.ts`, `App.tsx`. Plus this file. Worst realistic failure: a cookie-helper
+bug invalidating every live session mid-job. Rollback: revert the commits; no env var,
+DB or deploy dependency. Not touched: `source-code/` mirror (and `sync-source-code.sh`
+never run), `vite.config.ts`, `.replit`, DB, scrapers, queue.
+
+**2. Implementation** — one config module per language present. **TypeScript only; there
+is no Python side** (the only `.py` files in the tree are inside vscode-server's
+`node_modules`). `BASE_PATH` defaults to `/`, `PUBLIC_URL` to
+`(process.env.PUBLIC_BASE_URL || '').replace(/\/$/,'')` — the exact inline expression
+that was there before. Client prefix comes from Vite's `import.meta.env.BASE_URL`,
+which is `/` because `vite.config.ts` sets no `base`.
+
+Routed through it: 3 emailed-link helpers, the OAuth redirect URI (both the
+header-derived and the `PUBLIC_URL`-fallback branch), the post-login redirect, the
+`Set-Cookie`/clear-cookie `Path` and cookie name, the "Back to login" href, 6 route
+mounts, the static mount, all 21 SPA API paths, and 2 sign-in hrefs.
+
+**3. Gates** — all green, and green *before* the bundle too (baseline captured first).
+
+| Gate | Command | Before | After |
+|---|---|---|---|
+| typecheck + build | `pnpm build` (`tsc -b` + `vite build`; `tsc -p`) | pass | pass |
+| tests | `pnpm --filter api-server test` | 29 modules, 715 assertions | 30 modules, **823** assertions, 0 failed |
+
+No pre-existing gate failures; nothing to prove predates the bundle.
+
+**4. Godlike audit — closed on two consecutive clean rounds**
+
+*Round 1 — 2 findings, both security, both confirmed by probing the built module:*
+- BASE_PATH accepted `/a'onmouseover=alert(1)`, `/a%00b`, `/a@b`, `/a:b`, `/a;b`. The
+  WHATWG-URL oracle percent-encodes `"` and `<>` (already refused) but leaves `'`
+  intact, and `basePath('/')` is interpolated into an HTML attribute in `auth.ts` —
+  safety rested on that one sink using double quotes. **Fixed:** segment allowlist.
+- PUBLIC_BASE_URL accepted userinfo. `https://good.com@evil.com` reads as good.com and
+  resolves to origin **evil.com**, which would aim every emailed download link at the
+  attacker. **Fixed:** userinfo refused.
+
+*Round 2 — clean.* Re-probed 16 hostile BASE_PATH and 10 hostile PUBLIC_URL shapes: all
+dangerous forms refused, all legitimate forms preserved. Equivalence re-verified.
+*Round 3 — clean.* No `fetch`/XHR bypasses `api/client.ts`; no rooted `href`/`window.open`
+in the SPA; every UI download link goes through `api.csvUrl`/`hqZipUrl`/`publishersCsvUrl`;
+no own-address literal remains anywhere in `src`.
+
+Security framing used **`new URL()` as the oracle, never string-shape checks**. Confirmed:
+no helper can emit a protocol-relative URL (`//`, `///`, `\\`, `/\` all refused on both
+vars); no open redirect is reachable through a hostile `BASE_PATH` or `PUBLIC_URL`
+(dot-segment and backslash forms refused; the only two `res.redirect` calls are
+`basePath('/')` and Google's own authorize URL, neither operator-influenced); and **no
+download token can leak into a redirect target because no download token exists** —
+downloads authenticate by session cookie plus `canReadJob`, with no secret in the URL.
+
+**5. Equivalence proof (zero behaviour change)**
+
+Differential harness comparing the new module against the old inline expressions
+copied verbatim: **28 checks identical across 4 env permutations** (unset; production-shaped
+`PUBLIC_BASE_URL`; trailing-slash variant; explicit `BASE_PATH=/`). The 21 client path
+literals diff clean against `HEAD`.
+
+**6. Smoke — pre-bundle vs post-bundle, byte-for-byte**
+
+A `git worktree` at the pre-bundle commit `18fc536` was built and driven through the
+**same** 17-probe harness, then diffed against the Bundle-1 run. **The only differing
+line was the harness's own port banner (3952 vs 3953). Every probe response was
+identical.** Endpoint list and results are recorded below as the Bundle 2 baseline.
+
+Safety held: the app was **not** booted via `dist/index.js` (that calls `startQueue()`,
+which dispatches real scrapers). The harness assembles the same Express app from the
+same routers minus `startQueue()`, runs from a throwaway cwd so `db.ts`'s
+`path.resolve('data')` makes a fresh sqlite file, and binds `127.0.0.1` on ports
+3952/3953 — outside `.replit`'s mapped set. **Real database md5 identical before and
+after. No scraping. No email dispatched. The running workflow was never touched.**
+
+**7. Auto-fix** — both in-scope findings fixed and re-audited. Eight out-of-scope
+findings recorded as O-1..O-8 above and left untouched.
 
 ---
 
@@ -978,3 +1087,30 @@ a browser probe or a static CSS gate — server-side assertions structurally can
   ~130x the project's entire spend to date, in a single run.
 - 2026-07-26: Play stays on direct egress — residential proxy is GB-prohibitive for 1.2 MB Play pages
   (see the DECISION block above). Concurrency 5 chosen over the clean-at-8 measurement for margin.
+
+**8. Endpoint baseline for Bundle 2** — recorded verbatim from the Bundle-1 run.
+Volatile values are redacted (`<ID>`, `<T>`, `<TOK>`, `<PORT>`) so a future run can be
+diffed directly. Identical output was produced by the pre-bundle build.
+
+```
+ENDPOINT PROBE RESULTS
+────────────────────────────────────────────────────────────────────────────────────────────────────
+health                      GET  /api/health                        200  {"ok":true,"ts":<T>}
+version                     GET  /version                           200  {"builtAt":"<T>"}
+me (anonymous)              GET  /api/me                            401  {"error":"not signed in"}
+me (session)                GET  /api/me                            200  {"id":"usr_<ID>","email":"probe@mobupps.com","name":"Probe","isAdmin":false}
+job list (anonymous)        GET  /api/jobs                          401  {"error":"authentication required"}
+job list (session)          GET  /api/jobs                          200  {"jobs":[]}
+oauth debug                 GET  /api/auth/google/debug             200  {"redirectUri":"http://127.0.0.1:<PORT>/api/auth/google/callback","clientIdPresent":true,"clientSecretPresent":true,"publicBaseUrlEnv":null,"forwardedProto":null,"forwardedHost":null,"hostHeader":"127.0.0.1:<PORT>","allowedDomain":"mobupps.com"}
+job create (session)        POST /api/jobs                          200  {"jobs":[{"id":"job_<ID>","product_type":"mobile","countries":"[\"US\"]","status":"pending","csv_path":null,"error":null,"created_at":<T>,"started_at":null,"completed_at":null,"total_ads_scraped":0,"total_advertisers":0,"recipient_email":null,"notification_status":null,"created_by_user_id":"usr_<ID>","source":"meta","source_params":null,"phase":"queued","phase_detail":"waiting for worker","phase_updated_at":<T>,"hq_zip_path":null,"run_after":null,"cancel_requested":0,"leads_found":0,"progress_pct":0}]}
+job detail = LIVE PROGRESS  GET  /api/jobs/job_<ID>                 200  {"job":{"id":"job_<ID>","product_type":"mobile","countries":"[\"US\"]","status":"pending","csv_path":null,"error":null,"created_at":<T>,"started_at":null,"completed_at":null,"total_ads_scraped":0,"total_advertisers":0,"recipient_email":null,"notification_status":null,"created_by_user_id":"usr_<ID>","source":"meta","source_params":null,"phase":"queued","phase_detail":"waiting for worker","phase_updated_at":<T>,"hq_zip_path":null,"run_after":null,"cancel_requested":0,"leads_found":0,"progress_pct":0},"logs":[]}
+download csv (session)      GET  /api/jobs/job_<ID>/csv             404  {"error":"CSV not yet ready"}
+download csv (anonymous)    GET  /api/jobs/job_<ID>/csv             401  {"error":"authentication required"}
+download hq-zip (session)   GET  /api/jobs/job_<ID>/hq-zip          404  {"error":"HQ-split zip not yet ready"}
+job list after create       GET  /api/jobs                          200  {"jobs":[{"id":"job_<ID>","product_type":"mobile","countries":"[\"US\"]","status":"pending","csv_path":null,"error":null,"created_at":<T>,"started_at":null,"completed_at":null,"total_ads_scraped":0,"total_advertisers":0,"recipient_email":null,"notification_status":null,"created_by_user_id":"usr_<ID>","source":"meta","source_params":null,"phase":"queued","phase_detail":"waiting for worker","phase_updated_at":<T>,"hq_zip_path":null,"run_after":null,"cancel_requested":0,"leads_found":0,"progress_pct":0}]}
+logout (clears cookie)      POST /api/auth/logout                   200  {"ok":true}
+                                                                    Set-Cookie=als_session=<TOK>; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0
+SPA root                    GET  /                                  200  text/html 702B
+SPA deep link               GET  /some/deep/link                    200  text/html 702B
+────────────────────────────────────────────────────────────────────────────────────────────────────
+```
