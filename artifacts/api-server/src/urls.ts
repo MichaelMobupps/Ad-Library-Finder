@@ -33,6 +33,18 @@ const ALLOWED_PROTOCOLS = new Set(['http:', 'https:']);
  */
 const BACKSLASH = /\\/;
 
+/**
+ * Allowed shape of one BASE_PATH segment.
+ *
+ * Deliberately far narrower than "what a URL parser tolerates". The prefix is
+ * our own mount point ("/leadfinder"), so an allowlist costs nothing and closes
+ * a whole class at once: the parser oracle alone accepts "/a'onmouseover=x",
+ * "/a%00b", "/a@b" and "/a:b", and basePath('/') is interpolated into an HTML
+ * attribute in auth.ts. Relying on that sink's quoting style to stay double is
+ * exactly the coupling that breaks two refactors later.
+ */
+const SEGMENT = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/;
+
 export class UrlConfigError extends Error {
   constructor(message: string) {
     super(message);
@@ -77,11 +89,17 @@ export function normalizeBasePath(raw: string | undefined | null): string {
     throw new UrlConfigError(`BASE_PATH must name a path, got ${JSON.stringify(v)}`);
   }
 
-  // Dot segments would let a prefix walk back out of itself.
+  // Dot segments would let a prefix walk back out of itself; everything else
+  // must satisfy the allowlist above.
   for (const seg of trimmed.slice(1).split('/')) {
     if (seg === '' || seg === '.' || seg === '..') {
       throw new UrlConfigError(
         `BASE_PATH may not contain empty or dot segments: ${JSON.stringify(v)}`,
+      );
+    }
+    if (!SEGMENT.test(seg)) {
+      throw new UrlConfigError(
+        `BASE_PATH segment ${JSON.stringify(seg)} is not alphanumeric with . _ - inside`,
       );
     }
   }
@@ -145,6 +163,12 @@ export function normalizePublicUrl(raw: string | undefined | null): string {
     }
     if (parsed.search || parsed.hash) {
       throw new UrlConfigError('PUBLIC_BASE_URL may not carry a query or fragment');
+    }
+    // Userinfo is authority confusion: "https://good.com@evil.com" reads as
+    // good.com to a human and resolves to evil.com, which would point every
+    // emailed download link at the attacker. It can never be legitimate here.
+    if (parsed.username || parsed.password) {
+      throw new UrlConfigError('PUBLIC_BASE_URL may not contain userinfo (user:pass@)');
     }
   }
 
@@ -272,6 +296,22 @@ export function runUrlsTests(): { passed: number; failed: number; failures: stri
   throws(() => normalizeBasePath('/a?b=c'), 'BASE_PATH with query refused');
   throws(() => normalizeBasePath('/a#b'), 'BASE_PATH with fragment refused');
   throws(() => normalizeBasePath('/a\nb'), 'BASE_PATH with newline refused');
+  // Segment allowlist. The URL oracle alone accepts all of these; the sink in
+  // auth.ts interpolates basePath('/') into an HTML attribute, so they are
+  // refused outright rather than trusted to be inert.
+  throws(() => normalizeBasePath("/a'onmouseover=alert(1)"), 'BASE_PATH single quote refused');
+  throws(() => normalizeBasePath('/a"x'), 'BASE_PATH double quote refused');
+  throws(() => normalizeBasePath('/a<script>'), 'BASE_PATH angle brackets refused');
+  throws(() => normalizeBasePath('/a%00b'), 'BASE_PATH encoded NUL refused');
+  throws(() => normalizeBasePath('/a@b'), 'BASE_PATH at-sign refused');
+  throws(() => normalizeBasePath('/a:b'), 'BASE_PATH colon refused');
+  throws(() => normalizeBasePath('/a;b'), 'BASE_PATH semicolon refused');
+  throws(() => normalizeBasePath('/a b'), 'BASE_PATH space refused');
+  throws(() => normalizeBasePath('/-lead'), 'BASE_PATH segment may not start with a hyphen');
+  throws(() => normalizeBasePath('/lead-'), 'BASE_PATH segment may not end with a hyphen');
+  check(normalizeBasePath('/lead-finder_1.0') === '/lead-finder_1.0',
+    'BASE_PATH allows hyphen, underscore and dot inside a segment');
+  check(normalizeBasePath('/a/b/c') === '/a/b/c', 'BASE_PATH allows nested segments');
 
   // ---- security: PUBLIC_URL cannot borrow an origin or a dangerous scheme ----
   throws(() => normalizePublicUrl('//evil.com'), 'PUBLIC_BASE_URL protocol-relative refused');
@@ -283,6 +323,16 @@ export function runUrlsTests(): { passed: number; failed: number; failures: stri
   throws(() => normalizePublicUrl('https://e.com?x=1'), 'PUBLIC_BASE_URL with query refused');
   throws(() => normalizePublicUrl('https://e.com#f'), 'PUBLIC_BASE_URL with fragment refused');
   throws(() => normalizePublicUrl('https://e.com\nx'), 'PUBLIC_BASE_URL with newline refused');
+  // Authority confusion: reads as good.com, resolves to evil.com.
+  throws(() => normalizePublicUrl('https://good.com@evil.com'), 'PUBLIC_BASE_URL userinfo refused');
+  throws(() => normalizePublicUrl('https://user:pass@evil.com'), 'PUBLIC_BASE_URL user:pass refused');
+  // Preserved-as-today shapes: no normalisation beyond the trailing slash.
+  check(normalizePublicUrl('HTTPS://Good.COM') === 'HTTPS://Good.COM',
+    'PUBLIC_BASE_URL case is preserved exactly as before');
+  check(normalizePublicUrl('https://e.com:8443') === 'https://e.com:8443',
+    'PUBLIC_BASE_URL keeps an explicit port');
+  check(normalizePublicUrl('https://e.com/leadfinder') === 'https://e.com/leadfinder',
+    'PUBLIC_BASE_URL may carry a path');
 
   // ---- oracle: nothing we emit may parse to an origin other than our own ----
   const SELF = 'https://self.example.com';

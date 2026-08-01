@@ -27,6 +27,12 @@
 const RAW_BASE: string =
   (import.meta as unknown as { env?: { BASE_URL?: string } }).env?.BASE_URL ?? '/';
 
+/**
+ * Allowed shape of one base segment. MIRROR of SEGMENT in api-server/src/urls.ts.
+ * Narrower than what a URL parser tolerates, on purpose — see the note there.
+ */
+const SEGMENT = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/;
+
 export class BasePathError extends Error {
   constructor(message: string) {
     super(message);
@@ -56,6 +62,9 @@ export function normalizeBase(raw: string | undefined | null): string {
   for (const seg of trimmed.slice(1).split('/')) {
     if (seg === '' || seg === '.' || seg === '..') {
       throw new BasePathError(`base may not contain empty or dot segments: ${v}`);
+    }
+    if (!SEGMENT.test(seg)) {
+      throw new BasePathError(`base segment ${seg} is not alphanumeric with . _ - inside`);
     }
   }
 
