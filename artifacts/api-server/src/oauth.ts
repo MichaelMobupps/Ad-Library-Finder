@@ -38,17 +38,47 @@ function requireEnv(name: string): string {
 /**
  * Derive the redirect URI to register with Google.
  *
- * Priority (PRESERVED from prior fix):
- *   1. The actual deployed host as seen by Replit's edge proxy
+ * Priority:
+ *   1. PUBLIC_URL from urls.ts (env PUBLIC_BASE_URL), whenever it is set.
+ *   2. The deployed host as seen by Replit's edge proxy
  *      (x-forwarded-proto + x-forwarded-host).
- *   2. Host header on the incoming request.
- *   3. PUBLIC_URL from urls.ts (env PUBLIC_BASE_URL — legacy fallback).
+ *   3. Host header on the incoming request.
  *
- * The authorize-step and token-exchange step MUST produce the same string;
- * because both /api/auth/google and /api/auth/google/callback are hit on
- * the same host, header-derivation is stable across the two calls.
+ * WHY PUBLIC_BASE_URL COMES FIRST (H1, after a live sign-in outage)
+ * Behind the gateway a request-derived host is not this app's public address.
+ * The gateway proxies `tools.mobupps.net/leadfinder/*` to the `.replit.app`
+ * deployment, and Replit's edge sets x-forwarded-host to the DEPLOYMENT host —
+ * so the app derived
+ *   https://ad-library-finder.replit.app/leadfinder/api/auth/google/callback
+ * and Google, which has only the tools.mobupps.net and gateway URIs registered,
+ * answered redirect_uri_mismatch for everyone. Three things were wrong with
+ * deriving it from the request, and all three go away here:
+ *
+ *   - the host is whatever the last proxy says, which is not our public name;
+ *   - the authorize step and the token exchange can arrive on DIFFERENT hosts
+ *     (the callback returns through whatever URI Google was handed), and Google
+ *     compares the two strings — so a per-request derivation is not even
+ *     self-consistent across the pair;
+ *   - a request with no x-forwarded-proto yields "http://", which Google
+ *     rejects outright.
+ *
+ * PUBLIC_BASE_URL is this app's declared public base. It is already validated
+ * at boot (absolute http(s), no userinfo, path exactly BASE_PATH) and is
+ * already the source of every emailed link, so making it authoritative here
+ * aligns the OAuth URI with what the app tells the world about itself, and
+ * makes the string depend on NO per-request input.
+ *
+ * UNSET IS THE ROLLBACK PATH AND IS UNTOUCHED. With PUBLIC_BASE_URL empty the
+ * header derivation below runs exactly as it always has, including the http://
+ * case and the throw when a request carries no host at all.
  */
 export function getRedirectUriFromReq(req: Request): string {
+  // Authoritative when set: no header can move it, so the authorize step and
+  // the token exchange are the same string by construction, not by coincidence.
+  if (PUBLIC_URL) {
+    return publicUrl(OAUTH_CALLBACK_PATH);
+  }
+
   const xfProto = (req.headers['x-forwarded-proto'] as string | undefined)?.split(',')[0]?.trim();
   const xfHost = (req.headers['x-forwarded-host'] as string | undefined)?.split(',')[0]?.trim();
   const hostHeader = req.get('host');
@@ -60,12 +90,14 @@ export function getRedirectUriFromReq(req: Request): string {
     return `${proto}://${host}${basePath(OAUTH_CALLBACK_PATH)}`;
   }
 
-  if (!PUBLIC_URL) {
-    throw new Error(
-      'Cannot determine OAuth redirect URI: no x-forwarded-host / host header and PUBLIC_BASE_URL is not set'
-    );
-  }
-  return publicUrl(OAUTH_CALLBACK_PATH);
+  // Reachable only with PUBLIC_BASE_URL empty — the early return above took
+  // every other case — so there is nothing left to fall back to. The old code
+  // had a `return publicUrl(...)` here; it is now unreachable by construction,
+  // and leaving it would read as if PUBLIC_URL were still a last resort rather
+  // than the first choice.
+  throw new Error(
+    'Cannot determine OAuth redirect URI: no x-forwarded-host / host header and PUBLIC_BASE_URL is not set'
+  );
 }
 
 export function createOAuthClient(redirectUri?: string): OAuth2Client {

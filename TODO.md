@@ -34,6 +34,7 @@
 | O-15 | **Mount matching is case-INsensitive, the cookie `Path` is case-sensitive.** Express's default (`case sensitive routing` off, unchanged by any bundle) means `/LEADFINDER/api/me` matches the mount and is served — but RFC 6265 path-match is byte-exact, so the browser would not attach `lf_session` (`Path=/leadfinder/`) and the user reads as signed out. Confirmed by probe: `/LEADFINDER/api/me` → `401`. Not reachable through the gateway, which forwards the exact prefix, and unprefixed it cannot happen at all (`Path=/` matches everything). New only because Bundle 2 narrowed the cookie Path. One line if it is ever wanted: `app.set('case sensitive routing', true)`. **L2 note:** the legacy matcher is deliberately case-SENSITIVE, so `/API/JOBS/<id>/CSV` is not adopted as a legacy address. No emitted link has ever been uppercase — every one is built from a literal — so this affects only hand-typed URLs, which today's case-insensitive mounts happen to serve. | V1 audit | OPEN — informational |
 | O-16 | **The emailed "View full job log" link has never deep-linked to the job.** `notifier.ts:29` emits `…/#/jobs/<id>`, but `App.tsx:124` only reacts to `#/settings`; every other fragment is ignored and the user lands on the job list. Pre-existing and unchanged by L2 — surfaced because the link's survival was verified end to end (it now reaches `/leadfinder/` in one hop, fragment re-attached by the browser per RFC 7231 §7.1.2). Fixing it means teaching the SPA to open a job from the fragment; that is a product change, not a migration one. | L2 audit | OPEN — informational |
 | O-17 | A legacy **POST with a malformed or oversized JSON body** is answered 400/413 by `express.json` before the 307, because the legacy layer sits after the body parser. That placement is deliberate: the parser and the request logger both precede it, and the log is what proves the method arrives intact. No caller POSTs to a legacy address — the three emailed shapes are GETs and there are no webhooks — so this is a property, not a defect. | L2 audit | DEFERRED |
+| O-19 | **`PUBLIC_BASE_URL` carrying a path while `BASE_PATH` is unset is now load-bearing and unguarded.** The boot guard (`assertPublicUrlCarriesPrefix`) only compares the two when a prefix is active, so `PUBLIC_BASE_URL=https://host/some/path` with no `BASE_PATH` boots happily and, since H1, makes the OAuth redirect URI `https://host/some/path/api/auth/google/callback` — a path the app does not serve. Not a new class: that same value has always aimed every emailed link at `/some/path/api/jobs/…`, which is equally wrong, so the state was already broken. Cutover rule 6 says set the pair together, which prevents it. One-line mitigation if wanted: warn at boot when `new URL(PUBLIC_BASE_URL).pathname !== '/'` and `BASE_PATH` is unset. | H1 audit | DEFERRED |
 | O-18 | The legacy layer is an **enumerated list, not a catch-all**: a browser tab left open across the cutover still 404s on `/api/me`, `/api/jobs`, `/api/settings`. Deliberate — a catch-all would have to build its `Location` from the raw request path (the open-redirect shape L2 exists to avoid), and those sessions are invalidated by the `als_session`→`lf_session` rename anyway, so the tab is signed out regardless. Reload lands on the app. | L2 audit | OPEN — informational |
 
 ---
@@ -45,31 +46,35 @@ Bundle 1 records these; it does not change them. Each becomes a cutover item.*
 
 | Service | What is registered | File | Line | Cutover action |
 |---|---|---|---|---|
-| **Google Cloud Console — OAuth 2.0 Client** | Authorized redirect URI: `<app address>/api/auth/google/callback` | `artifacts/api-server/src/oauth.ts` | 14 (path const), 60 (header-derived), 68 (`PUBLIC_URL` fallback) | **Add** the new gateway URI in the Cloud Console *before* the cutover and **keep the old one** until the old address is retired. The app derives the URI from `x-forwarded-host`/`Host` at request time, so it follows the gateway automatically — but Google rejects any URI not on the allow-list, so sign-in breaks for everyone the moment the host changes without the console entry. |
+| **Google Cloud Console — OAuth 2.0 Client** | Authorized redirect URI: `<app address>/api/auth/google/callback` | `artifacts/api-server/src/oauth.ts` | 14 (path const), 78 (`PUBLIC_URL`, authoritative since H1), 90 (header fallback, only when `PUBLIC_BASE_URL` is unset) | **Add** the new gateway URI in the Cloud Console *before* the cutover and **keep the old one** until the old address is retired. **Since H1 the URI is `PUBLIC_BASE_URL` + the callback path whenever `PUBLIC_BASE_URL` is set — it no longer follows the request host.** So the URI to register is exactly the one you can predict from that variable, and the only way to change it is to change that variable. Google rejects any URI not on the allow-list, so sign-in breaks for everyone the moment the two disagree. |
 | (same, documented) | `<PUBLIC_BASE_URL>/api/auth/google/callback` | `SETUP_GOOGLE_OAUTH.md` | 36 | Update the doc when the address changes. |
 
-**The exact URIs to register, character for character.** Measured in the Bundle 2 LIT
-smoke by replaying the derivation with the gateway's `x-forwarded-host` — not composed
-by hand:
+**The exact URI the app now sends, character for character.** Re-derived in the H1 LIT
+smoke through the real sink and read from the server's own log in **both** OAuth steps —
+not composed by hand:
 
 ```
-https://mobupps-tools-gateway.replit.app/leadfinder/api/auth/google/callback
-https://tools.mobupps.net/leadfinder/api/auth/google/callback
+https://tools.mobupps.net/leadfinder/api/auth/google/callback     <- the only one sent, since H1
 ```
 
-Add **both** in the Google Cloud Console **before** the cutover (the second only matters
-once the domain lands 2026-08-02) and **keep every existing URI** until the old address
-is retired. The app derives this at request time from `x-forwarded-proto` +
-`x-forwarded-host` plus its own `BASE_PATH`, so it follows the gateway automatically —
-but Google rejects any URI not on the allow-list, and sign-in breaks for everyone the
-moment the host changes without the console entry. Verified in the smoke: exactly one
-`/leadfinder` in the derived URI, no double prefix, for both hosts.
+**Keep every existing URI registered** (cutover rule 5), including
+`https://mobupps-tools-gateway.replit.app/leadfinder/api/auth/google/callback`, which is
+now **unused**: since H1 the app sends the `PUBLIC_BASE_URL` one whatever host the request
+arrived through. A consequence worth knowing: **the gateway's `.replit.app` mirror is no
+longer a self-contained login surface** — a user who starts sign-in there is returned by
+Google to `tools.mobupps.net` and ends up on the canonical domain, which is what the
+ROADMAP's canonical-address rule wants anyway.
 
-**Depends on the gateway forwarding `x-forwarded-host`.** If it forwards the app's own
-hostname instead, the derived URI is the app's address and the console needs *that* URI
-too. Check this against the running gateway before cutover — it is a one-request test
-against `/leadfinder/api/auth/google/debug`, which echoes both the header and the
-derived URI.
+**H1 removed the gateway dependency this section used to carry.** The earlier warning here
+— *"depends on the gateway forwarding `x-forwarded-host`; if it forwards the app's own
+hostname instead, the console needs THAT URI too"* — was correct and was never checked
+against the running gateway. It is what happened: the gateway forwards to the `.replit.app`
+deployment, Replit's edge set `x-forwarded-host` to the deployment host, the app derived
+`https://ad-library-finder.replit.app/leadfinder/api/auth/google/callback`, and Google
+answered `redirect_uri_mismatch` for everyone. The derivation no longer reads any header,
+so the dependency is gone. The one-request confirmation is unchanged and still worth
+running after every publish: `GET /leadfinder/api/auth/google/debug` reports both the
+derived URI and the real `forwardedHost`.
 
 **No other external registration exists.** Every other outbound service is call-out-only
 and holds no address of ours — see the outbound analysis in the Bundle 1 ledger entry.
@@ -882,6 +887,234 @@ smoke.
 **closed** (the platform has now committed the `.replit` port deletion), O-10, O-11 and
 O-12 are updated with what this order changed, and three new out-of-scope items are
 recorded as O-16…O-18 and left untouched.
+
+---
+
+### Leadfinder Hotfix H1 — PUBLIC_BASE_URL authoritative for the OAuth redirect URI ☑ DONE (2026-08-02)
+
+Branch `hotfix-h1-oauth-host`. **Production is live and sign-in is broken**, so this is a
+hotfix, not a bundle: minimum surface, same ritual.
+
+**0. Lineage check (Git safety rule 1, directional form) — PASS.** *Does another branch
+hold content main lacks?* `git diff <branch> main` over all 9 local and 8 remote refs:
+nothing does. `replit-agent` carries 4 commits `main` lacks with an **identical tree**.
+`main` has taken two further platform *"Published your App"* commits since L2 (`fe8c7c8`,
+`dc3a2b4` — the cutover publishes); `git diff c4807f6 main` is **empty**, so they changed
+no file. `main` and `origin/main` are level. Branch cut from `main`.
+
+**1. Blast radius (recorded before the first edit)**
+
+*The defect, measured rather than assumed.* `getRedirectUriFromReq()`
+(`oauth.ts:51`) is the single sink for the redirect URI: the authorize step
+(`getAuthUrl`), the token exchange (`exchangeCodeForTokensAndProfile`) and
+`/api/auth/google/debug` all call it. Its precedence today is
+**`x-forwarded-host` → `Host` → `PUBLIC_BASE_URL`**, and the third branch is reached only
+when a request carries neither header — which HTTP/1.1 makes effectively impossible. So
+`PUBLIC_BASE_URL` is **dead code on this path**, even though it is the value the boot
+guard validates and the value every emailed link already uses. Only the *host* is
+request-derived; the path half already comes from `BASE_PATH` via `basePath()`.
+
+Measured against the live configuration (`BASE_PATH=/leadfinder/`,
+`PUBLIC_BASE_URL=https://tools.mobupps.net/leadfinder`), booted from the real assembly:
+
+| What the app receives | Derived URI, before this fix |
+|---|---|
+| gateway → `.replit.app`; Replit's edge sets `x-forwarded-host: ad-library-finder.replit.app` | `https://ad-library-finder.replit.app/leadfinder/api/auth/google/callback` ← **the mismatch** |
+| direct hit, no `x-forwarded-*` | `http://ad-library-finder.replit.app/leadfinder/api/auth/google/callback` (**http**, which Google rejects outright) |
+| a gateway that forwarded the original host | `https://tools.mobupps.net/leadfinder/api/auth/google/callback` (correct — but the gateway does not do this) |
+| `PUBLIC_BASE_URL` | never consulted |
+
+Google holds `https://tools.mobupps.net/leadfinder/…` and
+`https://mobupps-tools-gateway.replit.app/leadfinder/…`; the app sends the deployment
+host, which is on neither list. **This is exactly the risk Bundle 1 recorded under
+"External registrations discovered"** — *"Depends on the gateway forwarding
+`x-forwarded-host`… check this against the running gateway before cutover"* — the check
+was not run, and it landed. Two further consequences, both closed by the same change: the
+authorize step and the callback can arrive on **different** hosts (the callback comes back
+through whatever Google was given), so a request-derived host is not even self-consistent
+across the pair Google compares; and a request without `x-forwarded-proto` yields `http://`.
+
+*Files to be touched — 3 code + 1 doc:*
+
+| File | Change |
+|---|---|
+| `artifacts/api-server/src/oauth.ts` | `PUBLIC_URL` consulted FIRST when set; header derivation kept verbatim as the fallback |
+| `artifacts/api-server/scripts/check-oauth-redirect-uri.mjs` | **new.** boot gate: derives the URI in real child processes across env × header combinations |
+| `artifacts/api-server/scripts/run-tests.mjs` | run the new gate |
+| `TODO.md` | this entry |
+
+*Not touched:* `urls.ts` (`publicUrl()` already composes exactly this string, and it is
+already proved to carry the prefix exactly once), `app.ts`, `index.ts`, `auth.ts`,
+`routes-auth.ts` (including the `/api/auth/google/debug` response shape — the DARK
+baseline pins it, see O-4), `notifier.ts`, the client, the database, Replit Secrets.
+
+*Behaviours affected:*
+1. With `PUBLIC_BASE_URL` **set**, the redirect URI is `PUBLIC_BASE_URL` +
+   `/api/auth/google/callback`, on every request, regardless of headers. This is the fix.
+2. With `PUBLIC_BASE_URL` **unset**, nothing changes at all — the header derivation is
+   byte-identical, including the `http://` case and the "no host at all" throw. That is
+   the rollback path and it stays frozen.
+3. **Wider than production:** any deploy with `PUBLIC_BASE_URL` set is affected, including
+   this workspace, whose env holds `https://leadfindermobupps.replit.app`. Dev sign-in
+   will use that address rather than the request host. That is the intended semantic of
+   the variable — "this is my public address" — but it is a behaviour change outside
+   production and is called out rather than buried.
+
+*Worst realistic failure, in order:*
+1. **`PUBLIC_BASE_URL` set to something Google does not have registered.** Sign-in stays
+   broken, just with a different URI in the error. Mitigated by the boot guard (the value
+   must be absolute http(s) and its path must equal `BASE_PATH` exactly) and by the smoke
+   printing the derived string character for character, so it can be compared with the
+   Cloud Console before publishing.
+2. **The two steps disagreeing.** Only one function derives the URI and it now depends on
+   no per-request input, so the authorize step and the token exchange are identical by
+   construction. Asserted from the server's own log rather than claimed.
+3. **A regression in the unset path**, which would break the rollback. Caught by the DARK
+   byte-identity gate, which pins the `oauth debug` line of the 17-probe table.
+
+*Rollback:* `git revert` the commit, or unset `PUBLIC_BASE_URL` (which restores the exact
+previous behaviour by construction — the old code path is untouched). No DB migration, no
+schema change, no secret change. **No new OAuth registration is required:** the URI this
+fix produces, `https://tools.mobupps.net/leadfinder/api/auth/google/callback`, is already
+registered.
+
+**2. Implementation** — the blast radius held exactly: 3 code + 1 doc.
+
+`getRedirectUriFromReq()` gains one early return:
+
+```ts
+if (PUBLIC_URL) {
+  return publicUrl(OAUTH_CALLBACK_PATH);
+}
+// …the header derivation below is unchanged, byte for byte…
+```
+
+The header branch is untouched. The old trailing `return publicUrl(...)` — the third
+priority — is now unreachable by construction (the early return took every case that could
+have got there), so it was replaced by the throw that already guarded it; leaving it would
+read as if `PUBLIC_URL` were still a last resort rather than the first choice. **The
+throw's condition is unchanged**: no host *and* no `PUBLIC_BASE_URL`. The one state that
+used to reach the old line — no host header but `PUBLIC_BASE_URL` set — now returns the
+same string from the top, and that equivalence is asserted (`'no host headers at all'` is
+in the gate's header matrix).
+
+**`getRedirectUriFromReq` is the only sink**, confirmed by sweep rather than memory: the
+sole other `x-forwarded-*` / `req.get('host')` reads in the tree are in
+`routes-auth.ts:58-60`, where the debug endpoint *echoes* the headers for diagnosis
+without deriving anything. Its three callers — the debug endpoint, `getAuthUrl` (authorize)
+and `exchangeCodeForTokensAndProfile` (token exchange) — all go through it, which is why
+the pair Google compares is now identical **by construction**: the string depends on no
+per-request input at all.
+
+**3. Gates** — all green.
+
+| Gate | Command | Before | After |
+|---|---|---|---|
+| typecheck + build | `pnpm build` | pass | pass |
+| tests | `pnpm --filter api-server test` | 30 modules, 1469 | 30 modules, **1469**, 0 failed |
+| standalone gates, run directly | `node scripts/check-*.mjs` | 4 | **5** (new: `check-oauth-redirect-uri`) |
+| new boot gate | `check-oauth-redirect-uri.mjs` | — | **59 LIT + 7 DARK + 4 public-only**, 0 failed |
+
+The unit-assertion total is unchanged because the new gate is a **booted** one: `PUBLIC_URL`
+is resolved at module load, so "set" and "unset" are two processes, not two arguments. The
+gate boots the real assembly per env combination and reads the URI through the real sink —
+both directly and over HTTP through `/api/auth/google/debug`, which is the endpoint an
+operator will use to confirm the fix on production.
+
+**4. Godlike audit — 3 rounds, closed on a fully clean one**
+
+*Round 1 — 0 product findings, 619 assertions.* The load-bearing one is a **differential**:
+with `PUBLIC_BASE_URL` unset, the new function is run against the **old implementation
+copied verbatim** across 16 header shapes (missing headers, multi-value, whitespace-padded,
+empty, `evil.com@good.com`, port forms, no headers at all). Identical output on every
+shape, and it throws exactly where the old code threw. That is the rollback-path claim,
+proved rather than asserted. With `PUBLIC_BASE_URL` set — prefixed, unprefixed, nested,
+explicit port, and `http://localhost` — all 16 header shapes derive **one** string, checked
+with the URL oracle: declared origin, declared scheme, no userinfo, no doubled slash, path
+exactly base + callback, prefix never repeated (checked with the parser, not by counting).
+Boot refusals re-proved in real child processes: userinfo, `user:pass@`, protocol-relative,
+`javascript:`, query-bearing, doubled trailing slash, missing prefix and double prefix all
+still refuse to start; both legitimate states still start.
+
+*Round 2 — 1 finding, in the verification tooling, and a real consequence behind it.* The
+L2 LIT smoke failed one check: it expected the derived URI to follow `x-forwarded-host` for
+`mobupps-tools-gateway.replit.app`. That expectation encoded the **pre-H1** behaviour —
+exactly the behaviour that broke sign-in — so the check was updated, not the product. The
+consequence it exposes is worth stating plainly: **the gateway's `.replit.app` mirror is no
+longer a self-contained login surface.** A user who starts sign-in there is now sent to
+Google with the `tools.mobupps.net` callback and lands on the canonical domain afterwards,
+with the session cookie set there. That follows the ROADMAP's own rule that
+`https://tools.mobupps.net/<tool>` is canonical and the other addresses are mirrors, and it
+is a consequence of the fix rather than a defect — but it means the previously-registered
+`https://mobupps-tools-gateway.replit.app/leadfinder/api/auth/google/callback` URI is now
+**unused**. Per cutover rule 5 it stays registered; nothing to change in the Cloud Console.
+No cross-process problem is introduced: authorize and callback still reach the same single
+Reserved-VM process through the gateway, so the in-memory `state` store still validates.
+
+*Round 3 — fully clean.* Everything re-run in one pass: build ✓ (0 tsc errors), 1,469
+assertions ✓, five standalone gates ✓, H1 audit 619/0 ✓, **L2 audit 4,763/0 ✓**, DARK smoke
+byte-identical ✓, L2 LIT smoke 83/83 ✓, H1 LIT smoke 11/11 ✓.
+
+**Security framing.** H1 *removes* an attacker-influenced input from an outbound URL. Before
+it, anyone able to reach the deployment directly with a forged `Host` or `x-forwarded-host`
+could make the app send `redirect_uri=https://attacker/...` to Google. Google's allow-list
+made it unexploitable for token theft, but the value flowed from request into an outbound
+URL, and the URL parser confirms that no longer happens: with `PUBLIC_BASE_URL` set, all 16
+header shapes — including `evil.example.com` in both headers — yield the same canonical
+string. `PUBLIC_BASE_URL` itself is already validated at boot (absolute http(s), no
+userinfo, no query/fragment, path exactly `BASE_PATH` while prefixed) and that validation
+was re-proved here in real child processes.
+
+**5. Smokes — both modes, real DB checksum verified either side**
+
+Same envelope as L2: the app is assembled by the shipped `buildApp()`, `startQueue()` is
+never called, each run uses its own throwaway cwd and binds `127.0.0.1` on ports 3991-3998,
+outside `.replit`'s mapped set. **Real DB md5 `e689c6fc55e6276acf296f7e9bada157` identical
+before and after every run. No secret was written. No workflow was running or touched. No
+scraping job was started and no email was dispatched.**
+
+*a. DARK (`BASE_PATH` and `PUBLIC_BASE_URL` both unset) — the 17-probe table is
+**byte-for-byte identical** to the Bundle 1 baseline*, md5
+`0b9f472cd1fcb63fb9c93396cc198b06`, `diff` clean. That table pins the `oauth debug` line
+(`redirectUri: http://127.0.0.1:<PORT>/api/auth/google/callback`, `publicBaseUrlEnv: null`),
+so the rollback path is verified at the exact surface this hotfix touches.
+
+*b. LIT (`BASE_PATH=/leadfinder/`, `PUBLIC_BASE_URL=https://tools.mobupps.net/leadfinder`,
+set for the child process only) — 11/11, plus the L2 LIT suite at 83/83.* Both steps Google
+compares were driven over real HTTP **on deliberately different hops** — the authorize step
+with `x-forwarded-host: ad-library-finder.replit.app` (what production sees), the callback
+with `x-forwarded-host: tools.mobupps.net` (what Google would return through) — and the URI
+read from **the server's own log**, not from an assertion:
+
+```
+[INFO] OAuth authorize: using redirect_uri=https://tools.mobupps.net/leadfinder/api/auth/google/callback
+[INFO] OAuth callback:  using redirect_uri=https://tools.mobupps.net/leadfinder/api/auth/google/callback
+```
+
+Identical strings, from different hops. The `redirect_uri` parameter actually handed to
+Google was read out of the authorize redirect's `Location` and is the same string again;
+`/leadfinder/api/auth/google/debug` reports it too, while still echoing the real
+`forwardedHost`, so the mismatch stays diagnosable from one endpoint.
+
+**Nothing reached Google.** The token exchange was driven with a bogus code and
+`HTTPS_PROXY` pointed at a closed local port, so the outbound POST to
+`oauth2.googleapis.com/token` failed with `ECONNREFUSED 127.0.0.1:1` — asserted positively,
+along with the absence of any Google-issued error (`invalid_grant`), which is what proves
+no request left the machine. The log line under test is written *before* that call, so the
+evidence is unaffected.
+
+**6. What the operator must check after publishing.** Nothing in the Cloud Console — the
+URI this produces is already registered. Confirm from the app itself:
+`GET https://tools.mobupps.net/leadfinder/api/auth/google/debug` must report
+`"redirectUri":"https://tools.mobupps.net/leadfinder/api/auth/google/callback"`, and
+`forwardedHost` will still show the deployment host, which is the point: the URI no longer
+follows it.
+
+**7. Auto-fix** — no in-scope product findings after round 1; the round-2 finding was a
+verification-tooling expectation and was corrected there. One new out-of-scope item recorded
+as **O-19** and left untouched. O-4 remains open and is now more clearly worth taking at the
+next opportunity: the debug endpoint still echoes the raw env rather than the resolved
+config, and it is the endpoint this failure is diagnosed from.
 
 ---
 

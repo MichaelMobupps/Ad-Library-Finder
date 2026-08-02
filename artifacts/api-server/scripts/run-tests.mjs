@@ -155,6 +155,25 @@ if (legacy.status === 0) {
   failedModules.push('legacy-redirects');
 }
 
+// OAuth redirect-URI gate: PUBLIC_BASE_URL must be authoritative when set, and
+// the header derivation must stay frozen when it is not. PUBLIC_URL is resolved
+// at module load, so each env combination is its own booted child process.
+const oauth = spawnSync(process.execPath, [path.join(ROOT, 'scripts', 'check-oauth-redirect-uri.mjs')], {
+  cwd: ROOT,
+  encoding: 'utf8',
+});
+if (oauth.status === 0) {
+  for (const line of `${oauth.stdout || ''}`.trim().split('\n')) {
+    if (line.trim()) console.log(`  ✓ ${line}`);
+  }
+} else {
+  console.log('  ✗ OAUTH REDIRECT URI DERIVATION BROKEN');
+  for (const line of `${oauth.stdout || ''}${oauth.stderr || ''}`.trim().split('\n')) {
+    if (!/^\[\d{4}-/.test(line)) console.log(`      ${line}`);
+  }
+  failedModules.push('oauth-redirect-uri');
+}
+
 if (failedModules.length > 0) {
   console.error(`✗ failing modules: ${failedModules.join(', ')}`);
   process.exit(1);
