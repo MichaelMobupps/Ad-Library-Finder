@@ -134,6 +134,27 @@ if (formCss.status === 0) {
   failedModules.push('form-css');
 }
 
+// Legacy-address gate: boots the real Express assembly in both modes and pins
+// the redirect STATUS CODE, method preservation, the loop guard and the
+// open-redirect refusals over real HTTP. A pure-function test cannot see a
+// `res.redirect(302, …)` edit; this can. Each mode runs in its own throwaway
+// cwd (the script does that itself) and never starts the queue.
+const legacy = spawnSync(process.execPath, [path.join(ROOT, 'scripts', 'check-legacy-redirects.mjs')], {
+  cwd: ROOT,
+  encoding: 'utf8',
+});
+if (legacy.status === 0) {
+  for (const line of `${legacy.stdout || ''}`.trim().split('\n')) {
+    if (line.trim()) console.log(`  ✓ ${line}`);
+  }
+} else {
+  console.log('  ✗ LEGACY ADDRESS SURVIVAL BROKEN');
+  for (const line of `${legacy.stdout || ''}${legacy.stderr || ''}`.trim().split('\n')) {
+    if (!/^\[\d{4}-/.test(line)) console.log(`      ${line}`);
+  }
+  failedModules.push('legacy-redirects');
+}
+
 if (failedModules.length > 0) {
   console.error(`✗ failing modules: ${failedModules.join(', ')}`);
   process.exit(1);

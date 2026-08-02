@@ -334,12 +334,109 @@ export function bareBasePathRedirect(
 }
 
 /**
+ * Status code for every legacy-to-prefixed redirect. 307, never 308/301/302.
+ *
+ * 308 and 301 are PERMANENT and cacheable: a browser or proxy that cached one
+ * would keep bouncing to the prefixed path after an env-unset rollback, at
+ * which point that path no longer exists — a cached redirect would outlive the
+ * very rollback the whole migration rests on. 302 is not cacheable by default
+ * but licenses a client to rewrite POST as GET, silently dropping the body.
+ * 307 is temporary AND method-preserving, which is exactly the pair we need.
+ *
+ * Exported so the value is pinned in one place and asserted by both the unit
+ * suite and the boot gate — a future edit to 302 or 308 fails a gate instead of
+ * shipping quietly.
+ */
+export const LEGACY_REDIRECT_STATUS = 307;
+
+/**
+ * Legacy paths, matched on the request path with NO prefix.
+ *
+ *   /                          the old app root — every bookmark, and the
+ *                              emailed "/#/jobs/<id>" link, whose fragment is
+ *                              never sent to us and is re-attached by the
+ *                              browser across the redirect on its own.
+ *   /api/jobs/<id>/csv         the emailed result-CSV link
+ *   /api/jobs/<id>/hq-zip      the emailed HQ-split link
+ *
+ * The id is `[^/]+`: one segment, so a crafted value can neither add path
+ * structure nor smuggle an authority. Anchored, so nothing else matches.
+ */
+const LEGACY_DOWNLOAD = /^\/api\/jobs\/[^/]+\/(?:csv|hq-zip)$/;
+
+/**
+ * Where a legacy (unprefixed) request must be sent once the app is mounted
+ * under a prefix, or null to leave the request alone.
+ *
+ * Returns null for the WHOLE default configuration, so an env-unset rollback
+ * has no legacy layer at all — not one that happens to agree with today.
+ *
+ * `search` is the raw query string (leading "?", or empty) and is carried
+ * across byte-for-byte: an emailed CSV link may legitimately carry
+ * "?product=cps", and a lost query would silently serve the wrong export.
+ *
+ * SECURITY — this is the one place in the app where a Location header is
+ * derived from request input, so it is built from fixed literals plus a single
+ * non-slash segment and then CHECKED WITH THE URL PARSER before it is emitted:
+ * the target must resolve to this same origin, must stay under the mount, and
+ * must not contain the empty segment ("//") that answers 200 index.html
+ * instead of the file. A target failing any of those is not emitted at all —
+ * the request falls through to the same 404 it gets today.
+ *
+ * LOOP SAFETY — every target is a path no rule here matches:
+ * `legacyRedirect(prefix, legacyRedirect(prefix, x))` is null for every x, so a
+ * second hop cannot exist. That is structural, not a coincidence: both targets
+ * begin with the prefix, and both rules only ever match unprefixed paths.
+ */
+export function legacyRedirect(
+  prefix: string,
+  reqPath: string,
+  search = '',
+): string | null {
+  if (prefix === '') return null;
+
+  let target: string | null = null;
+  if (reqPath === '/') target = `${prefix}/${search}`;
+  else if (LEGACY_DOWNLOAD.test(reqPath)) target = `${prefix}${reqPath}${search}`;
+  if (target === null) return null;
+
+  // Oracle check on what we are about to put in a Location header.
+  const ORACLE = 'https://legacy.invalid';
+  let probe: URL;
+  try {
+    probe = new URL(target, ORACLE);
+  } catch {
+    return null;
+  }
+  if (probe.origin !== ORACLE) return null;
+  if (!probe.pathname.startsWith(`${prefix}/`)) return null;
+  if (probe.pathname.includes('//')) return null;
+  return target;
+}
+
+/**
  * Whether the prefix-scoped SPA fallback should answer with index.html.
  *
  * `mountRelPath` is the request path with the mount prefix already stripped by
  * Express (so "/leadfinder/api/jobs/x" arrives as "/api/jobs/x").
  *
+ * `rawPath` is the path half of the ORIGINAL request target, before Express
+ * touched it. It is needed for exactly one reason: Express's mount strip
+ * CONSUMES an empty segment. "/leadfinder//api/jobs/x/csv" arrives here as
+ * "/api/jobs/x/csv" — indistinguishable from the ordinary unmatched API path —
+ * so the doubled slash is invisible at this layer unless the raw target is
+ * carried in. Defaults to `mountRelPath` so a caller with nothing else to give
+ * gets the old behaviour.
+ *
  *  - Non-GET/HEAD passes through, exactly as today's `app.get('*')` does.
+ *  - A path with an EMPTY SEGMENT ("//") is not a route we own — no mount can
+ *    match it — so answering it with 200 index.html is precisely how a broken
+ *    download link masquerades as a working page. V1 found that exact shape
+ *    reaching users through a doubled slash in PUBLIC_BASE_URL: the click
+ *    returned the app page, with no 404, no log line, and requireAuth never
+ *    reached. That source is refused at boot now, and no legacy redirect can
+ *    emit such a target, but the sink itself is one condition away from being
+ *    safe by construction rather than by argument. 404 it.
  *  - Anything under /api passes the decision through unchanged, so an unmatched
  *    API path keeps returning what it returns today (the API routers are
  *    mounted first and therefore still win).
@@ -349,8 +446,13 @@ export function bareBasePathRedirect(
  *    working page.
  *  - Everything else is a deep link -> index.html.
  */
-export function spaFallbackServesIndex(method: string, mountRelPath: string): boolean {
+export function spaFallbackServesIndex(
+  method: string,
+  mountRelPath: string,
+  rawPath: string = mountRelPath,
+): boolean {
   if (method !== 'GET' && method !== 'HEAD') return false;
+  if (rawPath.includes('//')) return false;
   const isApi = mountRelPath === '/api' || mountRelPath.startsWith('/api/');
   if (!isApi) {
     const last = mountRelPath.slice(mountRelPath.lastIndexOf('/') + 1);
@@ -637,6 +739,132 @@ export function runUrlsTests(): { passed: number; failed: number; failures: stri
     }
   }
 
+  // ---- legacy survival: old addresses keep working once the prefix is on ----
+  // The status code is a value, not a literal at the call site, so this pins it.
+  check(LEGACY_REDIRECT_STATUS === 307, 'legacy redirects are 307');
+  check((LEGACY_REDIRECT_STATUS as number) !== 308, 'NOT 308 — permanent, cacheable, survives a rollback');
+  check((LEGACY_REDIRECT_STATUS as number) !== 301, 'NOT 301 — permanent, cacheable, survives a rollback');
+  check((LEGACY_REDIRECT_STATUS as number) !== 302, 'NOT 302 — licenses a POST to be downgraded to GET');
+
+  // Unprefixed, the legacy layer does not exist. Not "agrees with today" — absent.
+  for (const p of ['/', '/api/jobs/job_abc/csv', '/api/jobs/job_abc/hq-zip', '/api/me', '/anything']) {
+    check(legacyRedirect('', p) === null, `unprefixed: ${p} is left alone`);
+    check(legacyRedirect('', p, '?x=1') === null, `unprefixed: ${p}?x=1 is left alone`);
+  }
+
+  // The three shapes that are actually in someone's inbox or bookmark bar.
+  check(legacyRedirect('/leadfinder', '/') === '/leadfinder/', 'old root reaches the mount');
+  check(
+    legacyRedirect('/leadfinder', '/api/jobs/job_abc/csv') === '/leadfinder/api/jobs/job_abc/csv',
+    'emailed CSV link reaches the prefixed download',
+  );
+  check(
+    legacyRedirect('/leadfinder', '/api/jobs/job_abc/hq-zip') === '/leadfinder/api/jobs/job_abc/hq-zip',
+    'emailed HQ-split link reaches the prefixed download',
+  );
+  // The query is the difference between the right export and the wrong one.
+  check(
+    legacyRedirect('/leadfinder', '/api/jobs/job_abc/csv', '?product=cps') ===
+      '/leadfinder/api/jobs/job_abc/csv?product=cps',
+    'the CSV product override survives the redirect',
+  );
+  check(
+    legacyRedirect('/leadfinder', '/', '?a=1&b=2') === '/leadfinder/?a=1&b=2',
+    'a multi-parameter query survives byte-for-byte',
+  );
+  check(
+    legacyRedirect('/leadfinder', '/api/jobs/job_a%20b/csv') === '/leadfinder/api/jobs/job_a%20b/csv',
+    'a percent-encoded id is passed through, not re-encoded',
+  );
+
+  // LOOP GUARD. Every target must be a path no rule matches — one hop, ever.
+  for (const [p, search] of [['/', ''], ['/', '?a=1'], ['/api/jobs/job_abc/csv', '?product=cps'], ['/api/jobs/job_abc/hq-zip', '']] as const) {
+    const target = legacyRedirect('/leadfinder', p, search)!;
+    const landed = new URL(target, 'https://self.example.com').pathname;
+    check(legacyRedirect('/leadfinder', landed) === null, `no second hop from ${p}${search}`);
+    check(bareBasePathRedirect('/leadfinder', landed) === null, `the bare-prefix rule does not re-redirect ${landed}`);
+  }
+
+  // Already-prefixed paths are not ours to touch — that IS the loop, if it ever ran.
+  for (const p of [
+    '/leadfinder/',
+    '/leadfinder/api/jobs/job_abc/csv',
+    '/leadfinder/api/jobs/job_abc/hq-zip',
+    '/leadfinder/api/me',
+  ]) {
+    check(legacyRedirect('/leadfinder', p) === null, `prefixed path untouched: ${p}`);
+  }
+
+  // Shapes that must NOT be adopted: anything not actually emailed or bookmarked.
+  for (const p of [
+    '/api/jobs/job_abc/csv/extra',   // deeper than the route
+    '/api/jobs/job_abc/csv/',        // trailing slash is a different path
+    '/api/jobs//csv',                // empty id
+    '/api/jobs/job_abc/CSV',         // the app never emitted this case
+    '/api/jobs/a/b/csv',             // two segments where one belongs
+    '//api/jobs/job_abc/csv',        // protocol-relative-looking request target
+    '/api/jobs',
+    '/api/me',
+    '/version',
+    '/assets/index-abc.js',
+    '/some/deep/link',
+    '/leadfinderX',
+    '',
+  ]) {
+    check(legacyRedirect('/leadfinder', p) === null, `not a legacy address: ${JSON.stringify(p)}`);
+  }
+
+  // SECURITY: the Location is derived from request input, so prove with the URL
+  // oracle that nothing reachable can leave this origin or the mount, and that
+  // no target carries the "//" that answers 200 index.html instead of a file.
+  {
+    const SELF_ORIGIN = 'https://self.example.com';
+    const hostile = [
+      '/api/jobs/..%2F..%2F..%2Fevil.com/csv',
+      '/api/jobs/%2F%2Fevil.com/csv',
+      '/api/jobs/..%5C..%5Cevil.com/csv',
+      '/api/jobs/%00/csv',
+      '/api/jobs/..;/csv',
+      '/api/jobs/../csv',
+      '/api/jobs/./csv',
+      '/api/jobs/job_abc%0d%0aSet-Cookie:%20x=1/csv',
+      '/api/jobs/job_abc/hq-zip',
+      '/',
+    ];
+    const hostileSearch = [
+      '',
+      '?next=//evil.com',
+      '?next=https://evil.com',
+      '?a=%2F%2Fevil.com',
+      '?a=b#/../..',
+      '?a=b#//evil.com',
+    ];
+    for (const p of hostile) {
+      for (const s of hostileSearch) {
+        const target = legacyRedirect('/leadfinder', p, s);
+        if (target === null) { passed++; continue; }   // refusing outright is always safe
+        check(!target.startsWith('//'), `target not protocol-relative: ${p}${s}`);
+        check(!BACKSLASH.test(target), `target has no backslash: ${p}${s}`);
+        check(!/[\r\n]/.test(target), `target has no CR/LF: ${p}${s}`);
+        const resolved = new URL(target, SELF_ORIGIN);
+        check(resolved.origin === SELF_ORIGIN, `target stays same-origin: ${p}${s} -> ${target}`);
+        check(resolved.pathname.startsWith('/leadfinder/'), `target stays under the mount: ${p}${s} -> ${resolved.pathname}`);
+        // The V1 defect, asserted at its new sink: a doubled slash makes the
+        // path match no mount, so the prefixed SPA fallback answers it with
+        // 200 index.html and the user gets the app page instead of the file.
+        check(!resolved.pathname.includes('//'), `target has no doubled slash: ${p}${s} -> ${resolved.pathname}`);
+        check(legacyRedirect('/leadfinder', resolved.pathname) === null, `still one hop: ${p}${s}`);
+      }
+    }
+  }
+
+  // Nested prefixes behave the same way — nothing here assumes one segment.
+  check(legacyRedirect('/a/b', '/') === '/a/b/', 'nested prefix: old root');
+  check(
+    legacyRedirect('/a/b', '/api/jobs/job_x/csv') === '/a/b/api/jobs/job_x/csv',
+    'nested prefix: emailed CSV link',
+  );
+
   // ---- SPA fallback: deep links yes, missing assets no, API untouched ----
   check(spaFallbackServesIndex('GET', '/') === true, 'root serves the SPA');
   check(spaFallbackServesIndex('GET', '/jobs/abc') === true, 'deep link serves the SPA');
@@ -650,6 +878,29 @@ export function runUrlsTests(): { passed: number; failed: number; failures: stri
   check(spaFallbackServesIndex('GET', '/api/x.y') === true, 'API path with a dot is still API');
   check(spaFallbackServesIndex('GET', '/apiary/x') === true, 'an /api lookalike is a deep link');
   check(spaFallbackServesIndex('GET', '/apiary/x.js') === false, 'an /api lookalike file still 404s');
+  // The doubled-slash shape, at the sink rather than only at its source. Express
+  // strips the mount, so "/leadfinder//api/jobs/x/csv" arrives here as
+  // "//api/jobs/x/csv": no mount matched it, and answering 200 index.html is how
+  // a download link silently turns into the app page.
+  check(spaFallbackServesIndex('GET', '//api/jobs/x/csv') === false, 'empty segment before /api does not serve the SPA');
+  check(spaFallbackServesIndex('GET', '//') === false, 'a bare doubled slash does not serve the SPA');
+  check(spaFallbackServesIndex('GET', '/jobs//abc') === false, 'an interior empty segment does not serve the SPA');
+  check(spaFallbackServesIndex('HEAD', '//api/jobs/x/csv') === false, 'HEAD of the doubled-slash shape does not serve the SPA either');
+  check(spaFallbackServesIndex('GET', '/jobs/abc') === true, 'a real deep link is unaffected');
+  // The REAL call shape. Express's mount strip eats the empty segment, so the
+  // second argument looks completely ordinary and only the raw target shows it.
+  check(
+    spaFallbackServesIndex('GET', '/api/jobs/x/csv', '/leadfinder//api/jobs/x/csv') === false,
+    'the doubled slash is caught through the raw target, which is the only place it survives',
+  );
+  check(
+    spaFallbackServesIndex('GET', '/api/jobs/x/csv', '/leadfinder/api/jobs/x/csv') === true,
+    'the ordinary prefixed API path is unaffected by the raw-target check',
+  );
+  check(
+    spaFallbackServesIndex('GET', '/jobs/abc', '/leadfinder/jobs/abc') === true,
+    'an ordinary prefixed deep link is unaffected',
+  );
 
   // ---- security: BASE_PATH cannot introduce an authority or escape itself ----
   throws(() => normalizeBasePath('//evil.com'), 'BASE_PATH protocol-relative refused');

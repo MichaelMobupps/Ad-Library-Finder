@@ -93,3 +93,31 @@ export function apiPath(p: string): string {
   if (p === '/') return `${PREFIX}/`;
   return `${PREFIX}${p}`;
 }
+
+/**
+ * Where a page that loaded OUTSIDE this app's mount must go, or null to stay put.
+ *
+ * The server answers an old unprefixed address with a 307, so this is the
+ * browser-side half of legacy survival: a shell that reached the user from
+ * outside the mount anyway (restored from cache, or a gateway that rewrites
+ * instead of redirecting) would otherwise call prefixed API paths from an
+ * unprefixed page and render an empty app.
+ *
+ * A separate exported function rather than three lines inside main.tsx because
+ * this is the one piece of the redirect that a test can execute: the decision is
+ * proved on the module that ships, not on a copy of it.
+ *
+ *  - null for the WHOLE default configuration. `PREFIX` is a BUILD-time constant
+ *    from Vite's `base`, so in a dist built without BASE_PATH this can never
+ *    fire and an env-unset rollback cannot reload anybody.
+ *  - the result is always a ROOTED path, never an absolute URL, so it cannot
+ *    leave the origin it started on.
+ *  - `search` and `hash` are carried across: the hash is what holds the emailed
+ *    "#/jobs/<id>" link, and it never reached the server to be preserved there.
+ *  - the target itself returns null, so exactly one hop is possible.
+ */
+export function offMountRedirect(pathname: string, search = '', hash = ''): string | null {
+  if (PREFIX === '') return null;
+  if (pathname === BASE_PATH || pathname.startsWith(`${BASE_PATH}/`)) return null;
+  return `${BASE_PATH}/${search}${hash}`;
+}
