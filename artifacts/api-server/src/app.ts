@@ -20,6 +20,8 @@ import { jobsRouter } from './routes-jobs.js';
 import { healthRouter, versionRouter } from './routes-health.js';
 import { authRouter } from './routes-auth.js';
 import { settingsRouter } from './routes-settings.js';
+import { chiefRouter, chiefBodyErrorHandler } from './routes-chief.js';
+import { chiefBootLog } from './chief.js';
 import {
   basePath,
   BASE_PATH,
@@ -47,6 +49,11 @@ function rawSearch(req: Request): string {
 
 export function buildApp(): express.Express {
   const app = express();
+
+  // One line about the machine surface: loaded or not, and a warning if the
+  // stored secret carried whitespace. Never the value. Here rather than at
+  // module load so importing this file still has no side effects.
+  chiefBootLog();
 
   // Trust the Replit edge proxy so req.secure / req.ip / req.protocol reflect
   // the real client connection. Required for forwarded-header-derived OAuth
@@ -126,6 +133,17 @@ export function buildApp(): express.Express {
   app.use(basePath('/api/health'), healthRouter);
   app.use(basePath('/version'), versionRouter);
   app.use(basePath('/api/auth'), authRouter);
+
+  // ---- Machine surface (order L-3.3a) ----
+  // Its own credential, its own principal: the router's first layer is a Bearer
+  // token check that never looks at req.user, so a session cookie cannot open
+  // anything here — and requireAuth below never looks at a header, so the token
+  // cannot open anything there. Mounted through basePath() like every other
+  // /api route, and matched by no legacy rule, so L2's redirect layer is
+  // untouched. The error handler is scoped to this mount so that body-parser
+  // failures answer machines in JSON without moving any human path's shape.
+  app.use(basePath('/api/chief'), chiefRouter);
+  app.use(basePath('/api/chief'), chiefBodyErrorHandler);
 
   // ---- /api/me — returns current user or 401 (used by SPA to detect login) ----
   app.get(basePath('/api/me'), (req: Request, res: Response) => {

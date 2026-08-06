@@ -5,6 +5,7 @@ import { sendEmailFromUser } from './gmail.js';
 import { getDefaultRecipientForUser } from './settings.js';
 import { withDeadline } from './deadline.js';
 import { publicUrl } from './urls.js';
+import { isChiefJob } from './chief.js';
 import { log } from './logger.js';
 
 /**
@@ -19,6 +20,32 @@ function resolveRecipient(job: JobRow): string | null {
   if (job.recipient_email) return job.recipient_email;
   if (job.created_by_user_id) return getDefaultRecipientForUser(job.created_by_user_id);
   return null;
+}
+
+/**
+ * A commanded job never produces email. Order L-3.3a.
+ *
+ * This is the ONE choke point: all five pipelines (meta in queue.ts, affplus,
+ * appgoblin, google_ads, store_first) dispatch through notifyJobCompleted /
+ * notifyJobFailed and nothing else in the tree sends mail about a job. Guarding
+ * here therefore covers every source, including any added later.
+ *
+ * Placed BEFORE resolveSender and resolveRecipient on purpose. Both would fail
+ * for the principal anyway — it has no Gmail tokens, so resolveSender returns
+ * null — but "fails because a lookup came up empty" is an accident that a future
+ * settings change could undo, and getDefaultRecipientForUser falls back to the
+ * owner's own email address, which for the principal is a real string. The guard
+ * makes it structural: for a chief-owned job, no recipient is ever resolved and
+ * no send is ever attempted.
+ *
+ * It also deliberately does NOT touch notification_status. Leaving it NULL says
+ * "no email was ever in question"; writing 'failed' would put a red mark in the
+ * admin Activity view for a job that was never supposed to send.
+ */
+function suppressedForChief(job: JobRow, kind: 'completion' | 'failure'): boolean {
+  if (!isChiefJob(job)) return false;
+  appendLog(job.id, 'info', `${kind} email suppressed: commanded job — the Chief collects results over the API`);
+  return true;
 }
 
 // Links that land in someone's inbox and are clicked days later. They resolve
@@ -78,6 +105,7 @@ function resolveSender(job: JobRow): { userId: string; gmailEmail: string } | nu
 }
 
 export async function notifyJobCompleted(job: JobRow) {
+  if (suppressedForChief(job, 'completion')) return;
   const sender = resolveSender(job);
   if (!sender) {
     appendLog(job.id, 'warn', 'completion email skipped: sender Gmail not connected — connect Gmail in Settings');
@@ -166,6 +194,7 @@ export async function notifyJobCompleted(job: JobRow) {
 }
 
 export async function notifyJobFailed(job: JobRow) {
+  if (suppressedForChief(job, 'failure')) return;
   const sender = resolveSender(job);
   if (!sender) {
     appendLog(job.id, 'warn', 'failure email skipped: sender Gmail not connected');

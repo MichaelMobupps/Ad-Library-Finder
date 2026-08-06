@@ -3,6 +3,7 @@ import { existsSync, mkdirSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import path from 'node:path';
 import { ensureStoreDiscoveryTables } from './storeDiscoveryDb.js';
+import { ensureChiefSchema } from './chief.js';
 
 export type ProductType = 'mobile' | 'cps';
 export type JobStatus = 'pending' | 'running' | 'completed' | 'failed' | 'deferred' | 'cancelled';
@@ -289,6 +290,11 @@ export async function initDb() {
   // Store-first discovery tables (discovered_apps, store_app_detail, publishers).
   // Created here so they exist before the queue or the /publishers route runs.
   ensureStoreDiscoveryTables();
+
+  // The Chief's idempotency ledger and its system principal (order L-3.3a).
+  // A side table plus one users row — no column is added to `jobs`, so every
+  // human job response keeps the exact JSON shape it has always had.
+  ensureChiefSchema();
 
   // Garbage-collect expired sessions on startup
   db.prepare(`DELETE FROM sessions WHERE expires_at < ?`).run(Date.now());

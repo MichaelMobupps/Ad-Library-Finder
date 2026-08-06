@@ -35,6 +35,12 @@
 | O-16 | **The emailed "View full job log" link has never deep-linked to the job.** `notifier.ts:29` emits `…/#/jobs/<id>`, but `App.tsx:124` only reacts to `#/settings`; every other fragment is ignored and the user lands on the job list. Pre-existing and unchanged by L2 — surfaced because the link's survival was verified end to end (it now reaches `/leadfinder/` in one hop, fragment re-attached by the browser per RFC 7231 §7.1.2). Fixing it means teaching the SPA to open a job from the fragment; that is a product change, not a migration one. | L2 audit | OPEN — informational |
 | O-17 | A legacy **POST with a malformed or oversized JSON body** is answered 400/413 by `express.json` before the 307, because the legacy layer sits after the body parser. That placement is deliberate: the parser and the request logger both precede it, and the log is what proves the method arrives intact. No caller POSTs to a legacy address — the three emailed shapes are GETs and there are no webhooks — so this is a property, not a defect. | L2 audit | DEFERRED |
 | O-19 | **`PUBLIC_BASE_URL` carrying a path while `BASE_PATH` is unset is now load-bearing and unguarded.** The boot guard (`assertPublicUrlCarriesPrefix`) only compares the two when a prefix is active, so `PUBLIC_BASE_URL=https://host/some/path` with no `BASE_PATH` boots happily and, since H1, makes the OAuth redirect URI `https://host/some/path/api/auth/google/callback` — a path the app does not serve. Not a new class: that same value has always aimed every emailed link at `/some/path/api/jobs/…`, which is equally wrong, so the state was already broken. Cutover rule 6 says set the pair together, which prevents it. One-line mitigation if wanted: warn at boot when `new URL(PUBLIC_BASE_URL).pathname !== '/'` and `BASE_PATH` is unset. | H1 audit | DEFERRED |
+| O-20 | **No rate limiting on the machine seam.** Explicitly out of scope for L-3.3a; recorded because the audit wants it on the record. `/api/chief/*` has no per-token request budget, so a looping Chief can poll `/status` or `/leads` as fast as it likes. Bounded in impact — every path is a read except `POST /jobs`, which is idempotent per `external_id` — but `GET /leads` loads all of a job's `job_results` rows per call (see O-21), so a tight poll is the one shape that costs real work. Take it with the first Chief-side scheduler, or when a second machine caller appears. | L-3.3a scope | OPEN — deferred by the order |
+| O-21 | **`GET /api/chief/jobs/:id/leads` is O(all rows) per request.** It calls `getResults(jobId)` (every `job_results` row for the job, `idx_job_results_job`-backed) and then filters and slices in memory, exactly as `buildCsv` does. Correct, and fine at today's sizes — a capped job has ≤ 100 leads, and the biggest jobs hold a few thousand rows — but the cost is per page, not per lead, so a hard poll multiplies it. Push the filter and the LIMIT/OFFSET into SQL if the Chief ever polls a large job aggressively. | L-3.3a audit | DEFERRED |
+| O-22 | **The admin Activity view is `LIMIT 200 ORDER BY created_at DESC`** (`listAllJobsWithUsers`, unchanged by L-3.3a). Commanded jobs land in the same list, so a busy Chief can push human jobs out of an admin's view. Not a correctness problem — `/api/jobs` per user is unaffected and every job is still readable by id — but the Activity view stops being "everything recent" once machine traffic outnumbers human traffic. Fix when it bites: a source/owner filter, or paging. | L-3.3a audit | OPEN — informational |
+| O-23 | **No job cancellation over the machine seam.** Explicitly out of scope for L-3.3a. The Chief cannot stop a job it commanded; only an admin can, from the Activity view (which does work on commanded jobs, and reports `cancelled` back through `GET /api/chief/jobs/:id`). Add `POST /api/chief/jobs/:id/stop` when the Chief needs to abandon a run it no longer wants. | L-3.3a scope | OPEN — deferred by the order |
+| O-24 | **The Chief cannot discover valid AppGoblin category slugs.** `appgoblin_category` is validated for shape only (`[a-z0-9_]+`); the real catalog comes from `GET /api/jobs/appgoblin-categories`, which is cookie-authenticated and therefore unreachable with the token. A commanded AppGoblin job with a well-formed but non-existent slug will be created and will find nothing. Either mirror that endpoint onto `/api/chief` or have C-3.3b hardcode the handful of slugs it uses. | L-3.3a audit | OPEN — needs a decision before the Chief commands AppGoblin |
+| O-25 | **`spend_today_usd` reports real money, and the order expected 0.** See deviation 1 in the L-3.3a ledger entry: this app calls the Anthropic API and keeps a USD ledger with a $100/day cap. If the Chief aggregates spend across the fleet, Leadfinder now contributes a real number rather than a structural zero — which is correct, but is not what the fleet-level plan assumed. Worth confirming the Chief's spend model expects it. | L-3.3a discovery | OPEN — informational, for the Chief side |
 | O-18 | The legacy layer is an **enumerated list, not a catch-all**: a browser tab left open across the cutover still 404s on `/api/me`, `/api/jobs`, `/api/settings`. Deliberate — a catch-all would have to build its `Location` from the raw request path (the open-redirect shape L2 exists to avoid), and those sessions are invalidated by the `als_session`→`lf_session` rename anyway, so the tab is signed out regardless. Reload lands on the app. | L2 audit | OPEN — informational |
 
 ---
@@ -1115,6 +1121,529 @@ verification-tooling expectation and was corrected there. One new out-of-scope i
 as **O-19** and left untouched. O-4 remains open and is now more clearly worth taking at the
 next opportunity: the debug endpoint still echoes the raw env rather than the resolved
 config, and it is the endpoint this failure is diagnosed from.
+
+---
+
+### Leadfinder Order L-3.3a — Chief machine surface ☑ DONE (2026-08-06)
+
+Branch `leadfinder-l33a-chief-surface`. The app side of step 3.3, the discovery seam:
+a token-authenticated machine surface the Chief commands discovery jobs through.
+
+**0. Lineage check (Git safety rule 1, directional form) — PASS.** *Does another branch
+hold content `main` lacks?* Answered with `git diff <branch> main` plus
+`git rev-list --count main..<branch>` over all 9 local and 9 remote refs. Nothing does.
+Only `replit-agent` carries commits `main` lacks (5), and its tree is **identical** to
+`main`'s (`98490c48103f5e2032549bf2267e4407c228e79b` on both), so it holds no content.
+`main` is 1 commit ahead of `origin/main` (`afe1953`, a platform *"Published your App"*)
+and the two trees are identical. Branch cut from `main` at `afe1953`.
+
+**1. Blast radius (recorded before the first edit)**
+
+*Files to be touched — 8 code + 1 doc:*
+
+| File | Change |
+|---|---|
+| `artifacts/api-server/src/chief.ts` | **new.** `CHIEF_TOKEN` loader (trimmed, boot warning on stray whitespace, loaded only if it can authenticate), constant-time Bearer check, the system principal, the supported-country catalog, the closed-body validator, the wire serializers, `runChiefTests()` |
+| `artifacts/api-server/src/routes-chief.ts` | **new.** `GET /status`, `POST /jobs`, `GET /jobs/:id`, `GET /jobs/:id/leads`, a terminal JSON 404, and a body-parser error handler scoped to this mount only |
+| `artifacts/api-server/src/db.ts` | one line inside `initDb()` — `ensureChiefSchema()`. No existing table, column, index or query is touched |
+| `artifacts/api-server/src/app.ts` | one mount, `app.use(basePath('/api/chief'), chiefRouter)`, plus the scoped error handler after it |
+| `artifacts/api-server/src/notifier.ts` | one structural guard: a job owned by the chief principal returns **before** any sender or recipient is resolved. The single choke point all five pipelines pass through |
+| `artifacts/api-server/scripts/check-chief-surface.mjs` | **new.** boot gate — the real assembly, both modes, over real HTTP |
+| `artifacts/api-server/scripts/check-country-mirror.mjs` | **new.** drift gate: the server's supported-country catalog ↔ `dashboard/src/countries.ts` |
+| `artifacts/api-server/scripts/run-tests.mjs` | run the two new gates |
+| `TODO.md` | this entry |
+
+*Not touched:* the whole `dashboard` package (no UI change), `urls.ts`, `auth.ts`,
+`oauth.ts`, `routes-auth.ts`, `routes-jobs.ts`, `routes-settings.ts`, `queue.ts`,
+`jobControl.ts`, `csv.ts`, every scraper and pipeline, `.replit`, Replit Secrets, the
+production database.
+
+*Database change — the minimum idempotency and the principal strictly require:*
+one new table `chief_jobs(external_id TEXT PRIMARY KEY, job_id TEXT NOT NULL UNIQUE,
+created_at INTEGER NOT NULL)` and one new row in `users` (the non-human principal).
+Deliberately **not** a new column on `jobs`: `getJob`/`listJobsForUser`/
+`listAllJobsWithUsers` all `SELECT *`, so a column would add a field to the JSON of every
+human job response, and "humans notice nothing" is a hard rule of this order. SQLite `TEXT
+PRIMARY KEY` compares BINARY, which is what makes the idempotency key byte-exact.
+
+*Behaviours affected:*
+1. Four new paths under `/api/chief/*` exist in **both** modes. Unprefixed they were
+   previously answered `200 index.html` by the SPA catch-all; prefixed they were 404.
+2. `notifier.ts` gains one early return, reachable only by a job whose
+   `created_by_user_id` is the chief principal. No human job can reach it.
+3. `initDb()` creates one table and upserts one user row at boot. Idempotent.
+4. The **admin** Activity view (`/api/jobs/activity`) will list chief jobs, labelled with
+   the principal's identity through the existing `LEFT JOIN users`. A regular user's
+   `/api/jobs` is unchanged — it filters on their own id and can never see them.
+5. Nothing else: no existing route, response body, cookie, redirect or email changes.
+
+*Worst realistic failure, in order:*
+1. **The token opens a cookie path, or a cookie opens a chief path.** The whole point of
+   the seam. Structurally prevented — the two checks read different inputs and neither
+   consults the other — and tested in both directions.
+2. **A human's job readable through the token.** Both chief GETs 404 unless the job's
+   owner *is* the principal, so a human job is indistinguishable from a missing one.
+3. **A commanded job emailing someone.** Guarded at the single notifier choke point,
+   before any sender or recipient resolution, and proved by the difference against a human
+   job in the same test.
+4. **Idempotency bypassed**, giving the Chief two jobs for one `external_id`. Prevented by
+   a UNIQUE primary key over the raw bytes, a constraint-catch on the insert race, and by
+   never normalising the key (no trim, no case fold).
+5. **The new mount disturbing the L2 legacy layer or the SPA fallback.** No legacy rule
+   matches `/api/chief/*`; the recorded 17-probe DARK baseline is re-run byte-for-byte and
+   the legacy gate is re-run in both modes.
+6. **A secret in a log, error or response.** The token is read once at load, never logged,
+   never echoed; the 401 body is a fixed literal, identical for all four failure causes.
+
+*Rollback:* `git revert` the branch commits. No env var, no secret, no deploy step and no
+data migration. Leaving `CHIEF_TOKEN` unset is itself a complete functional rollback —
+with no token loaded nothing can authenticate and every `/api/chief/*` path answers the
+same 401 — and the new table and principal row are inert without it.
+
+**The blast radius held**, with one addition recorded during the audit: nothing outside the
+9 files above was touched, and the database change is exactly the one table and one row
+predicted.
+
+---
+
+## THE CONTRACT AS BUILT — C-3.3b is written from this section alone
+
+**Address.** Every path below is mounted through `basePath()`, exactly like `/api/jobs`.
+With `BASE_PATH` unset it serves at `https://ad-library-finder.replit.app/api/chief/…`;
+with `BASE_PATH=/leadfinder` it serves at
+`https://ad-library-finder.replit.app/leadfinder/api/chief/…` **and nowhere else** — the
+unprefixed address answers 404 while prefixed, and no L2 legacy rule adopts it. Both forms
+are proved in the smoke. **Use the prefixed form once the cutover is done.**
+
+**Authentication.** `Authorization: Bearer <CHIEF_TOKEN>` on every request.
+
+- The scheme is **case-sensitive** (`Bearer`), separated by **exactly one space**. The
+  credential is compared verbatim, byte for byte, in constant time
+  (`crypto.timingSafeEqual` after a length check).
+- The app's stored secret is trimmed at load; the presented credential is not trimmed by
+  this app. Leading/trailing whitespace around the whole header VALUE is removed by the
+  HTTP parser itself (RFC 7230 §3.2.4) before the app sees it — interior whitespace
+  (`Bearer  tok`) is part of the credential and fails.
+- 401 is **one indistinguishable answer** — same status, same body, same headers — for a
+  missing header, a malformed header, a wrong token, and an unset `CHIEF_TOKEN`. No
+  `WWW-Authenticate`, no timing or length signal about the expected value.
+- The token opens **only** `/api/chief/*`. It opens no cookie-authenticated path. A cookie
+  session — including an admin one — opens **no** `/api/chief/*` path.
+- Every chief response, success or failure, carries `Cache-Control: no-store`.
+
+**Status codes, in the order they are decided:**
+
+| Order | Code | When |
+|---|---|---|
+| 1 | `400` / `413` | malformed JSON / body over 1 MB — raised by the app-level body parser **before auth**, answered as JSON on this mount only (`{"error":"malformed JSON body"}`, `{"error":"request body too large"}`). The parser's own message, which quotes the body back, is never returned. |
+| 2 | `401` | `{"error":"unauthorized"}` — ahead of every routing decision, so **401 precedes 404** and an anonymous caller cannot learn whether a path or a job exists. |
+| 3 | `404` | `{"error":"not found"}` — unknown path, unknown method on a known path, unknown job id, **or a job this principal does not own**. |
+| 4 | `415` | `{"error":"Content-Type: application/json required"}` |
+| 5 | `400` | validation refusal, `{"error":"<the message from the table below>"}` |
+| 6 | `503` | `{"error":"status unavailable"}` (status), `{"error":"temporarily unavailable"}` (reads), `{"error":"not accepting jobs"}` (create). A failed read is **never** a fabricated value or an empty list. |
+| 7 | `200` / `201` | success. `201` when a command creates a job, `200` when a known `external_id` returns the existing one. |
+| — | `500` | `{"error":"could not create job"}` — a genuine bug, distinct from 503 on purpose: 503 means ask again, 500 means stop asking. |
+
+### `GET /api/chief/status`
+
+```json
+{ "app": "leadfinder", "ok": true, "accepting_jobs": true,
+  "active_jobs": 0, "spend_today_usd": 0, "server_time": "2026-08-06T11:38:56.449Z" }
+```
+
+- `accepting_jobs` — **this app's queue cannot refuse a creation.** `createJob` inserts a
+  `pending` row and `dispatchRunnable` (queue.ts) only decides *when* it starts; the global
+  concurrency ceiling, the per-user serialisation and the LLM daily cap all delay a start,
+  none rejects a create. So the honest answer is "yes, whenever this app can reach its own
+  database", and the value is produced by a real read, not a literal. `POST /jobs` calls
+  the same predicate and 503s when it is false, so the flag cannot promise what the create
+  path refuses. **Accepted is not started** — see the queueing note below.
+- `active_jobs` — `COUNT(*) FROM jobs WHERE status='running'`, across **every** owner.
+  A human's browser-started run consumes the same worker slot as a commanded one.
+- `spend_today_usd` — **not the constant 0 the order predicted; see the deviations
+  section.** It is this app's own `llm_spend` ledger summed over the current
+  Asia/Jerusalem day. It reads 0 on a day with no LLM calls because the ledger says so.
+- `server_time` — ISO-8601 UTC, always ending `Z`.
+
+### `POST /api/chief/jobs`
+
+Request — `Content-Type: application/json` required, **closed body**, any unknown field
+refused by name:
+
+| Field | Type | Rule |
+|---|---|---|
+| `source` | string | one of `google_ads`, `meta`, `affplus`, `appgoblin`. Case-sensitive. (`store_first` is deliberately not commandable — its deliverable is the shared Publishers corpus, not per-job leads, so it has nothing to return through `/leads`.) |
+| `target_type` | string | `mobile` or `cps`. **`google_ads` accepts `cps` only; `appgoblin` accepts `mobile` only** — the same rules routes-jobs.ts enforces for a human, restated so the seam refuses a combination the engine cannot run instead of queueing a job guaranteed to fail. |
+| `countries` | string[] | non-empty; each an ISO-3166 alpha-2 code from this app's supported catalog (**137 codes**, mirrored from the human form and drift-gated). Accepted in any case and upper-cased; **duplicates are refused**, not merged. |
+| `lead_count` | number | `20`, `50` or `100` only. Unlimited does not exist for a commanded job. |
+| `external_id` | string | required idempotency key. 1–200 **bytes** of UTF-8, no C0/C1 control characters. Stored and compared **byte for byte** — never trimmed, never case-folded. Over-length is refused, never truncated. |
+| `appgoblin_category` | string? | `[a-z0-9_]+`. **Required (with or instead of the next field) when `source` is `appgoblin`** — see the deviations section. Refused on any other source. |
+| `appgoblin_ad_network` | string? | a domain such as `appsflyer.com`; lower-cased. Same requirement and same restriction. |
+
+Response `201` (created) or `200` (idempotent replay):
+
+```json
+{ "created": true, "job": { …the job object… } }
+```
+
+**Idempotency.** `external_id` is the PRIMARY KEY of a side table, so uniqueness is the
+database's, not a read-then-write. Five simultaneous identical commands produce exactly
+one job (proved). `"chief-1"`, `"CHIEF-1"` and `" chief-1 "` are three different keys and
+therefore three different jobs — the bytes are the key.
+
+### The job object — 17 fields, in this order
+
+```json
+{ "job_id": "job_qgibKD68qk", "external_id": "chief-smoke-0001",
+  "source": "meta", "target_type": "mobile", "countries": ["US","GB"], "lead_count": 20,
+  "state": "pending", "phase": "queued", "step": "waiting for worker",
+  "progress_pct": 0, "leads_found": 0, "error": null,
+  "created_at": "2026-08-06T11:38:56.458Z", "started_at": null, "completed_at": null,
+  "run_after": null, "final": false }
+```
+
+**`state` is this repo's real vocabulary**, `jobs.status`, untranslated:
+
+| `state` | Meaning | `final` |
+|---|---|---|
+| `pending` | queued, not started | false |
+| `running` | executing now | false |
+| `deferred` | hit this app's $100/day LLM cap mid-run; re-runs after `run_after` (next Asia/Jerusalem midnight), partial results kept | false |
+| `completed` | finished | **true** |
+| `failed` | pipeline error, or the stall watchdog; `error` carries the message | **true** |
+| `cancelled` | stopped by a human (an admin can stop any job) | **true** |
+
+`phase` is `jobs.phase`: `queued`, `starting`, `scraping`, `classifying`, `enriching`,
+`building_csv`, `hq_splitting`, `done`, `failed`, `deferred`, `cancelled`, or `null` on a
+pre-phase legacy row. `step` is `jobs.phase_detail`, the exact free-text line the human UI
+renders as live progress (`US / "casino" (3/40)`). `progress_pct` is 0–100 across all of
+the pipeline's work, monotonic within a run. `leads_found` is the live lead counter.
+`error` is the pipeline's own message, bounded to 500 characters. All timestamps are
+ISO-8601 UTC or `null`. Poll until `final` is true.
+
+### `GET /api/chief/jobs/:id`
+
+`{ "job": { …the job object… } }`, or **404 for any job the chief principal does not own**
+— byte-identical to the 404 for an id that never existed.
+
+### `GET /api/chief/jobs/:id/leads?offset=&limit=`
+
+```json
+{ "job_id": "job_…", "state": "pending", "final": false, "total": 5,
+  "offset": 0, "limit": 2, "count": 2, "next_offset": 2, "has_more": true, "leads": [ … ] }
+```
+
+- `limit` defaults to **50**, is **capped at 100** (clamped, and the effective value is
+  reported back). `offset` defaults to 0. Malformed values are **refused** (400), never
+  silently corrected.
+- `total` is the number of leads this job will deliver: `selectExportRows` applied to the
+  job's own product type and lead cap — i.e. **exactly the rows the CSV and the emailed
+  .xlsx carry**, not every advertiser the classifier rejected.
+- Ordering is `job_results.id ASC` (insertion order), strictly ascending and stable: rows
+  are only ever appended, so an offset stays meaningful across polls of a running job.
+  Reading a job before it finishes is allowed; `final` says whether the answer can change.
+- **A page may be shorter than `limit`.** A 48 KB budget on the `leads` array binds first
+  when the data is fat (a tracking-heavy `landing_url` is length-bounded nowhere in this
+  app), which is what keeps every page well under the Chief's 64 KB ceiling — proved with
+  100 leads carrying 4 KB URLs each. **Always continue from `next_offset`, never from
+  `offset + limit`.**
+
+### The lead object — 10 fields, derived from what this app stores
+
+```json
+{ "lead_id": 1, "advertiser_name": "Smoke Advertiser 1", "country": "US",
+  "classification": "mobile_google_play",
+  "store_url": "https://play.google.com/store/apps/details?id=com.smoke.app1",
+  "landing_url": "https://smoke-1.example.com/offer",
+  "page_url": "https://facebook.com/smokepage1",
+  "app_category": null, "is_game": null, "found_at": "2026-08-06T11:38:56.518Z" }
+```
+
+`lead_id` is `job_results.id`, the ordering key. `classification` is one of
+`mobile_google_play`, `mobile_app_store` (mobile jobs) or `cps_web` (cps jobs).
+`app_category` / `is_game` are the app-store enrichment fields — populated on GATC mobile
+leads, `null` everywhere else. `is_game` is a real boolean or null, never 1/0.
+
+**One stored column is deliberately absent: `ad_text`.** It is ad creative copy of
+unbounded length; 100 of them would blow the 64 KB ceiling on their own. It remains in the
+CSV and the .xlsx bundle.
+
+### Every refusal message
+
+| Message | Cause |
+|---|---|
+| `body must be a JSON object` | body is null, an array, or a scalar |
+| `unknown field: <name>` | anything outside the 7 fields above (including `__proto__`; the name is bounded to 40 characters in the reply) |
+| `source is required` / `source must be one of google_ads, meta, affplus, appgoblin` | missing / not on the list |
+| `target_type is required` / `target_type must be one of mobile, cps` | missing / not on the list |
+| `source google_ads supports target_type cps only` | incompatible pair |
+| `source appgoblin supports target_type mobile only` | incompatible pair |
+| `countries must be a non-empty array` / `countries must contain only strings` | shape |
+| `unsupported country: <code>` | outside the 137-code catalog (bounded to 8 characters in the reply) |
+| `duplicate country: <code>` | the same country twice |
+| `lead_count must be one of 20, 50, 100` | missing, null, non-integer, or off-menu |
+| `external_id is required` / `external_id must not be empty` | missing / empty |
+| `external_id must not contain control characters` | C0/C1 byte in the key |
+| `external_id must be at most 200 bytes` | over-length — refused, never truncated |
+| `appgoblin jobs require appgoblin_category and/or appgoblin_ad_network` | no discovery axis |
+| `appgoblin_category and appgoblin_ad_network apply to source appgoblin only` | axis on another source |
+| `appgoblin_category must be lowercase letters/digits/underscores` | slug shape |
+| `appgoblin_ad_network must be a domain like "appsflyer.com"` | domain shape |
+| `limit must be at least 1` / `limit must be a non-negative integer` | paging |
+| `offset must be at least 0` / `offset must be a non-negative integer` | paging |
+| `<name> must be a single non-negative integer` | a repeated or structured query parameter |
+
+### What the Chief must know about this app's queue
+
+- **Commanded jobs run one at a time.** Every one is owned by the single principal, and
+  queue.ts serialises per user (parallel across users, serial within one). A second command
+  is accepted immediately and waits for the first. Unchanged by this order, and out of
+  scope to change.
+- They also share the global ceiling of 3 concurrent jobs with human runs.
+- They are **not** exempt from the $100/day LLM cap. At the cap, a commanded
+  `meta` / `affplus` / `appgoblin` / `google_ads` job is parked and reported as `deferred`
+  with a `run_after`.
+- A commanded job **never sends email**, on completion or failure.
+- An admin can stop or resume a commanded job from the Activity view. Human oversight is
+  retained deliberately; the Chief sees the result as `cancelled`.
+
+### Four captured exchanges, token redacted (LIT, from the smoke)
+
+```http
+GET /leadfinder/api/chief/status HTTP/1.1          |  GET /leadfinder/api/chief/status HTTP/1.1
+                                                   |  Authorization: Bearer <CHIEF_TOKEN>
+HTTP/1.1 401                                       |  HTTP/1.1 200
+Cache-Control: no-store                            |  Cache-Control: no-store
+{"error":"unauthorized"}                           |  {"app":"leadfinder","ok":true,"accepting_jobs":true,
+                                                   |   "active_jobs":0,"spend_today_usd":0,
+                                                   |   "server_time":"2026-08-06T11:38:56.449Z"}
+```
+
+```http
+POST /leadfinder/api/chief/jobs HTTP/1.1
+Authorization: Bearer <CHIEF_TOKEN>
+Content-Type: application/json
+
+{"source":"meta","target_type":"mobile","countries":["US","GB"],"lead_count":20,"external_id":"chief-smoke-0001"}
+
+HTTP/1.1 201
+Cache-Control: no-store
+{"created":true,"job":{"job_id":"job_qgibKD68qk","external_id":"chief-smoke-0001","source":"meta",
+ "target_type":"mobile","countries":["US","GB"],"lead_count":20,"state":"pending","phase":"queued",
+ "step":"waiting for worker","progress_pct":0,"leads_found":0,"error":null,
+ "created_at":"2026-08-06T11:38:56.458Z","started_at":null,"completed_at":null,"run_after":null,"final":false}}
+
+--- the same command again ---
+HTTP/1.1 200
+{"created":false,"job":{"job_id":"job_qgibKD68qk", …identical… }}
+
+--- one field wrong ---
+{"source":"meta","target_type":"mobile","countries":["US","XX"],"lead_count":20,"external_id":"chief-smoke-refused"}
+HTTP/1.1 400
+{"error":"unsupported country: XX"}
+```
+
+```http
+GET /leadfinder/api/chief/jobs/job_qgibKD68qk HTTP/1.1
+Authorization: Bearer <CHIEF_TOKEN>
+
+HTTP/1.1 200
+{"job":{"job_id":"job_qgibKD68qk","external_id":"chief-smoke-0001","source":"meta","target_type":"mobile",
+ "countries":["US","GB"],"lead_count":20,"state":"pending","phase":"queued","step":"waiting for worker",
+ "progress_pct":0,"leads_found":0,"error":null,"created_at":"2026-08-06T11:38:56.458Z","started_at":null,
+ "completed_at":null,"run_after":null,"final":false}}
+
+--- a job this principal does not own (a human's), byte-identical to a job that never existed ---
+GET /leadfinder/api/chief/jobs/job_HUMANSMOKE
+HTTP/1.1 404
+{"error":"not found"}
+```
+
+```http
+GET /leadfinder/api/chief/jobs/job_qgibKD68qk/leads?limit=2 HTTP/1.1
+Authorization: Bearer <CHIEF_TOKEN>
+
+HTTP/1.1 200
+{"job_id":"job_qgibKD68qk","state":"pending","final":false,"total":5,"offset":0,"limit":2,"count":2,
+ "next_offset":2,"has_more":true,
+ "leads":[{"lead_id":1,"advertiser_name":"Smoke Advertiser 1","country":"US",
+   "classification":"mobile_google_play","store_url":"https://play.google.com/store/apps/details?id=com.smoke.app1",
+   "landing_url":"https://smoke-1.example.com/offer","page_url":"https://facebook.com/smokepage1",
+   "app_category":null,"is_game":null,"found_at":"2026-08-06T11:38:56.518Z"}, …]}
+
+--- continued at next_offset, and one refusal ---
+GET …/leads?offset=2&limit=2   -> 200, offset 2, next_offset 4
+GET …/leads?limit=0            -> 400 {"error":"limit must be at least 1"}
+```
+
+**2. Decisions worth their own line**
+
+- **The system principal is a real `users` row** — `usr_chief` /
+  `chief@orchestrator.internal` / "Chief (orchestrator)" — not a NULL owner and not a
+  human. NULL was rejected outright: `canReadJob` (routes-jobs.ts:565) treats a NULL owner
+  as readable by *everyone*, so commanded jobs would have been visible to every signed-in
+  user. A real row also keeps the admin Activity view's existing `LEFT JOIN users`
+  labelling every job with a creator instead of a blank. The identity is outside
+  `@mobupps.com`, and `isAllowedEmail` admits that domain only, so no OAuth flow can ever
+  produce or claim it.
+- **Answer to "do commanded jobs appear anywhere in the human UI?": yes, in exactly one
+  place — the ADMIN Activity view — and they are labelled.** A regular user's `/api/jobs`
+  filters on their own id and can never see one; a non-admin reading a commanded job's id
+  directly gets 404. In Activity they render with `Started by: chief@orchestrator.internal`
+  through the existing column, needing no dashboard change. That is deliberate: an admin
+  can already see and stop every job in this app, and a machine-issued job that no human
+  could see would be a job nobody could stop.
+- **No email is structural, not incidental.** The guard sits at the single choke point all
+  five pipelines dispatch through (`notifier.ts`), *before* any sender or recipient is
+  resolved. Both lookups would fail for the principal anyway — no Gmail tokens — but
+  `getDefaultRecipientForUser` falls back to the owner's own email address, which for the
+  principal is a real string, so "it fails because a lookup came up empty" was an accident
+  waiting for a settings change to undo. The guard also leaves `notification_status` NULL
+  rather than writing `'failed'`, so a commanded job does not wear a red mark for an email
+  that was never in question. Proved by the difference: in the same test run a human job
+  goes down the email path and records `'failed'`, a commanded one records nothing.
+- **A side table, not a column on `jobs`.** `getJob`, `listJobsForUser` and
+  `listAllJobsWithUsers` all `SELECT *`; a column would have added `"external_id":null` to
+  the JSON of every human job response. The recorded DARK baseline pins those bytes.
+- **The page has a byte budget, not just a row cap.** `limit ≤ 100` alone cannot hold a
+  64 KB ceiling, because no URL in this app is length-bounded. A single lead larger than
+  the whole budget is still returned alone rather than silently truncated — this codebase
+  does not trim someone's data to make a wire format comfortable.
+- **The supported-country catalog is mirrored and gated.** The human POST only checks that
+  a code is two letters, so it accepts `XX` and runs a job that can never find anything.
+  The machine surface refuses it, against a 137-code catalog mirrored from
+  `dashboard/src/countries.ts` — with `scripts/check-country-mirror.mjs` failing the test
+  gate on any drift, the pattern `check-lead-mirror.mjs` already established (and what O-5
+  asks for elsewhere).
+
+**3. Gates** — all green.
+
+| Gate | Command | Before | After |
+|---|---|---|---|
+| typecheck + build | `pnpm build` | pass | pass |
+| tests | `pnpm --filter api-server test` | 30 modules, 1469 | **31 modules, 1604**, 0 failed |
+| `chief` unit suite | (inside the above) | — | **135** |
+| standalone gates | `node scripts/check-*.mjs` | 4 | **6** (new: `check-country-mirror`, `check-chief-surface`) |
+| new boot gate | `check-chief-surface.mjs` | — | **474 DARK + 478 LIT + 265 unset + 267 padded**, 0 failed |
+
+The new gate boots the **real assembly** in four env modes, each in its own child process
+with its own throwaway cwd, and never starts the queue.
+
+**4. Godlike audit — 3 rounds, closed on a clean one**
+
+*Round 1, technical — 4 findings, all fixed.* (a) A `deferred` commanded job had **no ETA
+on the wire**: the Chief would have polled blindly for up to a day. `run_after` added as a
+17th field. (b) `parsePagination`'s message for a repeated parameter said "must appear at
+most once", which is wrong for the structured (`?limit[a]=1`) case — reworded. (c) The gate
+asserted idempotency behaviourally but never proved the **database constraint** exists, nor
+that its error code is the one `createCommandedJob` catches to answer a race — a rename
+would have turned an idempotent answer into a 500. Both codes now pinned. (d) The bare
+mount `/api/chief` and `/api/chief/` were not in the 401 sweep; added.
+
+*Round 2, security — 2 findings.* (a) **Unbounded caller input was reflected in refusal
+messages**: `unknown field: <10 KB>` and `unsupported country: <5 KB>` echoed whatever
+arrived. A 400 that reflects an arbitrary payload is an amplifier and hands whatever
+renders it a string of the caller's choosing. Both bounded (40 / 8 characters). (b) The
+prototype-pollution test was **mis-constructed** — an object literal's `__proto__:` sets the
+prototype instead of putting the key on the wire, so it was testing nothing. Rewritten to
+send raw JSON; the real behaviour was already correct (`JSON.parse` makes `__proto__` an own
+property, `Object.keys` sees it, the closed body refuses it), and a sanity assertion now
+proves `Object.prototype` was not poisoned by the attempt.
+
+*Round 3, end-user + coherence — 1 fix, 1 out-of-scope finding.* A failed read on the two
+GET endpoints answered **500** where `/status` answered 503; unified to 503, because to a
+machine the two mean opposite things ("ask again" vs "stop asking"). Out of scope and
+recorded, not touched: the admin Activity view is `LIMIT 200 ORDER BY created_at DESC`, so a
+busy Chief can push human jobs out of an admin's view (**O-22**).
+
+*Round 4 — clean.* No findings.
+
+**Two tests proved able to fail by reintroducing their defect** (order item 6):
+
+| Defect reintroduced | Result |
+|---|---|
+| ownership check removed from `getChiefJob` | 3 failures per mode: *a human's job -> 404 (got 200)*, *…byte-identical to one that never existed*, *the same for its leads* |
+| `suppressedForChief` guard removed from `notifier.ts` | 3 failures per mode: *a commanded job records no notification status at all*, *the suppression is recorded in the job log*, *no sender was ever resolved for it* |
+
+Both were restored and the suite re-run green.
+
+**5. Security framing — the six confirmations the order asked for**
+
+| Requirement | How it is established |
+|---|---|
+| token/cookie separation in **both** directions | Structural: `requireChiefToken` reads only the `Authorization` header and never `req.user`; `requireAuth` reads only `req.user` and has never read a header. Proved over HTTP on 7 chief paths with a human session *and* an admin session (401, byte-identical to the anonymous 401), and with the token on 8 cookie paths including `/api/jobs/activity` and `/api/jobs/publishers` (401, each keeping its own body). |
+| human jobs unreachable through the token | Both chief GETs answer 404 unless the owner **is** the principal, and the 404 body is byte-compared against the 404 for an id that never existed. Hostile ids (`..`, `%2e%2e`, `job_x%00`, `job_' OR 1=1--`) all 404. |
+| chief jobs incapable of producing email | One guard at the only choke point, ahead of sender/recipient resolution; proved by the difference against a human job in the same run. |
+| idempotency not bypassable by casing or whitespace | SQLite `TEXT PRIMARY KEY` compares BINARY, and the key is never trimmed or case-folded. `"CHIEF-EXT-HAPPY"` and `" chief-ext-happy "` each create their own job; the stored bytes are read back and compared. Five simultaneous identical commands → one job. |
+| `countries` and `source` cannot reach an interpreter unvalidated | Both are allowlisted **before** storage — `source` against 4 literals, every country against the 137-code catalog — then written through bound parameters. `countries` reaches the engines as a JSON array of `[A-Z]{2}` strings; there is no path by which an unvalidated value is stored or executed. |
+| no secret in any log, error, or response | The token is read once at load and never printed — not its value, not its length. The gate's parent process greps **the child's entire output** (boot lines, every access-log line, every failure message) for the test secret in all four modes and fails if it appears; both smoke servers' logs were grepped too. The 401 body is a fixed literal. |
+
+**6. Smoke — separate ports, job runner disabled, facts from each server's own access log**
+
+Three servers, ports **3971 / 3973 / 3975** (outside `.replit`'s mapped set — it maps only
+3001), each bound to `127.0.0.1` in its own throwaway cwd, so `path.resolve('data')` made a
+fresh sqlite file. **The real database's md5 is `e689c6fc55e6276acf296f7e9bada157` before
+and after — identical to the value L2 recorded.** No workflow was running and none was
+touched. `startQueue()` was never called, so every job created sat `pending` and nothing
+executed: no scrape, no store call, no email, no external request of any kind.
+
+*a. DARK (`BASE_PATH`, `PUBLIC_BASE_URL` unset).* The 17-probe endpoint table is
+**byte-for-byte identical to the baseline recorded in the Bundle 1 ledger**, md5
+`0b9f472cd1fcb63fb9c93396cc198b06` on both sides, `diff` clean — including
+`Set-Cookie=als_session=<TOK>; Path=/` and both 702-byte SPA responses. The harness was
+rebuilt from scratch for this order and reproduced the recorded md5 exactly. **Run twice:
+with `CHIEF_TOKEN` unset and with it loaded — identical both times**, which is the
+statement that the human surface does not move when the machine surface goes live. Then
+every new path proved: bare 401, the authenticated happy path and one refusal per endpoint.
+
+*b. LIT (`BASE_PATH=/leadfinder/`, `PUBLIC_BASE_URL=https://tools.mobupps.net/leadfinder`).*
+The same proofs at the prefixed paths, read back from the server's own log:
+
+```
+GET  /leadfinder/api/chief/status              401 then 200
+POST /leadfinder/api/chief/jobs                201, then 200 (replay), then 400 (refusal)
+GET  /leadfinder/api/chief/jobs/job_…          200
+GET  /leadfinder/api/chief/jobs/job_…/leads    200, 200 (next_offset), 400 (limit=0)
+GET  /leadfinder/api/chief/jobs/job_HUMANSMOKE 404  <- a human's job
+GET  /leadfinder/api/jobs                      401  <- the chief token on the human surface
+GET  /leadfinder/api/chief/nope                404 application/json, never the SPA page
+GET  /api/jobs/job_HUMANSMOKE/csv              307 -> /leadfinder/api/jobs/job_HUMANSMOKE/csv
+GET  /api/chief/status                         404  <- unprefixed, while prefixed
+```
+
+The L2 legacy redirect still answers **307** with its `Location` unchanged, and the
+`check-legacy-redirects` gate (21 DARK + 212 LIT) passes untouched.
+
+**7. Deviations from the order, stated plainly**
+
+1. **`spend_today_usd` is the real ledger value, not a hardcoded `0`.** The order says it
+   "is `0` and truthfully so, because this app has no paid vendors". That premise does not
+   hold for this repo: `@anthropic-ai/sdk` is a dependency, `ANTHROPIC_API_KEY` is set in
+   this environment, `classifier.ts` / `hqResolver.ts` / `webResolver.ts` call the Anthropic
+   API, `llmBudget.recordSpend()` writes every call's exact USD cost to the `llm_spend`
+   table, and `DAILY_CAP_USD` defers jobs at $100/day against that same sum. Returning a
+   literal `0` on a day this app spent money is precisely the "fabricated value" the same
+   paragraph forbids. It therefore reports `SUM(usd)` over the current Asia/Jerusalem day —
+   which is `0`, truthfully, on any day with no LLM calls. The field's name, type and
+   position are unchanged, so a Chief that only sums it is unaffected. Deliberately **not**
+   `llmBudget.spentTodayUsd()`: that helper swallows a failed read and returns 0, correct
+   for a budget gate that must fail open, wrong here where a failed read must be a 503.
+2. **The closed body has two extra optional fields, `appgoblin_category` and
+   `appgoblin_ad_network`.** The order lists `appgoblin` as a commandable source but gives
+   the body no discovery axis, and `appgoblinPipeline.ts:116` throws
+   `appgoblin: job missing source_params (category or adNetworkDomain required)` the moment
+   such a job starts. Without these fields, every commanded AppGoblin job would have been
+   created, queued, and failed on contact. The two fields use the human form's own
+   validators verbatim, are required (at least one) when the source is `appgoblin`, and are
+   refused on every other source. The body remains closed.
+3. **The source ↔ target_type compatibility rules are enforced** (`google_ads` is cps-only,
+   `appgoblin` is mobile-only). Not mentioned by the order, but they are this app's existing
+   rules for humans, and the alternative is accepting a command the engine cannot run.
+4. **`run_after` is a 17th field** on the job object, so a `deferred` job carries its own
+   ETA rather than looking stuck.
+
+**8. Auto-fix and out-of-scope** — every in-scope finding above was fixed and re-audited to
+a clean round. Six items recorded and left untouched: **O-20** … **O-25** below.
 
 ---
 

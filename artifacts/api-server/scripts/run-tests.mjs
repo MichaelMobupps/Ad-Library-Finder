@@ -155,6 +155,42 @@ if (legacy.status === 0) {
   failedModules.push('legacy-redirects');
 }
 
+// Country-catalog mirror gate: the chief surface REFUSES any country outside
+// its catalog, and that catalog is a mirror of the dashboard's. A drift would
+// make the Chief unable to command a country the form offers.
+const countries = spawnSync(process.execPath, [path.join(ROOT, 'scripts', 'check-country-mirror.mjs')], {
+  cwd: ROOT,
+  encoding: 'utf8',
+});
+if (countries.status === 0) {
+  console.log('  ✓ supported-country catalog (dashboard ↔ chief surface) in sync');
+} else {
+  console.log('  ✗ COUNTRY CATALOG OUT OF SYNC');
+  for (const line of `${countries.stdout || ''}${countries.stderr || ''}`.trim().split('\n')) console.log(`      ${line}`);
+  failedModules.push('country-mirror');
+}
+
+// Chief machine-surface gate: boots the real assembly in four env modes and
+// pins the token/cookie separation in both directions, the indistinguishable
+// 401, the status contract, every create refusal, idempotency under a race,
+// human-job invisibility, the paging bounds and the no-email guarantee. A pure
+// unit test cannot see an auth middleware mounted in the wrong order; this can.
+const chiefSurface = spawnSync(process.execPath, [path.join(ROOT, 'scripts', 'check-chief-surface.mjs')], {
+  cwd: ROOT,
+  encoding: 'utf8',
+});
+if (chiefSurface.status === 0) {
+  for (const line of `${chiefSurface.stdout || ''}`.trim().split('\n')) {
+    if (line.trim()) console.log(`  ✓ ${line}`);
+  }
+} else {
+  console.log('  ✗ CHIEF MACHINE SURFACE BROKEN');
+  for (const line of `${chiefSurface.stdout || ''}${chiefSurface.stderr || ''}`.trim().split('\n')) {
+    if (!/^\[\d{4}-/.test(line)) console.log(`      ${line}`);
+  }
+  failedModules.push('chief-surface');
+}
+
 // OAuth redirect-URI gate: PUBLIC_BASE_URL must be authoritative when set, and
 // the header derivation must stay frozen when it is not. PUBLIC_URL is resolved
 // at module load, so each env combination is its own booted child process.
