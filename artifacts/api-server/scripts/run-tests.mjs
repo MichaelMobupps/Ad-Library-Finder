@@ -170,6 +170,23 @@ if (countries.status === 0) {
   failedModules.push('country-mirror');
 }
 
+// Source-matrix mirror gate: which (source, target) pairs this app can run, and
+// which engine each is, lives in ONE table that both the human route and the
+// machine surface read. The dashboard cannot import it, so it carries the same
+// mapping in an expression of its own. Drift here is what made the Chief's first
+// commanded discovery come back 400 (order L-3.3c).
+const sourceMatrix = spawnSync(process.execPath, [path.join(ROOT, 'scripts', 'check-source-matrix.mjs')], {
+  cwd: ROOT,
+  encoding: 'utf8',
+});
+if (sourceMatrix.status === 0) {
+  console.log('  ✓ source × target matrix (dashboard ↔ server) in sync');
+} else {
+  console.log('  ✗ SOURCE MATRIX OUT OF SYNC');
+  for (const line of `${sourceMatrix.stdout || ''}${sourceMatrix.stderr || ''}`.trim().split('\n')) console.log(`      ${line}`);
+  failedModules.push('source-matrix');
+}
+
 // Chief machine-surface gate: boots the real assembly in four env modes and
 // pins the token/cookie separation in both directions, the indistinguishable
 // 401, the status contract, every create refusal, idempotency under a race,

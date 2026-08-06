@@ -42,6 +42,18 @@ import {
   JobSource,
   ProductType,
 } from './db.js';
+import {
+  isTargetType,
+  isUiSource,
+  resolveStoredSource,
+  targetsForStoredSource,
+  TARGET_TYPES,
+  UI_SOURCES,
+  unsupportedPairMessage,
+  uiSourceForStored,
+  type UiSource,
+} from './sourceMatrix.js';
+import { ALL_MARKETS } from './storeDiscoveryConfig.js';
 import { log } from './logger.js';
 
 // ── The token ────────────────────────────────────────────────────────────────
@@ -222,11 +234,16 @@ export function ensureChiefSchema(): void {
  * table rather than per-job `job_results` rows, so it has nothing to return
  * through `/leads`.
  */
-export const CHIEF_SOURCES = ['google_ads', 'meta', 'affplus', 'appgoblin'] as const;
-export type ChiefSource = (typeof CHIEF_SOURCES)[number];
+/**
+ * The wire vocabulary is the USER-FACING one, and it is not restated here — it
+ * is `sourceMatrix.ts`, the table the human path reads too. See that file for
+ * why a machine caller names `google_ads` + `mobile` rather than `store_first`.
+ */
+export const CHIEF_SOURCES = UI_SOURCES;
+export type ChiefSource = UiSource;
 
-export const CHIEF_TARGET_TYPES = ['mobile', 'cps'] as const;
-export type ChiefTargetType = (typeof CHIEF_TARGET_TYPES)[number];
+export const CHIEF_TARGET_TYPES = TARGET_TYPES;
+export type ChiefTargetType = ProductType;
 
 /**
  * The lead caps the human form offers (csv.ts LEAD_LIMIT_CHOICES). "As many as
@@ -236,21 +253,6 @@ export type ChiefTargetType = (typeof CHIEF_TARGET_TYPES)[number];
  */
 export const CHIEF_LEAD_COUNTS = [20, 50, 100] as const;
 
-/**
- * Source ↔ target-type compatibility. NOT new policy — these are exactly the
- * rules routes-jobs.ts enforces for a human (routes-jobs.ts:265-278), restated
- * here because the machine surface must refuse the same combinations the engine
- * cannot run rather than queueing a job that is guaranteed to fail.
- */
-const TARGETS_BY_SOURCE: Record<ChiefSource, readonly ChiefTargetType[]> = {
-  // Google Ads Transparency search matches advertiser names and verified
-  // domains; it structurally cannot enumerate app advertisers.
-  google_ads: ['cps'],
-  // AppGoblin is an app-store intelligence site: mobile only.
-  appgoblin: ['mobile'],
-  meta: ['mobile', 'cps'],
-  affplus: ['mobile', 'cps'],
-};
 
 /**
  * The countries this app supports, upper-case ISO-3166 alpha-2.
@@ -310,6 +312,13 @@ export const CREATE_BODY_FIELDS = [
 export interface ChiefCreateRequest {
   source: ChiefSource;
   target_type: ChiefTargetType;
+  /**
+   * The engine this pair resolves to (sourceMatrix), and what `jobs.source`
+   * gets. Derived during validation rather than at insert time so exactly one
+   * place decides which engine a command means. Never on the wire in either
+   * direction — `source` above is the caller's vocabulary.
+   */
+  stored_source: JobSource;
   /** Upper-cased, de-duplicated, every code known to be supported. */
   countries: string[];
   lead_count: number;
@@ -358,24 +367,26 @@ export function validateCreateBody(body: unknown): ValidationResult {
     if (!allowed.has(key)) return bad(`unknown field: ${echo(key, 40)}`);
   }
 
-  // source
+  // source — closed list first, so the matrix below is only ever asked about a
+  // key it defines. The narrowing is what keeps the shared truth from being able
+  // to widen this vocabulary: resolveStoredSource does not accept a bare string.
   if (typeof b.source !== 'string') return bad('source is required');
-  if (!(CHIEF_SOURCES as readonly string[]).includes(b.source)) {
+  if (!isUiSource(b.source)) {
     return bad(`source must be one of ${CHIEF_SOURCES.join(', ')}`);
   }
-  const source = b.source as ChiefSource;
+  const source = b.source;
 
-  // target_type
+  // target_type — same shape, same reason.
   if (typeof b.target_type !== 'string') return bad('target_type is required');
-  if (!(CHIEF_TARGET_TYPES as readonly string[]).includes(b.target_type)) {
+  if (!isTargetType(b.target_type)) {
     return bad(`target_type must be one of ${CHIEF_TARGET_TYPES.join(', ')}`);
   }
-  const targetType = b.target_type as ChiefTargetType;
-  if (!TARGETS_BY_SOURCE[source].includes(targetType)) {
-    return bad(
-      `source ${source} supports target_type ${TARGETS_BY_SOURCE[source].join(' and ')} only`,
-    );
-  }
+  const targetType = b.target_type;
+
+  // Which engine is this pair? Absent means this app genuinely cannot run it —
+  // NOT that the name is unknown, which the two checks above already settled.
+  const storedSource = resolveStoredSource(source, targetType);
+  if (storedSource === null) return bad(unsupportedPairMessage(source));
 
   // countries
   if (!Array.isArray(b.countries) || b.countries.length === 0) {
@@ -449,6 +460,7 @@ export function validateCreateBody(body: unknown): ValidationResult {
     value: {
       source,
       target_type: targetType,
+      stored_source: storedSource,
       countries,
       lead_count: leadCount,
       external_id: externalId,
@@ -465,14 +477,16 @@ export function validateCreateBody(body: unknown): ValidationResult {
  * this app's normal engine" a claim rather than a fact.
  */
 export function commandedSourceParams(v: ChiefCreateRequest): Record<string, unknown> {
-  if (v.source === 'appgoblin') {
+  // Dispatch on the ENGINE, not the caller's word for it: `google_ads` means two
+  // different pipelines depending on target_type, and they read different keys.
+  if (v.stored_source === 'appgoblin') {
     return {
       category: v.appgoblin_category,
       adNetworkDomain: v.appgoblin_ad_network,
       maxLeads: v.lead_count,
     };
   }
-  if (v.source === 'google_ads') {
+  if (v.stored_source === 'google_ads') {
     // The five keys the human path always writes, all null = "run the default
     // multilingual keyword sample across all verticals".
     return {
@@ -481,6 +495,29 @@ export function commandedSourceParams(v: ChiefCreateRequest): Record<string, unk
       maxKeywords: null,
       customKeywords: null,
       region: null,
+      maxLeads: v.lead_count,
+    };
+  }
+  if (v.stored_source === 'store_first') {
+    // The five keys routes-jobs.ts writes for a human store-first job, plus the
+    // cap. `markets` is the one that MUST be filled: this pipeline does not read
+    // `jobs.countries` at all — resolveStoreParams takes its markets from here
+    // and falls back to DEFAULT_ACTIVE_MARKETS (12) when the list is absent, so
+    // a commanded Brazil job would quietly have run the default twelve markets
+    // and reported success. The human form fills it the same way, from the same
+    // country picker (NewJobForm.tsx: `markets: countries.map(lowercase)`), and
+    // every code here has already been checked against SUPPORTED_COUNTRIES —
+    // which is ALL_MARKETS, code for code.
+    //
+    // `verticals` stays null on purpose: the closed body has no vertical field,
+    // and null is how the human path says "run the default set" rather than a
+    // guess this surface would be inventing.
+    return {
+      verticals: null,
+      markets: v.countries.map((c) => c.toLowerCase()),
+      similarMaxAppsPerRun: null,
+      searchTermsLimit: null,
+      confirmationMaxApiCalls: null,
       maxLeads: v.lead_count,
     };
   }
@@ -537,7 +574,7 @@ export function createCommandedJob(v: ChiefCreateRequest): { job: JobRow; create
       countries: req.countries,
       recipientEmail: null, // a commanded job has no recipient; see notifier.ts
       createdByUserId: CHIEF_PRINCIPAL_ID,
-      source: req.source as JobSource,
+      source: req.stored_source,
       sourceParams: commandedSourceParams(req),
     });
     getDb()
@@ -646,7 +683,12 @@ export function jobToChiefDto(job: JobRow, externalId: string | null): ChiefJobD
   return {
     job_id: job.id,
     external_id: externalId,
-    source: job.source,
+    // The caller's vocabulary, not the storage id: a job commanded as
+    // `google_ads` + `mobile` is stored as `store_first` and must read back as
+    // `google_ads`, or the Chief cannot recognise its own command. This is the
+    // same translation App.tsx does when it renders that id as
+    // "GOOGLE ADS - MOBILE" for a human.
+    source: uiSourceForStored(job.source),
     target_type: job.product_type,
     countries: parseCountries(job.countries),
     lead_count: jobLeadCount(job),
@@ -904,6 +946,14 @@ export function runChiefTests(): { passed: number; failed: number; failures: str
   check(!isSupportedCountry('XX'), 'countries: an unassigned code is unsupported');
   check(!isSupportedCountry('KP'), 'countries: an excluded country is unsupported');
   check(!isSupportedCountry('USA'), 'countries: alpha-3 is unsupported');
+  // The invariant that makes google_ads + mobile safe to command: every country
+  // this surface accepts is a market the store-first pipeline recognises. If the
+  // two ever diverge, a commanded job would be accepted for a market the engine
+  // then drops on the floor.
+  check(
+    SUPPORTED_COUNTRIES.every((c) => (ALL_MARKETS as readonly string[]).includes(c.toLowerCase())),
+    'countries: every supported country is a store market the engine knows',
+  );
 
   // ── the closed body ──
   const base = {
@@ -931,8 +981,72 @@ export function runChiefTests(): { passed: number; failed: number; failures: str
   check(!ok({ source: 1 }).ok, 'body: a non-string source is refused');
   check(!ok({ source: undefined }).ok, 'body: a missing source is refused');
   check(!ok({ target_type: 'web' }).ok, 'body: an unknown target_type is refused');
-  check(ok({ source: 'google_ads', target_type: 'cps' }).ok, 'body: google_ads + cps is accepted');
-  check(!ok({ source: 'google_ads', target_type: 'mobile' }).ok, 'body: google_ads + mobile is refused (the engine cannot run it)');
+  // ── the source × target matrix (order L-3.3c) ──
+  //
+  // The defect this replaced: L-3.3a mirrored the STORED source vocabulary and
+  // published it as the wire vocabulary, so `google_ads` + `mobile` — the pair a
+  // human picks every day, which the form maps to the `store_first` engine — was
+  // refused as a combination this app cannot run.
+  //
+  // Every pair is enumerated below against a literal expectation. The literal is
+  // a change-detector, not a second table: editing sourceMatrix.ts without
+  // meaning to will fail here rather than silently redefine what the Chief may
+  // command.
+  const EXPECTED_MATRIX: Array<[string, string, string | null]> = [
+    ['google_ads', 'mobile', 'store_first'], // ← the request that started L-3.3c
+    ['google_ads', 'cps', 'google_ads'],
+    ['meta', 'mobile', 'meta'],
+    ['meta', 'cps', 'meta'],
+    ['affplus', 'mobile', 'affplus'],
+    ['affplus', 'cps', 'affplus'],
+    ['appgoblin', 'mobile', 'appgoblin'],
+    ['appgoblin', 'cps', null], // the only pair this app genuinely cannot run
+  ];
+  check(
+    EXPECTED_MATRIX.length === UI_SOURCES.length * TARGET_TYPES.length,
+    'matrix: every source × target pair is enumerated',
+  );
+  for (const [src, tgt, stored] of EXPECTED_MATRIX) {
+    const extra = src === 'appgoblin' ? { appgoblin_category: 'game_casino' } : {};
+    const r = ok({ source: src, target_type: tgt, ...extra });
+    check(r.ok === (stored !== null), `matrix: ${src} + ${tgt} is ${stored ? 'accepted' : 'refused'}`);
+    if (r.ok) {
+      check(r.value.stored_source === stored, `matrix: ${src} + ${tgt} runs the ${stored} engine`);
+      // The two views agree: the engine the machine surface picked is one the
+      // human route would accept this product type for. This is what makes the
+      // two paths unable to disagree silently again.
+      check(
+        targetsForStoredSource(r.value.stored_source).includes(tgt as ProductType),
+        `matrix: the human path accepts ${stored} + ${tgt} too`,
+      );
+    }
+  }
+
+  // The exact request the Chief's first commanded discovery was refused with.
+  const theOriginalRequest = validateCreateBody({
+    source: 'google_ads',
+    target_type: 'mobile',
+    countries: ['US'],
+    lead_count: 20,
+    external_id: 'chief-first-command',
+  });
+  check(theOriginalRequest.ok, "matrix: the Chief's original google_ads+mobile+US+20 command is accepted");
+  check(
+    theOriginalRequest.ok && theOriginalRequest.value.stored_source === 'store_first',
+    'matrix: and it runs the store-first engine — the one the human UI calls "Google Ads - Mobile"',
+  );
+
+  // A still-invalid combination refuses, with a message that states the real
+  // supported set for the source the caller named.
+  check(
+    errOf(ok({ source: 'appgoblin', target_type: 'cps', appgoblin_category: 'x' })) ===
+      'source appgoblin supports target_type mobile only',
+    'matrix: appgoblin + cps refuses, naming appgoblin’s real supported set',
+  );
+  check(
+    errOf(ok({ source: 'google_ads', target_type: 'mobile' })) === '',
+    'matrix: google_ads no longer refuses any target type',
+  );
   check(
     ok({ source: 'appgoblin', target_type: 'mobile', appgoblin_category: 'game_casino' }).ok,
     'body: appgoblin + mobile + a category is accepted',
@@ -997,27 +1111,53 @@ export function runChiefTests(): { passed: number; failed: number; failures: str
   );
 
   // ── source_params: identical to what a human create writes ──
-  // Throws rather than casts, so a validator regression fails the suite loudly
-  // instead of type-asserting its way past the assertion below.
-  const valid = (over: Record<string, unknown> = {}): ChiefCreateRequest => {
+  // Records a FAILURE rather than casting, so a validator regression is loud
+  // instead of type-asserting its way past the assertions below.
+  //
+  // It deliberately does NOT throw: `check` only collects, so an exception
+  // escaping runChiefTests discards every failure already found and the suite
+  // reports "0 failed" for a module that is broken. A matrix regression makes
+  // exactly these calls fail, which is how that was noticed.
+  const valid = (over: Record<string, unknown> = {}): ChiefCreateRequest | null => {
     const r = ok(over);
-    if (!r.ok) throw new Error(`expected a valid command, got: ${r.error}`);
+    if (!r.ok) {
+      failures.push(`FAIL: params: expected ${JSON.stringify(over)} to be valid, got: ${r.error}`);
+      return null;
+    }
     return r.value;
   };
-  const metaParams = commandedSourceParams(valid());
-  check(JSON.stringify(metaParams) === '{"maxLeads":50}', 'params: meta carries only the lead cap');
-  const gaParams = commandedSourceParams(valid({ source: 'google_ads', target_type: 'cps' }));
+  /** Params for a command, or `{}` when the command did not validate (already
+   *  recorded as a failure above — this keeps the comparison below meaningful
+   *  rather than throwing on null). */
+  const paramsOf = (over: Record<string, unknown> = {}): Record<string, unknown> => {
+    const v = valid(over);
+    return v ? commandedSourceParams(v) : {};
+  };
+  check(JSON.stringify(paramsOf()) === '{"maxLeads":50}', 'params: meta carries only the lead cap');
   check(
-    JSON.stringify(gaParams) ===
+    JSON.stringify(paramsOf({ source: 'google_ads', target_type: 'cps' })) ===
       '{"verticals":null,"languages":null,"maxKeywords":null,"customKeywords":null,"region":null,"maxLeads":50}',
     'params: google_ads writes the same five null keys the human path writes',
   );
-  const agParams = commandedSourceParams(
-    valid({ source: 'appgoblin', target_type: 'mobile', appgoblin_ad_network: 'AppsFlyer.com' }),
+  check(
+    JSON.stringify(paramsOf({ source: 'appgoblin', target_type: 'mobile', appgoblin_ad_network: 'AppsFlyer.com' })) ===
+      '{"category":null,"adNetworkDomain":"appsflyer.com","maxLeads":50}',
+    'params: appgoblin writes the axis the pipeline reads, lower-cased',
+  );
+  // store_first, reached by commanding google_ads + mobile. `markets` is the
+  // load-bearing key: the pipeline does NOT read jobs.countries, so an absent
+  // list would silently run DEFAULT_ACTIVE_MARKETS instead of what was asked for.
+  const sfParams = paramsOf({ source: 'google_ads', target_type: 'mobile', countries: ['BR', 'de'] });
+  check(
+    JSON.stringify(sfParams) ===
+      '{"verticals":null,"markets":["br","de"],"similarMaxAppsPerRun":null,' +
+        '"searchTermsLimit":null,"confirmationMaxApiCalls":null,"maxLeads":50}',
+    'params: store_first writes the five keys the human path writes, markets from the commanded countries',
   );
   check(
-    JSON.stringify(agParams) === '{"category":null,"adNetworkDomain":"appsflyer.com","maxLeads":50}',
-    'params: appgoblin writes the axis the pipeline reads, lower-cased',
+    Array.isArray(sfParams.markets) &&
+      (sfParams.markets as string[]).every((m) => (ALL_MARKETS as readonly string[]).includes(m)),
+    'params: every market written is one the store pipeline recognises',
   );
 
   // ── pagination ──

@@ -1272,8 +1272,8 @@ refused by name:
 
 | Field | Type | Rule |
 |---|---|---|
-| `source` | string | one of `google_ads`, `meta`, `affplus`, `appgoblin`. Case-sensitive. (`store_first` is deliberately not commandable — its deliverable is the shared Publishers corpus, not per-job leads, so it has nothing to return through `/leads`.) |
-| `target_type` | string | `mobile` or `cps`. **`google_ads` accepts `cps` only; `appgoblin` accepts `mobile` only** — the same rules routes-jobs.ts enforces for a human, restated so the seam refuses a combination the engine cannot run instead of queueing a job guaranteed to fail. |
+| `source` | string | one of `google_ads`, `meta`, `affplus`, `appgoblin`. Case-sensitive. This is the USER-FACING vocabulary — the four buttons on the human form — not the stored `JobSource`. `store_first` is a storage id and is never accepted as an input; it is reached by naming `google_ads` with `target_type: mobile`, exactly as the human form reaches it. **Corrected by L-3.3c** — the original text here claimed `store_first` "has nothing to return through `/leads`", which is false. |
+| `target_type` | string | `mobile` or `cps`. **`appgoblin` accepts `mobile` only; every other source accepts both.** See the corrected matrix in the L-3.3c entry. **Corrected by L-3.3c** — the original text here claimed `google_ads` accepts `cps` only, which refused a combination this app supports and runs every day. |
 | `countries` | string[] | non-empty; each an ISO-3166 alpha-2 code from this app's supported catalog (**137 codes**, mirrored from the human form and drift-gated). Accepted in any case and upper-cased; **duplicates are refused**, not merged. |
 | `lead_count` | number | `20`, `50` or `100` only. Unlimited does not exist for a commanded job. |
 | `external_id` | string | required idempotency key. 1–200 **bytes** of UTF-8, no C0/C1 control characters. Stored and compared **byte for byte** — never trimmed, never case-folded. Over-length is refused, never truncated. |
@@ -1376,8 +1376,7 @@ CSV and the .xlsx bundle.
 | `unknown field: <name>` | anything outside the 7 fields above (including `__proto__`; the name is bounded to 40 characters in the reply) |
 | `source is required` / `source must be one of google_ads, meta, affplus, appgoblin` | missing / not on the list |
 | `target_type is required` / `target_type must be one of mobile, cps` | missing / not on the list |
-| `source google_ads supports target_type cps only` | incompatible pair |
-| `source appgoblin supports target_type mobile only` | incompatible pair |
+| `source appgoblin supports target_type mobile only` | incompatible pair — **the only one left** after L-3.3c. The `google_ads supports target_type cps only` refusal no longer exists: that pair runs the store engine. |
 | `countries must be a non-empty array` / `countries must contain only strings` | shape |
 | `unsupported country: <code>` | outside the 137-code catalog (bounded to 8 characters in the reply) |
 | `duplicate country: <code>` | the same country twice |
@@ -1644,6 +1643,261 @@ The L2 legacy redirect still answers **307** with its `Location` unchanged, and 
 
 **8. Auto-fix and out-of-scope** — every in-scope finding above was fixed and re-audited to
 a clean round. Six items recorded and left untouched: **O-20** … **O-25** below.
+
+---
+
+### Leadfinder Order L-3.3c — the machine surface refuses a combination the app supports ☑ DONE (2026-08-06)
+
+Branch `leadfinder-l33c-source-matrix`, cut from `main` at `8806f04`.
+
+**0. What the defect actually is — the order's premise is half right, and the half it
+gets wrong changes the fix.**
+
+The order states that L-3.3a's source-to-target validation "does not share a source of
+truth with the real job path". Read directionally, that is not what happened:
+
+- L-3.3a's `TARGETS_BY_SOURCE` (`chief.ts:245-253`) is **not inverted, not stale and not
+  invented.** It is an accurate mirror of `routes-jobs.ts:265-278`, which really does
+  refuse `google_ads` + `mobile` for a human, with the message *"google_ads source
+  supports productType=cps only — use the "Google Ads - Mobile" source for apps"*.
+  Both paths agree today. A drift-fix alone would change nothing.
+- The mismatch is a **layer** mismatch. This app has two source vocabularies. The
+  **stored** one is `JobSource` (`db.ts:10`): `meta | affplus | appgoblin | google_ads |
+  store_first`. The **user-facing** one is the four buttons on the New Job form, and
+  `NewJobForm.tsx:70` maps them to the stored ids:
+  `srcChoice === 'google_ads' ? (mode === 'mobile' ? 'store_first' : 'google_ads') : srcChoice`.
+  `App.tsx:228` labels the stored id back: `store_first: 'GOOGLE ADS - MOBILE'`.
+  So **Google Ads mobile discovery exists and works exactly as Michael says** — it is the
+  `store_first` source wearing its UI name. L-3.3a mirrored the stored layer and then
+  published it as the wire vocabulary, so the Chief was made to speak storage ids while
+  every human speaks UI labels.
+- Compounding it, L-3.3a **excluded `store_first` from the commandable sources on a
+  factually wrong premise** — *"its deliverable is the shared Publishers corpus, not
+  per-job leads, so it has nothing to return through `/leads`"*. It is wrong on all three
+  counts, verified before this edit:
+
+  | L-3.3a's premise | Verified reality |
+  |---|---|
+  | no per-job leads | `storeLeads.ts:245-257` `persistPublisherLeads` → `insertResult` writes `job_results` rows classified `mobile_google_play`/`mobile_app_store` with `store_url` — exactly the shape `/leads` serialises |
+  | (lead cap unconsidered) | honours `maxLeads` — `storeDiscoveryPipeline.ts:407, 878, 944` |
+  | (country universe unconsidered) | `ALL_MARKETS` (`storeDiscoveryConfig.ts:39`) and the chief catalog `SUPPORTED_COUNTRIES` (`chief.ts:269`) are **the same 137 codes in the same order** — machine-compared, zero difference either way |
+
+So the fix is not "correct a table". It is: give the two paths one shared truth that
+carries the **mapping** as well as the matrix, and let the machine surface reach the
+engine the human UI reaches.
+
+**One trap this creates, and the reason `countries` cannot just be passed through.**
+`store_first` does not read `job.countries` at all — `resolveStoreParams`
+(`storeDiscoveryConfig.ts:495-515`) takes its markets from `source_params.markets` and
+falls back to `DEFAULT_ACTIVE_MARKETS` (12 markets) when absent. A commanded Brazil job
+would therefore have run the default twelve markets and reported success. The human form
+avoids this by sending `markets: countries.map(lowercase)` (`NewJobForm.tsx:220`); the
+machine surface must do the same, or accepting the request would replace a loud 400 with
+a silent wrong answer. The same file already carries a comment (`storeDiscoveryConfig.ts:501-506`)
+about a previous bug of exactly this class.
+
+**1. Blast radius (recorded before the first edit)**
+
+*Files to be touched — 5 code + 1 doc:*
+
+| File | Change |
+|---|---|
+| `artifacts/api-server/src/sourceMatrix.ts` | **new.** The single shared truth: the user-facing source × target-type matrix, and the mapping from each accepted pair to its stored `JobSource`. Both paths read it; neither keeps a table |
+| `artifacts/api-server/src/routes-jobs.ts` | the two inline compatibility `if`s at 265-278 replaced by one call into `sourceMatrix`. Same refusals, same status, same messages for every input a human can send |
+| `artifacts/api-server/src/chief.ts` | `TARGETS_BY_SOURCE` deleted; validation reads `sourceMatrix`; the resolved stored source is what `createCommandedJob` writes; `commandedSourceParams` gains a `store_first` branch that sets `markets` from the validated countries; `jobToChiefDto` maps the stored source back to the user-facing name so the wire round-trips |
+| `artifacts/api-server/scripts/check-source-matrix.mjs` | **new.** drift gate: `sourceMatrix.ts` ↔ `NewJobForm.tsx:70` ↔ `App.tsx:228`, in the pattern `check-country-mirror.mjs` established |
+| `artifacts/api-server/scripts/check-chief-surface.mjs` | the matrix assertions re-driven from the shared truth; the previously refused request added as a proof |
+| `artifacts/api-server/scripts/run-tests.mjs` | run the new gate |
+| `TODO.md` | this entry |
+
+*Not touched:* every engine and pipeline, `queue.ts`, `jobControl.ts`, `notifier.ts`,
+`db.ts` (**no schema change** — the mapping is code, and `store_first` is already a legal
+`JobSource` value), `auth.ts`, `oauth.ts`, the whole `dashboard` package (no UI change),
+Replit Secrets, the production database. The endpoint paths, auth, status ordering and
+response schemas stay exactly as L-3.3a documented them.
+
+*Behaviours affected:*
+1. `POST /api/chief/jobs` with `source=google_ads, target_type=mobile` changes from **400
+   to 201**, and creates a job whose stored source is `store_first`.
+2. That job's `countries` now reach the engine as `source_params.markets`. No other
+   source's `source_params` changes by a byte.
+3. `GET /api/chief/jobs/:id` reports `source: "google_ads"` for such a job — the
+   user-facing name it was commanded with, not the storage id. The 17-field schema is
+   unchanged; only this one value's vocabulary is pinned down.
+4. Refusal messages for genuinely impossible pairs are reworded to state the real
+   supported set for the named source.
+5. The human path: **no behaviour change at all.** Same inputs, same outcomes, same
+   message strings — it is the same rules read from one place instead of two.
+
+*Worst realistic failure, in order:*
+1. **A commanded Google-Ads-mobile job silently runs the wrong markets** — the trap above.
+   Prevented by the explicit `countries → markets` mapping and tested by reading the
+   stored `source_params` back.
+2. **The human path's validation shifts under the refactor**, so a human's job that used
+   to be accepted is refused or vice versa. Guarded by driving the tests from the shared
+   truth for every source × target pair, and by leaving the message strings byte-identical.
+3. **The shared truth widens the vocabulary** — a matrix lookup accepting a source or
+   target outside the closed lists. The lookup happens strictly after the two closed-list
+   checks, and the security round confirms it specifically.
+4. **The wire vocabulary becomes ambiguous** — `store_first` reachable under two names, or
+   a job that reads back as something other than what was commanded. One vocabulary only:
+   the four user-facing sources, and `store_first` is never accepted as an input.
+5. **The L2 legacy layer or the DARK baseline moves.** Nothing here touches routing; the
+   17-probe baseline and the legacy gate are re-run in both modes regardless.
+
+*Rollback:* `git revert` the branch commits. No env var, no secret, no deploy step, no
+data migration, no schema change. Jobs already created keep working — `store_first` was
+always a legal stored source.
+
+**2. Decision taken, with the alternative named.** The wire speaks the **user-facing**
+vocabulary in both directions: the Chief commands `google_ads` + `mobile` and reads back
+`source: "google_ads"`, exactly as a human picks "Google Ads" + "Mobile" and sees
+"GOOGLE ADS - MOBILE". The alternative — exposing `store_first` as a fifth commandable
+source — was rejected: it would give one capability two names on the wire, and it would
+leave the Chief's own first command still refused, which is the defect this order exists
+to close.
+
+**3. THE CORRECTED MATRIX — the Chief's console form is built from this**
+
+Four sources, two target types, **seven runnable pairs**. `source` and `target_type` are
+both closed and case-sensitive; the engine column is internal and never appears on the wire.
+
+| `source` | `target_type` | runs | what it is |
+|---|---|---|---|
+| `google_ads` | `mobile` | `store_first` | **the pair L-3.3c fixed.** Harvests the app stores and runs its own transparency confirmation. The human form calls this "Google Ads" + Mobile and the Activity view labels it `GOOGLE ADS - MOBILE` |
+| `google_ads` | `cps` | `google_ads` | Google Ads Transparency advertiser search — matches advertiser names and verified domains |
+| `meta` | `mobile` | `meta` | Meta Ad Library |
+| `meta` | `cps` | `meta` | ″ |
+| `affplus` | `mobile` | `affplus` | AffPlus offer feed |
+| `affplus` | `cps` | `affplus` | ″ |
+| `appgoblin` | `mobile` | `appgoblin` | AppGoblin app-store intelligence. Requires `appgoblin_category` and/or `appgoblin_ad_network` |
+| `appgoblin` | `cps` | — | **the only pair this app cannot run.** AppGoblin has no web/CPS side. Refused 400 `source appgoblin supports target_type mobile only` |
+
+Rules that follow from the table, all tested:
+
+- **`store_first` is never an input.** `{"source":"store_first"}` is refused
+  `source must be one of google_ads, meta, affplus, appgoblin`. One capability, one name.
+- **The wire round-trips.** A job commanded as `google_ads` + `mobile` reads back
+  `"source":"google_ads"` from `GET /api/chief/jobs/:id` forever, even though `jobs.source`
+  holds `store_first`. The Chief always sees the vocabulary it spoke.
+- **`countries` steer the store engine.** For the `store_first` pair they are written to
+  `source_params.markets` lower-cased, exactly as the human form does. Every one of the 137
+  supported country codes is a valid store market — the two lists are identical, machine-compared.
+- **`lead_count` is honoured** by the store engine (`maxLeads`), like every other source.
+- Everything else in L-3.3a's contract — paths, auth, status ordering, the 17-field job
+  object, the 10-field lead object, paging — is **unchanged**.
+
+**4. Gates** — all green.
+
+| Gate | Command | Before | After |
+|---|---|---|---|
+| typecheck + build | `pnpm build` | pass | pass |
+| tests | `pnpm --filter api-server test` | 31 modules, 1604 | **32 modules, 1702**, 0 failed |
+| `sourceMatrix` unit suite | (inside the above) | — | **70** (new module) |
+| `chief` unit suite | ″ | 135 | **163** |
+| `check-chief-surface` | boot gate | 474 D / 478 L | **498 D / 502 L** (+265 unset, +267 padded) |
+| `check-source-matrix` | boot gate | — | **new** — 7 runnable pairs verified against the dashboard |
+
+**5. Godlike audit — 3 rounds, closed on a clean one**
+
+*Round 1, technical — 3 findings, all fixed.* (a) `everySupportedPair()` was exported and
+never called — dead code in the one file whose whole job is being the single truth. Removed.
+(b) **The human path's compatibility rules had no test at all.** `runRoutesJobsTests` covers
+publishers, not job creation, so the refactor of routes-jobs.ts:265-278 was resting on the
+chief suite alone. A `sourceMatrix` suite now pins `targetsForStoredSource` for all five
+engines — those five lines ARE the original hand-written rules, so a human-visible change
+cannot pass silently. (c) Nothing proved MATRIX covers `JobSource`. A sixth source added to
+db.ts and forgotten here would make `targetsForStoredSource` answer `[]`, and the human
+route would then refuse *every* product type for it with the degenerate message
+`X source supports productType= only`. Now a compile-time exhaustiveness check plus a
+runtime assertion that no engine has an empty target set.
+
+*Round 2, security — 1 finding, fixed.* The order asked specifically that the shared truth
+cannot widen validation beyond the closed vocabularies. It cannot — both callers allowlist
+*before* they look up (chief.ts via `isUiSource`/`isTargetType`, routes-jobs.ts via its
+five-literal source check), and the signatures refuse a bare `string`. But writing the
+hostile-key test found that **`resolveStoredSource` threw a TypeError on an unknown source
+key**: `MATRIX['']` is `undefined` and indexing that dies, while `MATRIX['constructor']`
+yields a function that is not an engine. Not reachable today — the guards and the types both
+stop it — but a lookup that throws on an unknown key is a landmine for the next caller, and
+this file exists precisely to be the one place nobody has to think twice about. Both lookups
+now use own-property checks and are total. Tested against `__proto__`, `constructor`,
+`prototype`, `toString`, `store_first`, `''` and `GOOGLE_ADS`.
+
+*Round 3, end-user + coherence — 1 finding, fixed.* L-3.3a's "THE CONTRACT AS BUILT" section
+is what C-3.3b is written from, and three of its lines had become false (the `source` row's
+claim that store_first has nothing to return, the `target_type` row's cps-only rule, and the
+`google_ads supports target_type cps only` refusal). All three corrected in place and marked,
+rather than left for C-3.3b to trip over.
+
+*Round 4 — clean.* No findings.
+
+**Two defects proven able to fail their tests** (order item 4):
+
+| Defect reintroduced | Result |
+|---|---|
+| `google_ads: { cps: 'google_ads' }` — the L-3.3a matrix restored | **3 gates red.** `chief` unit suite: 7 named failures. `check-source-matrix`: *"the form submits 'store_first' for google_ads + mobile, but the matrix has no such engine — the server would refuse a job the UI offers"*. `check-chief-surface`: red in both dark and lit |
+| `markets: null` in `commandedSourceParams` | `chief` 2 failures, `check-chief-surface` red in both modes: *"a commanded google_ads+mobile job steers the store engine with its own countries (got …markets:null…)"* |
+
+Both restored and the suite re-run green. The first exercise also exposed a **reporting**
+defect worth its own line: `runChiefTests`'s `valid()` helper *threw* on a validation
+regression, and an exception escaping the suite discards every failure already collected —
+the module reported `0 failed` while being broken. It now records a failure and continues,
+which is how the 7 named failures above became visible at all.
+
+**6. Smoke — separate ports, job runner disabled, real assembly, throwaway cwd**
+
+Two servers, ports **3971 (dark) / 3973 (lit)**, bound to `127.0.0.1`, each in its own
+`mkdtemp` cwd so `path.resolve('data')` made a fresh sqlite file. `startQueue()` was never
+called: every job created sat `pending` with `started_at = null`, so nothing executed — no
+scrape, no store call, no email, no external request. **The real database's md5 is
+`e689c6fc55e6276acf296f7e9bada157` before and after**, identical to the value L2 and L-3.3a
+recorded. No workflow was running and none was touched. Both ports released.
+
+*a. DARK (`BASE_PATH`, `PUBLIC_BASE_URL` unset) — 16/16.* The 17-probe endpoint table is
+**byte-for-byte identical to the baseline recorded in the Bundle 1 ledger**, md5
+`0b9f472cd1fcb63fb9c93396cc198b06` on both sides. The harness was rebuilt from scratch for
+this order and reproduced the recorded md5 exactly.
+
+*b. LIT (`BASE_PATH=/leadfinder`, `PUBLIC_BASE_URL=https://tools.mobupps.net/leadfinder`) —
+18/18.* The same proofs at the prefixed paths:
+
+```
+GET  /leadfinder/api/chief/status              401 then 200
+POST /leadfinder/api/chief/jobs                201  <- google_ads + mobile, PREVIOUSLY 400
+       stored: source=store_first status=pending started_at=null
+       params={"verticals":null,"markets":["us"],…,"maxLeads":20}
+GET  /leadfinder/api/chief/jobs/job_…          200  <- reads back "source":"google_ads"
+POST /leadfinder/api/chief/jobs                400  {"error":"source appgoblin supports target_type mobile only"}
+POST /leadfinder/api/chief/jobs                400  {"error":"source must be one of google_ads, meta, affplus, appgoblin"}   <- store_first by name
+GET  /leadfinder/api/jobs                      401  <- the chief token on the human surface
+GET  /api/chief/status                         404  <- unprefixed, while prefixed
+GET  /api/jobs/job_LEGACY/csv                  307 -> /leadfinder/api/jobs/job_LEGACY/csv
+```
+
+The L2 legacy redirect still answers **307** with its `Location` unchanged, and
+`check-legacy-redirects` (21 dark + 212 lit) passes untouched.
+
+**7. Deviations from the order, stated plainly**
+
+1. **The order's diagnosis was half wrong, and the fix is bigger than it describes.** The
+   order says L-3.3a's validation "does not share a source of truth with the real job path".
+   The table was in fact an accurate mirror of routes-jobs.ts; both refused `google_ads` +
+   `mobile`. Correcting a drift would have changed nothing. The real defect — a layer
+   mismatch plus a factually wrong exclusion of `store_first` — is written up in section 0,
+   and fixing it required routing the pair to a different engine and mapping `countries` to
+   that engine's `markets`, not just editing a table.
+2. **`commandedSourceParams` now dispatches on the engine, not the caller's word.**
+   Unavoidable once one source name means two engines: `google_ads` + `cps` and `google_ads`
+   + `mobile` need different `source_params` shapes.
+3. **Three lines of L-3.3a's published contract were corrected in place**, not merely
+   superseded here, because C-3.3b is written from that section alone.
+
+**8. Auto-fix and out-of-scope** — every in-scope finding above was fixed and re-audited to a
+clean round. **O-24 is now materially more urgent** (see Open items): with `appgoblin` the
+only source carrying a required discovery axis, and its category catalog still reachable only
+over a cookie-authenticated endpoint, it is the one remaining pair the Chief cannot command
+successfully without out-of-band knowledge. No new open items.
 
 ---
 

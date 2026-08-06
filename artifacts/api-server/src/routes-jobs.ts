@@ -45,6 +45,7 @@ import {
   type PublisherRow,
 } from './storeDiscoveryDb.js';
 import { publisherViewCsv } from './storeLeads.js';
+import { targetsForStoredSource } from './sourceMatrix.js';
 
 export const jobsRouter: Router = Router();
 
@@ -261,19 +262,30 @@ jobsRouter.post('/', (req: Request<{}, {}, CreateJobBody>, res: Response) => {
     jobSource = source;
   }
 
-  // AppGoblin and store-first are mobile-only. Affplus supports cps (web) too.
-  if ((jobSource === 'appgoblin' || jobSource === 'store_first') && productTypes.some((pt) => pt !== 'mobile')) {
-    return res.status(400).json({ error: `${jobSource} source supports productType=mobile only` });
-  }
-  // Google Ads Transparency is CPS-ONLY. Its advertiser search matches advertiser
-  // names and verified domains, which resolves web/CPS advertisers well and
-  // structurally cannot enumerate app advertisers — the reason mobile discovery
-  // moved to the stores. The store_first source ("Google Ads - Mobile") is the
-  // mobile path and runs its own transparency confirmation, so a GATC mobile job
-  // is now strictly a slower, worse duplicate of it.
-  if (jobSource === 'google_ads' && productTypes.some((pt) => pt !== 'cps')) {
+  // Which product types this engine can actually run. Derived from
+  // sourceMatrix.ts — the SAME table /api/chief validates against, so the human
+  // and machine paths cannot drift apart again (order L-3.3c).
+  //
+  // This check is over STORED ids while the machine surface's is over the
+  // user-facing pair, because the dashboard has already done the mapping by the
+  // time it posts here: "Google Ads" + Mobile arrives as `store_first`
+  // (NewJobForm.tsx), which is exactly why a GATC mobile job is refused below
+  // and mobile discovery still works — they are two different engines.
+  const allowedTargets = targetsForStoredSource(jobSource);
+  const offendingTarget = productTypes.find((pt) => !allowedTargets.includes(pt));
+  if (offendingTarget) {
+    // Both strings are byte-for-byte what the two hand-written checks answered
+    // before the refactor: they are surfaced in the human UI, and google_ads's
+    // names the source that DOES do mobile instead of leaving the operator at a
+    // dead end. Google Ads Transparency search matches advertiser names and
+    // verified domains — it resolves web/CPS advertisers well and structurally
+    // cannot enumerate app advertisers, which is why mobile discovery moved to
+    // the stores.
     return res.status(400).json({
-      error: 'google_ads source supports productType=cps only — use the "Google Ads - Mobile" source for apps',
+      error:
+        jobSource === 'google_ads'
+          ? 'google_ads source supports productType=cps only — use the "Google Ads - Mobile" source for apps'
+          : `${jobSource} source supports productType=${allowedTargets.join(' and ')} only`,
     });
   }
 

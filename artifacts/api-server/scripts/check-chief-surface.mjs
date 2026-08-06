@@ -386,8 +386,10 @@ if (FULL) {
     ['a mis-cased source', command({ source: 'Meta' }), 'source must be one of'],
     ['a missing target_type', command({ target_type: undefined }), 'target_type is required'],
     ['an unknown target_type', command({ target_type: 'web' }), 'target_type must be one of'],
-    ['google_ads + mobile', command({ source: 'google_ads', target_type: 'mobile' }), 'supports target_type cps only'],
-    ['appgoblin + cps', command({ source: 'appgoblin', target_type: 'cps' }), 'supports target_type mobile only'],
+    // NB: google_ads + mobile is NOT here. It is the pair L-3.3c fixed — it runs
+    // the store-first engine, exactly as the human form's "Google Ads" + Mobile
+    // does. Its acceptance is proved in section 4.
+    ['appgoblin + cps', command({ source: 'appgoblin', target_type: 'cps' }), 'source appgoblin supports target_type mobile only'],
     ['appgoblin with no axis', command({ source: 'appgoblin' }), 'appgoblin jobs require'],
     ['an axis on a meta job', command({ appgoblin_category: 'games' }), 'apply to source appgoblin only'],
     ['no countries', command({ countries: [] }), 'countries must be a non-empty array'],
@@ -467,18 +469,67 @@ if (FULL) {
   check(row.source_params === '{"maxLeads":50}', `source_params matches the human shape (got ${row.source_params})`);
   check(row.countries === '["US"]', 'countries are stored in this app\'s own format');
 
-  // Every source the contract allows actually creates.
-  for (const [src, target, extra] of [
-    ['meta', 'cps', {}],
-    ['affplus', 'mobile', {}],
-    ['google_ads', 'cps', {}],
-    ['appgoblin', 'mobile', { appgoblin_category: 'game_casino' }],
+  // Every pair the matrix allows actually creates, and lands on the engine the
+  // matrix names. `stored` differs from `src` for exactly one pair — that pair
+  // is the whole point of order L-3.3c.
+  for (const [src, target, stored, extra] of [
+    ['meta', 'cps', 'meta', {}],
+    ['meta', 'mobile', 'meta', {}],
+    ['affplus', 'mobile', 'affplus', {}],
+    ['affplus', 'cps', 'affplus', {}],
+    ['google_ads', 'cps', 'google_ads', {}],
+    ['google_ads', 'mobile', 'store_first', {}],
+    ['appgoblin', 'mobile', 'appgoblin', { appgoblin_category: 'game_casino' }],
   ]) {
     const res = await post(command({ source: src, target_type: target, external_id: `chief-src-${src}-${target}`, ...extra }));
     check(res.status === 201, `${src}/${target} creates (got ${res.status})`);
     const created2 = db.getJob(res.json.job.job_id);
-    check(created2.source === src && created2.product_type === target, `${src}/${target} is stored as commanded`);
+    check(
+      created2.source === stored && created2.product_type === target,
+      `${src}/${target} runs the ${stored} engine (stored ${created2.source}/${created2.product_type})`,
+    );
+    // Whatever engine it landed on, the Chief reads its own vocabulary back.
+    check(
+      res.json.job.source === src && res.json.job.target_type === target,
+      `${src}/${target} echoes the vocabulary it was commanded in`,
+    );
+    const readBack = await request('GET', CHIEF(`/jobs/${res.json.job.job_id}`), { token: bearer() });
+    check(
+      readBack.json.job.source === src,
+      `${src}/${target} still reads back as ${src} on a later GET (got ${readBack.json.job.source})`,
+    );
   }
+  const gaMobileRow = db.getJob(
+    db.getDb().prepare(`SELECT job_id FROM chief_jobs WHERE external_id = 'chief-src-google_ads-mobile'`).get().job_id,
+  );
+  check(
+    gaMobileRow.source_params ===
+      '{"verticals":null,"markets":["us"],"similarMaxAppsPerRun":null,"searchTermsLimit":null,' +
+        '"confirmationMaxApiCalls":null,"maxLeads":50}',
+    `a commanded google_ads+mobile job steers the store engine with its own countries (got ${gaMobileRow.source_params})`,
+  );
+
+  // The Chief's actual first commanded discovery, byte for byte as it was sent
+  // when it came back 400. This is the regression that named order L-3.3c.
+  const theOriginal = await post({
+    source: 'google_ads',
+    target_type: 'mobile',
+    countries: ['US'],
+    lead_count: 20,
+    external_id: 'chief-first-command',
+  });
+  check(theOriginal.status === 201, `the Chief's original command is accepted (got ${theOriginal.status})`);
+  check(
+    theOriginal.json?.job?.source === 'google_ads' && theOriginal.json?.job?.target_type === 'mobile',
+    'the Chief\'s original command reads back in the vocabulary it was sent in',
+  );
+  check(theOriginal.json?.job?.state === 'pending', 'the Chief\'s original command sits queued, not started');
+  const originalRow = db.getJob(theOriginal.json.job.job_id);
+  check(originalRow.source === 'store_first', 'and it is stored against the engine that actually does mobile');
+  check(
+    JSON.parse(originalRow.source_params).maxLeads === 20,
+    'and its lead cap reached the engine — store_first honours maxLeads',
+  );
   const gaRow = db.getJob(
     db.getDb().prepare(`SELECT job_id FROM chief_jobs WHERE external_id = 'chief-src-google_ads-cps'`).get().job_id,
   );
