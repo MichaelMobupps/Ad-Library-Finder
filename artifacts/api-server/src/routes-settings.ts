@@ -13,14 +13,14 @@ import { log } from './logger.js';
 export const settingsRouter: Router = Router();
 
 // GET /api/settings — per-user view
-settingsRouter.get('/', (req: Request, res: Response) => {
+settingsRouter.get('/', async (req: Request, res: Response) => {
   const user = (req as RequestWithUser).user!;
   res.json({
     userEmail: user.email,
     userName: user.name,
-    gmailConnected: isGmailConnectedForUser(user.id),
-    gmailEmail: getConnectedGmailEmailForUser(user.id),
-    defaultRecipient: getDefaultRecipientForUser(user.id),
+    gmailConnected: await isGmailConnectedForUser(user.id),
+    gmailEmail: await getConnectedGmailEmailForUser(user.id),
+    defaultRecipient: await getDefaultRecipientForUser(user.id),
   });
 });
 

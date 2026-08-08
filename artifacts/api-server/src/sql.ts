@@ -24,7 +24,8 @@
  *
  *   1. every method is async, so every site gains an `await`, which the
  *      compiler enforces for reads (a Promise is not a JobRow) and
- *      scripts/check-awaited-db.mjs enforces for writes; and
+ *      scripts/check-storage-seam.mjs enforces for writes and value positions
+ *      (an un-awaited call serialised into JSON ships as `{}`); and
  *   2. `?` placeholders are rewritten to `$1…$n` HERE rather than in 115 SQL
  *      strings, so the SQL in each module is still the SQL that module wrote.
  *

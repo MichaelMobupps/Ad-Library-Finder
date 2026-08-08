@@ -30,6 +30,14 @@
  *      instruction handed to a human for use during a publish, and untested
  *      operator instructions are how a publish goes wrong at the worst moment.
  *
+ *   7. THE SPA'S BOOT PAYLOADS ARE PRIMITIVES, NOT PROMISES. The white-screen
+ *      regression of 2026-08-08: /api/settings built its res.json() object
+ *      from async helpers without await, three fields serialised as `{}`, and
+ *      the dashboard crashed rendering one of them (React #31) — a blank page
+ *      for every signed-in user. check-storage-seam.mjs now bans the pattern
+ *      statically; this proves it on the wire, so a new route or field that
+ *      regresses the same way fails here even if it dodges that gate.
+ *
  *   5. THE DATABASE PASSWORD NEVER REACHES THE LOG. `DATABASE_URL` carries a
  *      credential, and the boot line names the backend. Proved by booting
  *      against a URL that HAS a password and reading every byte the process
@@ -462,6 +470,46 @@ try {
   check(
     /Durable Advertiser 1/.test(csv1.body.toString('utf8')),
     'phase 3: the CSV really contains the job\'s stored leads',
+  );
+
+  // ── 7. the SPA's boot payloads are primitives, not Promises ───────────────
+  // Every leaf the dashboard renders on sign-in must be a JSON primitive. An
+  // EMPTY OBJECT is what an un-awaited Promise looks like after res.json(),
+  // so any `{}` leaf in these payloads is treated as one.
+  const emptyObjectLeaves = (v, at = '$') =>
+    v === null || typeof v !== 'object'
+      ? []
+      : Array.isArray(v)
+        ? v.flatMap((x, i) => emptyObjectLeaves(x, `${at}[${i}]`))
+        : Object.keys(v).length === 0
+          ? [at]
+          : Object.entries(v).flatMap(([k, x]) => emptyObjectLeaves(x, `${at}.${k}`));
+
+  const bootPayloads = [];
+  for (const p of ['/api/me', '/api/settings', '/api/jobs']) {
+    const r = await get(before.port, p, cookie);
+    check(r.status === 200, `phase 7: ${p} answers 200 for a signed-in user (got ${r.status})`);
+    bootPayloads.push([p, r.status === 200 ? JSON.parse(r.body.toString('utf8')) : null]);
+  }
+  for (const [p, payload] of bootPayloads) {
+    const bad7 = payload === null ? [] : emptyObjectLeaves(payload);
+    check(
+      bad7.length === 0,
+      `phase 7: ${p} carries no serialised Promise (${bad7.length === 0 ? 'all leaves are primitives' : `\`{}\` at ${bad7.join(', ')}`})`,
+    );
+  }
+  const settingsPayload = (bootPayloads.find(([p]) => p === '/api/settings') || [])[1] ?? {};
+  check(
+    typeof settingsPayload.gmailConnected === 'boolean',
+    `phase 7: settings.gmailConnected is a real boolean (got ${JSON.stringify(settingsPayload.gmailConnected)})`,
+  );
+  check(
+    settingsPayload.gmailEmail === null || typeof settingsPayload.gmailEmail === 'string',
+    `phase 7: settings.gmailEmail is a string or null (got ${JSON.stringify(settingsPayload.gmailEmail)})`,
+  );
+  check(
+    settingsPayload.defaultRecipient === null || typeof settingsPayload.defaultRecipient === 'string',
+    `phase 7: settings.defaultRecipient is a string or null (got ${JSON.stringify(settingsPayload.defaultRecipient)})`,
   );
 
   // THE RESTART. SIGKILL, so nothing gets a chance to flush anything to disk —

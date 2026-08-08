@@ -109,6 +109,91 @@ for (const sf of program.getSourceFiles()) {
 }
 if (floating === 0) ok('every storage call is awaited (no discarded Promise in src/)');
 
+// ── 2b. no Promise used as a VALUE ───────────────────────────────────────────
+// The discarded-Promise check above catches `appendLog(...)` on a line of its
+// own. It does NOT catch a Promise smuggled into a value position, which is how
+// the white-screen bug of 2026-08-08 shipped: routes-settings.ts built
+// `{ gmailConnected: isGmailConnectedForUser(id) }` without await, res.json()
+// serialised the three Promises as `{}`, and the dashboard crashed rendering
+// `{}` as a React child — a blank page for every signed-in user.
+//
+// So: a CALL whose static type is Promise<...> may not appear where its value
+// is consumed synchronously. Each position below coerces a Promise into
+// something silently wrong rather than failing loudly:
+//   • object-literal property   → JSON.stringify(promise) === '{}'
+//   • template interpolation    → "[object Promise]" in a message or email
+//   • if / while / ternary test → always truthy, branch never varies
+//   • `!call()`                 → always false
+//   • ==, ===, <, >, …          → never equal, never ordered
+//   • left side of && / ||      → always truthy, right side never runs
+// Restricted to direct calls on purpose: `if (this.inflight)` on a stored
+// Promise VARIABLE is a legitimate existence check, `if (loadThing())` is not.
+const OFFENDING = new Map(); // position kind → why it is wrong
+const comparisonOps = new Set([
+  ts.SyntaxKind.EqualsEqualsToken,
+  ts.SyntaxKind.EqualsEqualsEqualsToken,
+  ts.SyntaxKind.ExclamationEqualsToken,
+  ts.SyntaxKind.ExclamationEqualsEqualsToken,
+  ts.SyntaxKind.LessThanToken,
+  ts.SyntaxKind.LessThanEqualsToken,
+  ts.SyntaxKind.GreaterThanToken,
+  ts.SyntaxKind.GreaterThanEqualsToken,
+]);
+
+/** How `call` is misused at its parent, or null when the position is fine. */
+function promiseValueMisuse(call) {
+  const p = call.parent;
+  if (ts.isPropertyAssignment(p) && p.initializer === call) {
+    return 'as an object-literal value (JSON.stringify serialises a Promise as {})';
+  }
+  if (ts.isTemplateSpan(p)) {
+    return 'inside a template literal (interpolates as "[object Promise]")';
+  }
+  if ((ts.isIfStatement(p) || ts.isWhileStatement(p) || ts.isDoStatement(p)) && p.expression === call) {
+    return 'as a condition (a Promise is always truthy)';
+  }
+  if (ts.isConditionalExpression(p) && p.condition === call) {
+    return 'as a condition (a Promise is always truthy)';
+  }
+  if (ts.isPrefixUnaryExpression(p) && p.operator === ts.SyntaxKind.ExclamationToken) {
+    return 'under `!` (a Promise is always truthy, so this is always false)';
+  }
+  if (ts.isBinaryExpression(p)) {
+    if (comparisonOps.has(p.operatorToken.kind)) {
+      return 'in a comparison (a Promise never equals or orders against a value)';
+    }
+    if (
+      (p.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken ||
+        p.operatorToken.kind === ts.SyntaxKind.BarBarToken) &&
+      p.left === call
+    ) {
+      return 'as the left side of && / || (a Promise is always truthy)';
+    }
+  }
+  return null;
+}
+
+let promiseValues = 0;
+for (const sf of program.getSourceFiles()) {
+  if (sf.isDeclarationFile || !sf.fileName.startsWith(SRC + path.sep)) continue;
+  const visit = (node) => {
+    if (ts.isCallExpression(node) && isPromise(node)) {
+      const why = promiseValueMisuse(node);
+      if (why) {
+        const { line } = sf.getLineAndCharacterOfPosition(node.getStart(sf));
+        fail(
+          `${path.relative(ROOT, sf.fileName)}:${line + 1} uses an un-awaited Promise ${why} — ` +
+            `\`${node.getText(sf).replace(/\s+/g, ' ').slice(0, 70)}\` (add await)`,
+        );
+        promiseValues++;
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  ts.forEachChild(sf, visit);
+}
+if (promiseValues === 0) ok('no Promise is used as a value (object literals, templates, conditions, comparisons)');
+
 // ── 3. the migrations are non-destructive ────────────────────────────────────
 // The standing fleet rule, enforced rather than reviewed: a generated migration
 // containing DROP is never approved.
