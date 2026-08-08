@@ -115,6 +115,13 @@ export async function renderJobHqZip(job: JobRow): Promise<RenderedZip | null> {
   const header = isMobile ? MOBILE_HQ_HEADER : WEB_HQ_HEADER;
   const shape = isMobile ? mobileHqRow : webHqRow;
 
+  // One timestamp for the whole artefact — the job's, not this moment's. It has
+  // to reach the workbooks as well as the outer archive: an .xlsx is a zip too,
+  // so a workbook built with `now` carries a different DOS stamp on every part
+  // inside it and changes the outer archive's bytes through its own CRC.
+  const stamp = job.completed_at ?? job.started_at ?? job.created_at;
+  const stampedAt = new Date(stamp);
+
   const zipEntries: ZipEntry[] = [];
   const perCountryCounts: Record<string, number> = {};
   // Sorted, so the zip's entry order is a property of the DATA rather than of
@@ -123,11 +130,13 @@ export async function renderJobHqZip(job: JobRow): Promise<RenderedZip | null> {
     const items = bucketed[country];
     const slug = countryToFilenameSlug(country);
     const sheetRows: (string | number | null)[][] = [header, ...items.map((it) => shape(it.result, it.hq))];
-    zipEntries.push({ path: `${slug}.xlsx`, data: buildXlsx({ name: slug.slice(0, 31), rows: sheetRows }) });
+    zipEntries.push({
+      path: `${slug}.xlsx`,
+      data: buildXlsx({ name: slug.slice(0, 31), rows: sheetRows }, stampedAt),
+    });
     perCountryCounts[country] = items.length;
   }
 
-  const stamp = job.completed_at ?? job.started_at ?? job.created_at;
   const manifestLines = [
     `HQ split manifest for job ${job.id}`,
     // The JOB's time, not this download's — see the determinism note above.
@@ -144,7 +153,12 @@ export async function renderJobHqZip(job: JobRow): Promise<RenderedZip | null> {
 
   return {
     filename: `${job.id}_by_hq.zip`,
-    body: buildZip(zipEntries),
+    // The JOB's timestamp, not this moment's: a zip entry carries a DOS
+    // date/time, so stamping it with `now` makes two downloads of the same
+    // completed job differ in bytes whenever they straddle a two-second
+    // boundary. Byte-identical downloads across a restart is a property this
+    // order claims, so it has to be a property of the data.
+    body: buildZip(zipEntries, stampedAt),
     perCountryCounts,
     unresolved,
   };

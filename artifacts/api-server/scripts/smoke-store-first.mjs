@@ -85,6 +85,44 @@ mkdirSync(path.join(SANDBOX, 'csv-output'), { recursive: true });
 process.chdir(SANDBOX); // MUST precede the dist imports
 
 const imp = (m) => import(pathToFileURL(path.join(DIST, m)).href);
+// ─────────────────────────────────────────────────────────────────────────────
+// NOT PORTED TO POSTGRESQL (order L-3.4g). READ THIS BEFORE RUNNING IT.
+//
+// This script belongs to the store-first SMOKE family, which is built on a
+// sandbox DIRECTORY: it set the working directory so that db.ts's
+// `path.resolve('data')` created a throwaway sqlite file, then ran a real
+// discovery pass against it.
+//
+// Both halves of that are gone. Storage is PostgreSQL behind DATABASE_URL and
+// there is no cwd-relative database to sandbox, so the sandbox concept has to
+// become "a throwaway DATABASE" (scripts/pgtest.mjs already builds one).
+//
+// It was deliberately NOT converted under L-3.4g, and the ledger says so:
+// every one of these scripts drives a live discovery run against Google Play,
+// the App Store and Ads Transparency, and that order's hard rules forbid
+// starting a real scraping or verification run — so a rewrite could not have
+// been executed even once before being committed. Shipping an unrunnable,
+// never-executed rewrite of an operator tool is worse than shipping an honest
+// refusal.
+//
+// TO PORT IT: give the sandbox its own database (startCluster() from
+// pgtest.mjs, or a named database on the dev instance), pass its URL down as
+// DATABASE_URL instead of chdir-ing, and replace the better-sqlite3 handle
+// below with a `pg` pool. The queries themselves are unchanged — the schema is
+// the same one, table for table.
+// ─────────────────────────────────────────────────────────────────────────────
+const PORTED = false;
+if (!PORTED) {
+  console.error(
+    'REFUSING TO RUN: this script still expects the pre-L-3.4g sqlite sandbox.\n' +
+      'Leadfinder now stores everything in PostgreSQL (DATABASE_URL) and no longer\n' +
+      'creates data/ad-library.sqlite, so this would build a sandbox nothing reads\n' +
+      'and then spend a real discovery run against it. See the note at the top of\n' +
+      'this file for what porting it involves.',
+  );
+  process.exit(2);
+}
+
 const { default: Database } = await import('better-sqlite3');
 
 const t0 = Date.now();

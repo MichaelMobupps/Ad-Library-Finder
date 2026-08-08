@@ -120,6 +120,25 @@ if (fastLane.status === 0) {
   failedModules.push('fast-lane');
 }
 
+// Durability gate: the claims order L-3.4g actually makes, proved across REAL
+// process boundaries — state survives a restart, the rescue seed is idempotent,
+// a download link answers byte-identically before and after a SIGKILL restart,
+// and the server refuses to boot without a database. Builds its own ephemeral
+// clusters; never starts the queue, so nothing scrapes and no mail is sent.
+const durability = spawnSync(process.execPath, [path.join(ROOT, 'scripts', 'check-durability.mjs')], {
+  cwd: ROOT,
+  encoding: 'utf8',
+});
+if (durability.status === 0) {
+  console.log('  ✓ durability (restart persistence, seed idempotency, stable downloads, boot refusal)');
+} else {
+  console.log('  ✗ DURABILITY PROOFS BROKEN');
+  for (const line of `${durability.stdout || ''}${durability.stderr || ''}`.trim().split('\n')) {
+    if (!/^\[\d{4}-/.test(line)) console.log(`      ${line}`);
+  }
+  failedModules.push('durability');
+}
+
 // Cross-package mirror gate: constants/validators duplicated into the dashboard
 // must behave identically to the server's copy. A unit suite cannot see across
 // the package boundary, so this runs as its own step.

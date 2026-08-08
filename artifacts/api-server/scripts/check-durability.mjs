@@ -145,6 +145,14 @@ if (phase) {
   }
 
   if (phase === 'read') {
+    // Re-run the seeder EXPLICITLY and report what it decided. Asserting only
+    // on row counts is not enough: with the idempotency guard removed the
+    // counts still hold, because the jobs PRIMARY KEY rejects the second insert
+    // and the seeder logs the failure. That is a broken seeder passing a green
+    // test, so the outcome itself is what gets asserted. (Found by mutation.)
+    const { seedRescuedChiefJobs } = await import(`${DIST}/rescueSeed.js`);
+    const seedOutcome = await seedRescuedChiefJobs();
+
     const job = await db.getJob(JOB_ID);
     const results = await db.getResults(JOB_ID);
     const mapping = await db.getDb()
@@ -166,6 +174,7 @@ if (phase) {
         seededLeads: Number(seededLeads.n),
         seededLo: seededLeads.lo == null ? null : Number(seededLeads.lo),
         seededHi: seededLeads.hi == null ? null : Number(seededLeads.hi),
+        seedOutcome,
       })}`,
     );
     await closeDatabase();
@@ -272,6 +281,19 @@ try {
     thirdOut.seededLo === 21 && thirdOut.seededHi === 40,
     `phase 2: lead ids are preserved as 21..40 — they ARE the Chief's lf_lead_id (got ${thirdOut.seededLo}..${thirdOut.seededHi})`,
   );
+  const so = thirdOut.seedOutcome ?? {};
+  check(
+    Array.isArray(so.seeded) && so.seeded.length === 0,
+    `phase 2: a later boot SEEDS NOTHING — it recognises the job, rather than failing on the primary key (seeded ${JSON.stringify(so.seeded)})`,
+  );
+  check(
+    Array.isArray(so.alreadyPresent) && so.alreadyPresent.includes('job_u5I0sjFlo_'),
+    `phase 2: it reports the rescued job as already present (${JSON.stringify(so.alreadyPresent)})`,
+  );
+  check(
+    Array.isArray(so.unrecoverable) && so.unrecoverable.includes('job_7nQAfTUr1v'),
+    `phase 2: the job the live seam had already lost is reported unrecoverable, not silently skipped (${JSON.stringify(so.unrecoverable)})`,
+  );
 
   const fresh = runPhase('freshid');
   const freshId = Number((fresh.stdout.match(/^FRESHID=(\d+)$/m) || [])[1]);
@@ -347,12 +369,16 @@ try {
   const zip2 = await get(after.port, ZIP_URL, cookie);
   check(csv2.status === 200, `phase 3: the CSV still downloads after the restart (got ${csv2.status})`);
   check(zip2.status === 200, `phase 3: the HQ bundle still downloads after the restart (got ${zip2.status})`);
+  // `=== 200` is part of the assertion, not decoration: two identical 404
+  // bodies also hash the same, so without it this passes for a download that
+  // is broken in both directions. (Found by mutating the route back to reading
+  // the filesystem — the byte-identity check went green on a pair of 404s.)
   check(
-    hash(csv1.body) === hash(csv2.body),
+    csv1.status === 200 && csv2.status === 200 && hash(csv1.body) === hash(csv2.body),
     `phase 3: the CSV is BYTE-IDENTICAL across the restart (${hash(csv1.body).slice(0, 12)} vs ${hash(csv2.body).slice(0, 12)})`,
   );
   check(
-    hash(zip1.body) === hash(zip2.body),
+    zip1.status === 200 && zip2.status === 200 && hash(zip1.body) === hash(zip2.body),
     `phase 3: the HQ bundle is BYTE-IDENTICAL across the restart (${hash(zip1.body).slice(0, 12)} vs ${hash(zip2.body).slice(0, 12)})`,
   );
   check(

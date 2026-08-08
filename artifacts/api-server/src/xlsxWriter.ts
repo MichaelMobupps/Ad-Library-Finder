@@ -83,7 +83,15 @@ function getOrAddString(table: SharedStringTable, value: string): number {
  * Build the xlsx archive for a single sheet. Returns a Buffer holding the
  * .xlsx file bytes (which is itself a zip).
  */
-export function buildXlsx(sheet: SheetData): Buffer {
+/**
+ * An .xlsx is itself a ZIP, so it carries DOS timestamps of its own on every
+ * part inside it. `modifiedAt` threads the caller's stamp down to them; without
+ * it a workbook rebuilt from unchanged data differs in bytes from one built two
+ * seconds earlier, and any byte-identity claim about a download containing it
+ * becomes intermittent rather than false — which is worse, because it passes
+ * most of the time. See download.ts.
+ */
+export function buildXlsx(sheet: SheetData, modifiedAt: Date = new Date()): Buffer {
   const sheetName = sanitizeSheetName(sheet.name);
   const table = newStringTable();
 
@@ -170,7 +178,7 @@ export function buildXlsx(sheet: SheetData): Buffer {
     { path: 'xl/sharedStrings.xml', data: sharedStringsXml },
   ];
 
-  return buildZip(entries);
+  return buildZip(entries, modifiedAt);
 }
 
 // ─────────────────────────────────────────────────────────────
