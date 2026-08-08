@@ -193,37 +193,29 @@ export function isChiefJob(job: Pick<JobRow, 'created_by_user_id'>): boolean {
   return isChiefPrincipal(job.created_by_user_id);
 }
 
-// ── Schema ───────────────────────────────────────────────────────────────────
+// ── The system principal ─────────────────────────────────────────────────────
 
 /**
- * The idempotency ledger and the principal row. Called from initDb().
+ * The principal row commanded jobs are owned by. Called from initDb().
  *
- * `external_id` is the PRIMARY KEY and SQLite compares TEXT keys with BINARY
- * collation, so " x" ≠ "x" ≠ "X": the uniqueness is over the exact bytes the
- * Chief sent, which is precisely the property "idempotency is not bypassable by
- * casing or whitespace tricks" asks for.
+ * The `chief_jobs` table itself is no longer created here — migrations.ts owns
+ * every table in this app since order L-3.4g. What is left is the one ROW that
+ * has to exist before a commanded job can reference it, and it is written on
+ * every boot because it is cheap and because a database restored from anywhere
+ * else must not leave the Chief unable to command anything.
  *
- * Deliberately a side table rather than a column on `jobs`: getJob(),
- * listJobsForUser() and listAllJobsWithUsers() all `SELECT *`, so a new column
- * would appear in the JSON of every human job response. This order changes
- * nothing a human can see.
+ * ON CONFLICT DO NOTHING with no conflict target, not `ON CONFLICT (id)`:
+ * users.email is UNIQUE too, and a boot must never die on a row that already
+ * exists under EITHER constraint.
  */
-export function ensureChiefSchema(): void {
-  const db = getDb();
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS chief_jobs (
-      external_id TEXT PRIMARY KEY,
-      job_id      TEXT NOT NULL UNIQUE,
-      created_at  INTEGER NOT NULL,
-      FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
-    );
-  `);
-  // INSERT OR IGNORE, not ON CONFLICT(id): users.email is UNIQUE too, and a
-  // boot must never die on a row that already exists under either constraint.
-  db.prepare(
-    `INSERT OR IGNORE INTO users (id, email, name, default_recipient, created_at)
-     VALUES (?, ?, ?, NULL, ?)`,
-  ).run(CHIEF_PRINCIPAL_ID, CHIEF_PRINCIPAL_EMAIL, CHIEF_PRINCIPAL_NAME, Date.now());
+export async function ensureChiefPrincipal(): Promise<void> {
+  await getDb()
+    .prepare(
+      `INSERT INTO users (id, email, name, default_recipient, created_at)
+       VALUES (?, ?, ?, NULL, ?)
+       ON CONFLICT DO NOTHING`,
+    )
+    .run(CHIEF_PRINCIPAL_ID, CHIEF_PRINCIPAL_EMAIL, CHIEF_PRINCIPAL_NAME, Date.now());
 }
 
 // ── What a commanded job may ask for ─────────────────────────────────────────
@@ -533,16 +525,16 @@ interface ChiefJobRow {
 }
 
 /** The job this external_id already names, or null. Exact bytes, no normalising. */
-export function jobIdForExternalId(externalId: string): string | null {
-  const row = getDb()
+export async function jobIdForExternalId(externalId: string): Promise<string | null>{
+  const row = await getDb()
     .prepare(`SELECT job_id FROM chief_jobs WHERE external_id = ?`)
     .get(externalId) as Pick<ChiefJobRow, 'job_id'> | undefined;
   return row?.job_id ?? null;
 }
 
 /** The idempotency key a commanded job was created under, or null for a human job. */
-export function externalIdForJob(jobId: string): string | null {
-  const row = getDb()
+export async function externalIdForJob(jobId: string): Promise<string | null>{
+  const row = await getDb()
     .prepare(`SELECT external_id FROM chief_jobs WHERE job_id = ?`)
     .get(jobId) as Pick<ChiefJobRow, 'external_id'> | undefined;
   return row?.external_id ?? null;
@@ -556,47 +548,62 @@ export function externalIdForJob(jobId: string): string | null {
  * one wins. The loser catches the constraint and returns the winner's job —
  * which is why the mapping row is written in the SAME transaction as the job.
  */
-export function createCommandedJob(v: ChiefCreateRequest): { job: JobRow; created: boolean } {
-  const existingId = jobIdForExternalId(v.external_id);
+export async function createCommandedJob(v: ChiefCreateRequest): Promise<{ job: JobRow; created: boolean; }>{
+  const existingId = await jobIdForExternalId(v.external_id);
   if (existingId) {
-    const existing = getJob(existingId);
+    const existing = await getJob(existingId);
     if (existing) return { job: existing, created: false };
     // The mapping outlived its job (nothing in this app deletes jobs, so this
     // is a torn-state guard rather than a path anyone takes). Drop the orphan
     // and create afresh rather than answering 404 forever.
-    getDb().prepare(`DELETE FROM chief_jobs WHERE external_id = ?`).run(v.external_id);
+    await getDb().prepare(`DELETE FROM chief_jobs WHERE external_id = ?`).run(v.external_id);
   }
 
-  const insert = getDb().transaction((req: ChiefCreateRequest) => {
-    const job = createJob({
-      id: `job_${nanoid(10)}`,
-      productType: req.target_type as ProductType,
-      countries: req.countries,
-      recipientEmail: null, // a commanded job has no recipient; see notifier.ts
-      createdByUserId: CHIEF_PRINCIPAL_ID,
-      source: req.stored_source,
-      sourceParams: commandedSourceParams(req),
-    });
-    getDb()
-      .prepare(`INSERT INTO chief_jobs (external_id, job_id, created_at) VALUES (?, ?, ?)`)
-      .run(req.external_id, job.id, Date.now());
-    return job;
-  });
-
   try {
-    return { job: insert(v), created: true };
+    // Both writes go through `t`, the transaction's OWN handle. That is not a
+    // stylistic detail: a statement issued through getDb() inside this callback
+    // would run on a different pooled connection and therefore OUTSIDE the
+    // transaction, which is exactly the atomicity this function's contract
+    // above promises. createJob/getJob take the handle for the same reason.
+    const job = await getDb().transaction(async (t) => {
+      const created = await createJob(
+        {
+          id: `job_${nanoid(10)}`,
+          productType: v.target_type as ProductType,
+          countries: v.countries,
+          recipientEmail: null, // a commanded job has no recipient; see notifier.ts
+          createdByUserId: CHIEF_PRINCIPAL_ID,
+          source: v.stored_source,
+          sourceParams: commandedSourceParams(v),
+        },
+        t,
+      );
+      await t
+        .prepare(`INSERT INTO chief_jobs (external_id, job_id, created_at) VALUES (?, ?, ?)`)
+        .run(v.external_id, created.id, Date.now());
+      return created;
+    });
+    return { job, created: true };
   } catch (err) {
     if (!isUniqueConstraintError(err)) throw err;
-    const winnerId = jobIdForExternalId(v.external_id);
-    const winner = winnerId ? getJob(winnerId) : null;
+    const winnerId = await jobIdForExternalId(v.external_id);
+    const winner = winnerId ? await getJob(winnerId) : null;
     if (!winner) throw err; // genuinely broken, not a race — do not invent a job
     return { job: winner, created: false };
   }
 }
 
+/**
+ * Did this fail because the idempotency key was already taken?
+ *
+ * PostgreSQL reports it as SQLSTATE 23505 (unique_violation) — one code for
+ * both a PRIMARY KEY and a UNIQUE collision, where SQLite had two. The two
+ * SQLITE_* codes are gone rather than kept "just in case": no code path in this
+ * app can produce them any more, and a stale alternative in a predicate like
+ * this one is how a real constraint error gets mistaken for a lost race.
+ */
 function isUniqueConstraintError(err: unknown): boolean {
-  const code = (err as { code?: string } | null)?.code ?? '';
-  return code === 'SQLITE_CONSTRAINT_PRIMARYKEY' || code === 'SQLITE_CONSTRAINT_UNIQUE';
+  return ((err as { code?: string } | null)?.code ?? '') === '23505';
 }
 
 /**
@@ -606,8 +613,8 @@ function isUniqueConstraintError(err: unknown): boolean {
  * same 404, same body — so the token cannot be used to probe whether a given id
  * belongs to somebody.
  */
-export function getChiefJob(jobId: string): JobRow | null {
-  const job = getJob(jobId);
+export async function getChiefJob(jobId: string): Promise<JobRow | null>{
+  const job = await getJob(jobId);
   if (!job) return null;
   if (!isChiefJob(job)) return null;
   return job;
@@ -838,8 +845,8 @@ export interface ChiefStatus {
  * alike. The Chief is asking about this app's load, and a run started from the
  * browser consumes exactly the same worker slot as a commanded one.
  */
-export function activeJobCount(): number {
-  const row = getDb()
+export async function activeJobCount(): Promise<number>{
+  const row = await getDb()
     .prepare(`SELECT COUNT(*) AS n FROM jobs WHERE status = 'running'`)
     .get() as { n: number };
   return row.n;
@@ -861,8 +868,8 @@ export function activeJobCount(): number {
  * open, never block a job on a query error) and the wrong one here, where a
  * failed read must surface as 503.
  */
-export function spendTodayUsd(jerusalemDay: string): number {
-  const row = getDb()
+export async function spendTodayUsd(jerusalemDay: string): Promise<number>{
+  const row = await getDb()
     .prepare(`SELECT COALESCE(SUM(usd), 0) AS total FROM llm_spend WHERE spend_day = ?`)
     .get(jerusalemDay) as { total: number };
   return row.total || 0;
@@ -884,8 +891,8 @@ export function spendTodayUsd(jerusalemDay: string): number {
  * because every commanded job is owned by ONE principal, the per-user rule runs
  * them one at a time. Accepted is not started.
  */
-export function acceptingJobs(): boolean {
-  getDb().prepare(`SELECT 1 FROM jobs LIMIT 1`).get();
+export async function acceptingJobs(): Promise<boolean>{
+  await getDb().prepare(`SELECT 1 FROM jobs LIMIT 1`).get();
   return true;
 }
 

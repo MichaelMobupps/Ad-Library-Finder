@@ -22,9 +22,9 @@ export interface HqCacheRow {
   created_at: number;
 }
 
-export function ensureHqCacheTable(): void {
+export async function ensureHqCacheTable(): Promise<void>{
   const db = getDb();
-  db.exec(`
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS hq_cache (
       store_url TEXT PRIMARY KEY,
       resolved_json TEXT NOT NULL,
@@ -33,9 +33,9 @@ export function ensureHqCacheTable(): void {
   `);
 }
 
-export function lookupHqCache(storeUrl: string): ResolvedHq | null {
+export async function lookupHqCache(storeUrl: string): Promise<ResolvedHq | null>{
   if (!storeUrl) return null;
-  const row = getDb()
+  const row = await getDb()
     .prepare(`SELECT resolved_json FROM hq_cache WHERE store_url = ?`)
     .get(storeUrl) as { resolved_json: string } | undefined;
   if (!row) return null;
@@ -47,10 +47,10 @@ export function lookupHqCache(storeUrl: string): ResolvedHq | null {
   }
 }
 
-export function storeHqCache(storeUrl: string, resolved: ResolvedHq): void {
+export async function storeHqCache(storeUrl: string, resolved: ResolvedHq): Promise<void>{
   if (!storeUrl) return;
   const now = Date.now();
-  getDb()
+  await getDb()
     .prepare(
       `INSERT INTO hq_cache (store_url, resolved_json, created_at) VALUES (?, ?, ?)
        ON CONFLICT(store_url) DO UPDATE SET resolved_json = excluded.resolved_json, created_at = excluded.created_at`
@@ -59,12 +59,12 @@ export function storeHqCache(storeUrl: string, resolved: ResolvedHq): void {
 }
 
 /** Count rows in cache — used by integration tests to verify cache hits. */
-export function countHqCache(): number {
-  const row = getDb().prepare(`SELECT COUNT(*) AS n FROM hq_cache`).get() as { n: number };
+export async function countHqCache(): Promise<number>{
+  const row = await getDb().prepare(`SELECT COUNT(*) AS n FROM hq_cache`).get() as { n: number };
   return row.n;
 }
 
 /** Test helper: delete a single entry (NOT exposed as a route). */
-export function deleteHqCacheEntry(storeUrl: string): void {
-  getDb().prepare(`DELETE FROM hq_cache WHERE store_url = ?`).run(storeUrl);
+export async function deleteHqCacheEntry(storeUrl: string): Promise<void>{
+  await getDb().prepare(`DELETE FROM hq_cache WHERE store_url = ?`).run(storeUrl);
 }

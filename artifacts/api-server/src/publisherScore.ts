@@ -116,15 +116,15 @@ function bestBandInstall(installs: number[]): number | null {
 
 /** Score every publisher and persist. Returns count scored. `now` defaults to the
  *  wall clock; callers may pass a fixed value in tests. */
-export function scoreAllPublishers(onLog?: LogFn, now: number = Date.now()): number {
-  const publishers = listPublishersByScore(1_000_000);
+export async function scoreAllPublishers(onLog?: LogFn, now: number = Date.now()): Promise<number>{
+  const publishers = await listPublishersByScore(1_000_000);
   // One pass for the whole table: signals are resolved per PUBLISHER (over its full
   // merged portfolio), so they cannot be derived from a publishers row alone.
-  const signals = allPublisherAppSignals();
+  const signals = await allPublisherAppSignals();
   let n = 0;
   for (const p of publishers) {
     const score = scorePublisher(toScoreInput(p, now, signals.get(p.id)));
-    setPublisherScore(p.id, score);
+    await setPublisherScore(p.id, score);
     n++;
   }
   onLog?.('info', `scoring: ${n} publishers scored`);

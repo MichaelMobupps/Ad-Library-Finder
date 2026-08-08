@@ -160,8 +160,8 @@ export async function exchangeCodeForTokensAndProfile(
   return { email, name, tokens };
 }
 
-export function persistGmailTokensForUser(userId: string, email: string, tokens: Credentials) {
-  upsertGmailTokens({
+export async function persistGmailTokensForUser(userId: string, email: string, tokens: Credentials) {
+  await upsertGmailTokens({
     userId,
     accessToken: tokens.access_token ?? null,
     refreshToken: tokens.refresh_token ?? null,
@@ -176,7 +176,7 @@ export function persistGmailTokensForUser(userId: string, email: string, tokens:
  * user has no Gmail connected (no refresh token).
  */
 export async function getAuthorizedClientForUser(userId: string): Promise<OAuth2Client> {
-  const row = getGmailTokensForUser(userId);
+  const row = await getGmailTokensForUser(userId);
   if (!row || !row.refresh_token) {
     throw new Error('Gmail not connected for this user');
   }
@@ -190,8 +190,8 @@ export async function getAuthorizedClientForUser(userId: string): Promise<OAuth2
   client.setCredentials(creds);
 
   // Persist any token refresh back to this user's row.
-  client.on('tokens', (newTokens: Credentials) => {
-    upsertGmailTokens({
+  client.on('tokens', async (newTokens: Credentials) => {
+    await upsertGmailTokens({
       userId,
       accessToken: newTokens.access_token ?? null,
       // refresh_token usually only present on first consent; preserve existing if absent

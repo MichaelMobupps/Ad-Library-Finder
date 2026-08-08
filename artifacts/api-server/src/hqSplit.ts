@@ -119,7 +119,7 @@ function rowFromResult(r: JobResultRow, hq: ResolvedHq | null): (string | number
  * zip path or null if there were no mobile results to split.
  */
 export async function runHqSplit(opts: SplitOptions): Promise<HqSplitOutcome> {
-  ensureHqCacheTable();
+  await ensureHqCacheTable();
 
   if (!existsSync(ZIP_DIR)) mkdirSync(ZIP_DIR, { recursive: true });
 
@@ -152,7 +152,7 @@ export async function runHqSplit(opts: SplitOptions): Promise<HqSplitOutcome> {
     const r = mobile[i];
     const storeUrl = r.store_url!;
 
-    let hq: ResolvedHq | null = lookupHqCache(storeUrl);
+    let hq: ResolvedHq | null = await lookupHqCache(storeUrl);
     if (hq) {
       outcome.cacheHits++;
       opts.onLog('debug', `hq-split: cache hit for ${storeUrl} → ${hq.primary_market || 'Unknown'}`);
@@ -174,7 +174,7 @@ export async function runHqSplit(opts: SplitOptions): Promise<HqSplitOutcome> {
       try {
         hq = await resolveHq(page);
         outcome.llmCalls++;
-        storeHqCache(storeUrl, hq);
+        await storeHqCache(storeUrl, hq);
         opts.onLog(
           'debug',
           `hq-split: resolved ${storeUrl} → company="${hq.company_name}" market="${hq.primary_market}" via ${hq.override_source}`

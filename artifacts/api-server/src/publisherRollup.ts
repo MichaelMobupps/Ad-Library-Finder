@@ -324,12 +324,12 @@ export function identityKeysFor(apps: StoreAppDetailRow[]): string[] {
  * arm cannot be a SQL equality anyway, since `a:` keys hold a mergeNameKey-normalized
  * seller name while store_app_detail stores the raw one.
  */
-export function allPublisherAppSignals(): Map<number, { installs: number[]; latestUpdate: number | null }> {
+export async function allPublisherAppSignals(): Promise<Map<number, { installs: number[]; latestUpdate: number | null; }>>{
   const owner = new Map<string, number>();
-  for (const row of allPublisherIdentities()) owner.set(row.identity_key, row.publisher_id);
+  for (const row of await allPublisherIdentities()) owner.set(row.identity_key, row.publisher_id);
 
   const out = new Map<number, { installs: number[]; latestUpdate: number | null }>();
-  for (const a of allDoneAppDetails()) {
+  for (const a of await allDoneAppDetails()) {
     // The identity key this app contributes — same construction as identityKeysFor.
     let key: string | null = null;
     if (a.store === 'google_play' && a.developer_id) {
@@ -360,9 +360,9 @@ export interface RollupResult {
   publisherIds: number[];
 }
 
-export function rollupPublishers(onLog?: LogFn): RollupResult {
-  const details = allDoneAppDetails();
-  const appAgg = buildAppAggregates(allDiscoveredLite());
+export async function rollupPublishers(onLog?: LogFn): Promise<RollupResult>{
+  const details = await allDoneAppDetails();
+  const appAgg = buildAppAggregates(await allDiscoveredLite());
 
   // 1. bucket apps by raw identity key.
   const rawGroups = new Map<string, StoreAppDetailRow[]>();
@@ -407,7 +407,7 @@ export function rollupPublishers(onLog?: LogFn): RollupResult {
 
   for (const [, apps] of merged) {
     const p = buildPublisherRow(apps, appAgg);
-    const id = upsertPublisher(p, identityKeysFor(apps));
+    const id = await upsertPublisher(p, identityKeysFor(apps));
     publisherIds.push(id);
     summary.publishers++;
     if (p.both_stores) summary.bothStores++;
@@ -433,7 +433,7 @@ export function rollupPublishers(onLog?: LogFn): RollupResult {
  * Exported for tests.
  */
 export function foldProvisionalPublishers(
-  raw: ReturnType<typeof rawPlayListDeveloperGroups>,
+  raw: Awaited<ReturnType<typeof rawPlayListDeveloperGroups>>,
 ): ProvisionalPublisher[] {
   const byKey = new Map<string, ProvisionalPublisher>();
   for (const r of raw) {
@@ -516,16 +516,16 @@ export function resetFastLaneCache(): void {
   lastFastLaneInputRows = -1;
 }
 
-export function rollupProvisionalPlayPublishers(onLog?: LogFn, limit = 20_000): { publishers: number; skipped: number } {
+export async function rollupProvisionalPlayPublishers(onLog?: LogFn, limit = 20_000): Promise<{ publishers: number; skipped: number; }>{
   // The background pump calls this every 15s. On a corpus the size of a real run
   // (8,000 apps / 2,000 developers) a full pass measured ~4s, so repeating it
   // when nothing new has been discovered would burn a quarter of every tick
   // competing with the scrape. One indexed COUNT settles it.
-  const inputRows = countPlayListIdentityRows();
+  const inputRows = await countPlayListIdentityRows();
   if (inputRows === lastFastLaneInputRows) return { publishers: 0, skipped: 0 };
   lastFastLaneInputRows = inputRows;
 
-  const groups = foldProvisionalPublishers(rawPlayListDeveloperGroups(limit));
+  const groups = foldProvisionalPublishers(await rawPlayListDeveloperGroups(limit));
   let touched = 0;
   let skipped = 0;
 
@@ -564,7 +564,7 @@ export function rollupProvisionalPlayPublishers(onLog?: LogFn, limit = 20_000): 
       preview_title: p.preview_title,
       score: 0, // scoring runs separately
     };
-    upsertPublisher(row, [`n:${p.name_key}`], { preserveEnriched: true });
+    await upsertPublisher(row, [`n:${p.name_key}`], { preserveEnriched: true });
     touched++;
   }
 

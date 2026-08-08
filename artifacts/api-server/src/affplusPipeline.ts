@@ -156,20 +156,20 @@ function platformsFor(offer: AffplusOffer, sourcePlatform: AffPlatform): Resolve
 
 export async function runAffplusJob(job: JobRow): Promise<void> {
   // markJobRunning sets phase='starting' / detail='launching browser'.
-  markJobRunning(job.id);
-  const onLog = (level: 'info' | 'warn' | 'error' | 'debug', msg: string) => {
-    appendLog(job.id, level, msg);
+  await markJobRunning(job.id);
+  const onLog = async (level: 'info' | 'warn' | 'error' | 'debug', msg: string) => {
+    await appendLog(job.id, level, msg);
     log.info(`[job ${job.id}] ${msg}`);
   };
 
-  onLog('info', `affplus job started: countries=${job.countries}`);
+  await onLog('info', `affplus job started: countries=${job.countries}`);
 
   try {
     // Resume-safety: a job deferred for the daily cap replays from the top.
     // Drop any rows it inserted on the prior run so the deliverable is not
     // duplicated. Runs before the cps/mobile branch, so it covers both paths.
     // No-op on a fresh job.
-    clearJobResults(job.id);
+    await clearJobResults(job.id);
 
     const countries: string[] = JSON.parse(job.countries);
 
@@ -194,16 +194,16 @@ export async function runAffplusJob(job: JobRow): Promise<void> {
 
     for (const country of countries) {
       for (const platform of platforms) {
-        throwIfCancelled(job.id);
+        await throwIfCancelled(job.id);
         listIdx++;
         // Overall progress: offer listing is 0..30 of the run.
-        setJobProgress(job.id, 30 * (listIdx / Math.max(1, totalLists)));
-        setJobPhase(
+        await setJobProgress(job.id, 30 * (listIdx / Math.max(1, totalLists)));
+        await setJobPhase(
           job.id,
           'scraping',
           `Affplus ${platform} / ${country} (${listIdx}/${totalLists})`
         );
-        onLog('info', `affplus: listing ${platform} / geo=${country}`);
+        await onLog('info', `affplus: listing ${platform} / geo=${country}`);
         const { offers, skippedCount, pagesFetched } = await listOffers({
           platform,
           geo: country,
@@ -220,14 +220,14 @@ export async function runAffplusJob(job: JobRow): Promise<void> {
           tagged.push({ offer, sourcePlatform: platform, country });
           added++;
         }
-        onLog('info', `affplus: ${platform}/${country} → ${offers.length} offers (${added} new), ${skippedCount} skipped by skip-list, ${pagesFetched} pages`);
+        await onLog('info', `affplus: ${platform}/${country} → ${offers.length} offers (${added} new), ${skippedCount} skipped by skip-list, ${pagesFetched} pages`);
       }
     }
 
-    onLog('info', `affplus: listing phase done — ${tagged.length} unique offers, ${totalSkipped} skipped, ${totalPages} total pages`);
+    await onLog('info', `affplus: listing phase done — ${tagged.length} unique offers, ${totalSkipped} skipped, ${totalPages} total pages`);
 
     // 4. Resolve + verify each offer; emit ONE row per offer (best candidate).
-    setJobPhase(job.id, 'classifying', `verifying 0/${tagged.length} offers against stores`);
+    await setJobPhase(job.id, 'classifying', `verifying 0/${tagged.length} offers against stores`);
 
     let resolvedCount = 0;
     let droppedCount = 0;
@@ -239,7 +239,7 @@ export async function runAffplusJob(job: JobRow): Promise<void> {
 
     let processed = 0;
     for (const { offer, sourcePlatform, country } of tagged) {
-      throwIfCancelled(job.id);
+      await throwIfCancelled(job.id);
       processed++;
       const cleaned = cleanOfferName(offer.name);
       if (!cleaned) {
@@ -358,7 +358,7 @@ export async function runAffplusJob(job: JobRow): Promise<void> {
         ? ` · alt_${alt.platform === 'android' ? 'play' : 'itunes'}: ${alt.resolved.storeUrl}`
         : '';
 
-      insertResult({
+      await insertResult({
         job_id: job.id,
         advertiser_name: offer.name,
         page_url: `https://www.affplus.com/o/${offer.slug}`,
@@ -369,44 +369,44 @@ export async function runAffplusJob(job: JobRow): Promise<void> {
         country: offer.geo || country,
       });
       resolvedCount++;
-      setJobLeadsFound(job.id, resolvedCount); // live counter
+      await setJobLeadsFound(job.id, resolvedCount); // live counter
 
       if (processed % 5 === 0 || processed === tagged.length) {
-        setJobPhase(
+        await setJobPhase(
           job.id,
           'classifying',
           `verifying ${processed}/${tagged.length} offers (${resolvedCount} matched)`
         );
         // Overall progress: store verification is 30..88 of the run.
-        setJobProgress(job.id, 30 + 58 * (processed / Math.max(1, tagged.length)));
+        await setJobProgress(job.id, 30 + 58 * (processed / Math.max(1, tagged.length)));
       }
 
       if (processed % 10 === 0) {
-        onLog(
+        await onLog(
           'info',
           `affplus: resolved ${resolvedCount}, dropped ${droppedCount} (processed ${processed}/${tagged.length})`
         );
       }
     }
 
-    onLog(
+    await onLog(
       'info',
       `affplus: resolve phase done — ${resolvedCount} verified rows, ${droppedCount} dropped (low-score ${lowScoreSkipped}, dating-name ${datingNameSkipped}, store-url dup ${storeUrlDupSkipped})`
     );
     if (droppedSamples.length > 0) {
-      onLog('info', 'affplus: dropped samples:');
+      await onLog('info', 'affplus: dropped samples:');
       for (const d of droppedSamples) {
-        onLog('info', `  - "${d.name}" → cleaned "${d.cleaned}" (${d.platform}): ${d.reason}`);
+        await onLog('info', `  - "${d.name}" → cleaned "${d.cleaned}" (${d.platform}): ${d.reason}`);
       }
     }
-    onLog('info', `affplus: skip-list filtered ${totalSkipped} adult/dating/cam/nutra/sweep offers`);
+    await onLog('info', `affplus: skip-list filtered ${totalSkipped} adult/dating/cam/nutra/sweep offers`);
 
-    setJobPhase(job.id, 'building_csv', `writing CSV (${resolvedCount} verified rows)`);
+    await setJobPhase(job.id, 'building_csv', `writing CSV (${resolvedCount} verified rows)`);
 
     // 5. Build CSV using existing mobile schema (header is now "store_url").
     // Operator-chosen lead cap (20/50/100/all) applies to the CSV and the HQ
     // split alike, so the Excel never disagrees with the CSV.
-    const allResults = getResults(job.id);
+    const allResults = await getResults(job.id);
     const affMaxLeads = normalizeMaxLeads(
       job.source_params ? (JSON.parse(job.source_params) as Record<string, unknown>).maxLeads : null,
     );
@@ -416,11 +416,11 @@ export async function runAffplusJob(job: JobRow): Promise<void> {
       results: allResults,
       maxRows: affMaxLeads,
     });
-    onLog('info', `affplus: CSV written: ${csvPath} (${rowsWritten} rows)`);
+    await onLog('info', `affplus: CSV written: ${csvPath} (${rowsWritten} rows)`);
 
     // 6. HQ split. Mobile-only, non-fatal on failure.
     if (job.product_type === 'mobile') {
-      setJobPhase(job.id, 'hq_splitting', `resolving HQ for ${rowsWritten} apps`);
+      await setJobPhase(job.id, 'hq_splitting', `resolving HQ for ${rowsWritten} apps`);
       try {
         const outcome = await runHqSplit({
           jobId: job.id,
@@ -428,27 +428,27 @@ export async function runAffplusJob(job: JobRow): Promise<void> {
           onLog,
         });
         if (outcome.zipPath) {
-          setJobHqZipPath(job.id, outcome.zipPath);
+          await setJobHqZipPath(job.id, outcome.zipPath);
           const summary = Object.entries(outcome.perCountryCounts)
             .sort(([, a], [, b]) => b - a)
             .map(([c, n]) => `${c}=${n}`)
             .join(', ');
-          onLog('info', `affplus hq-split: zip ready (${summary})`);
+          await onLog('info', `affplus hq-split: zip ready (${summary})`);
         }
         if (outcome.playBlocked) {
-          onLog('warn', `affplus hq-split: Play page-fetch was blocked/rate-limited — Android resolution may be degraded`);
+          await onLog('warn', `affplus hq-split: Play page-fetch was blocked/rate-limited — Android resolution may be degraded`);
         }
       } catch (err) {
         if (err instanceof BudgetExceededError) throw err;
-        onLog('warn', `affplus hq-split failed (non-fatal): ${(err as Error).message}`);
+        await onLog('warn', `affplus hq-split failed (non-fatal): ${(err as Error).message}`);
       }
     }
 
     // markJobCompleted sets phase='done'.
-    markJobCompleted(job.id, csvPath, { ads: tagged.length, advertisers: rowsWritten });
-    onLog('info', `affplus job completed`);
+    await markJobCompleted(job.id, csvPath, { ads: tagged.length, advertisers: rowsWritten });
+    await onLog('info', `affplus job completed`);
 
-    const fresh = getJob(job.id);
+    const fresh = await getJob(job.id);
     if (fresh) {
       void notifyJobCompleted(fresh)
         .then(() => onLog('info', 'notification dispatched'))
@@ -462,27 +462,27 @@ export async function runAffplusJob(job: JobRow): Promise<void> {
         const cap = normalizeMaxLeads(
           job.source_params ? (JSON.parse(job.source_params) as Record<string, unknown>).maxLeads : null,
         );
-        const partial = buildCsv({ jobId: job.id, productType: job.product_type, results: getResults(job.id), maxRows: cap });
+        const partial = buildCsv({ jobId: job.id, productType: job.product_type, results: await getResults(job.id), maxRows: cap });
         csvPath = partial.path;
         kept = partial.rowsWritten;
       } catch { /* best-effort */ }
-      markJobCancelled(job.id, `stopped by user — ${kept} lead(s) kept`, csvPath);
-      onLog('warn', `affplus job stopped by user — ${kept} partial lead(s) exported`);
+      await markJobCancelled(job.id, `stopped by user — ${kept} lead(s) kept`, csvPath);
+      await onLog('warn', `affplus job stopped by user — ${kept} partial lead(s) exported`);
       return;
     }
     if (err instanceof BudgetExceededError) {
       const runAfter = nextJerusalemMidnightMs();
       const when = new Date(runAfter).toISOString();
-      deferJob(job.id, runAfter, `LLM daily cap ($${DAILY_CAP_USD}) reached; resumes after ${when}`);
-      onLog('warn', `affplus job deferred: LLM daily cap reached; resumes after ${when} (Jerusalem midnight)`);
+      await deferJob(job.id, runAfter, `LLM daily cap ($${DAILY_CAP_USD}) reached; resumes after ${when}`);
+      await onLog('warn', `affplus job deferred: LLM daily cap reached; resumes after ${when} (Jerusalem midnight)`);
       return;
     }
     const msg = (err as Error).message || 'unknown error';
     log.error(`affplus job ${job.id} failed`, err);
-    onLog('error', `affplus job failed: ${msg}`);
-    markJobFailed(job.id, msg);
+    await onLog('error', `affplus job failed: ${msg}`);
+    await markJobFailed(job.id, msg);
 
-    const fresh = getJob(job.id);
+    const fresh = await getJob(job.id);
     if (fresh) {
       void notifyJobFailed(fresh).catch((e) => onLog('warn', `failure notification error: ${(e as Error).message}`));
     }
@@ -511,11 +511,11 @@ async function runAffplusWebJob(job: JobRow, countries: string[], onLog: WebLogF
   let idx = 0;
 
   for (const country of countries) {
-    throwIfCancelled(job.id);
+    await throwIfCancelled(job.id);
     idx++;
-    setJobPhase(job.id, 'scraping', `Affplus Web / ${country} (${idx}/${countries.length})`);
+    await setJobPhase(job.id, 'scraping', `Affplus Web / ${country} (${idx}/${countries.length})`);
     // Overall progress: web listing is 0..30 of the run.
-    setJobProgress(job.id, 30 * (idx / Math.max(1, countries.length)));
+    await setJobProgress(job.id, 30 * (idx / Math.max(1, countries.length)));
     onLog('info', `affplus-web: listing Desktop / geo=${country}`);
     const { offers, pagesFetched } = await listOffers({
       platform: 'Web',
@@ -548,7 +548,7 @@ async function runAffplusWebJob(job: JobRow, countries: string[], onLog: WebLogF
   // 2. Cheap free gates first (vertical + scam on name/verticals), then resolve
   //    survivors to a real advertiser destination. The paid name search inside
   //    the resolver is capped per-job by this shared budget.
-  setJobPhase(job.id, 'classifying', `resolving 0/${tagged.length} web offers`);
+  await setJobPhase(job.id, 'classifying', `resolving 0/${tagged.length} web offers`);
   const budget = makeSearchBudget(WEB_MAX_SEARCHES);
 
   let resolved = 0;
@@ -561,7 +561,7 @@ async function runAffplusWebJob(job: JobRow, countries: string[], onLog: WebLogF
   let processed = 0;
 
   for (const { offer, country } of tagged) {
-    throwIfCancelled(job.id);
+    await throwIfCancelled(job.id);
     processed++;
     const advertiserName = normalizeWebOffer(offer.name).name;
 
@@ -594,7 +594,7 @@ async function runAffplusWebJob(job: JobRow, countries: string[], onLog: WebLogF
       insertedHosts.add(dest.finalHost);
       if (dest.brandMismatch) brandTagged++;
       const mismatchNote = dest.brandMismatch ? ' · brand-mismatch: verify advertiser' : '';
-      insertResult({
+      await insertResult({
         job_id: job.id,
         advertiser_name: advertiserName,
         page_url: `https://www.affplus.com/o/${offer.slug}`,
@@ -605,13 +605,13 @@ async function runAffplusWebJob(job: JobRow, countries: string[], onLog: WebLogF
         country: offer.geo || country,
       });
       resolved++;
-      setJobLeadsFound(job.id, resolved); // live counter
+      await setJobLeadsFound(job.id, resolved); // live counter
     }
 
     if (processed % 5 === 0 || processed === tagged.length) {
-      setJobPhase(job.id, 'classifying', `resolving ${processed}/${tagged.length} web offers (${resolved} kept)`);
+      await setJobPhase(job.id, 'classifying', `resolving ${processed}/${tagged.length} web offers (${resolved} kept)`);
       // Overall progress: web resolution is 30..88 of the run.
-      setJobProgress(job.id, 30 + 58 * (processed / Math.max(1, tagged.length)));
+      await setJobProgress(job.id, 30 + 58 * (processed / Math.max(1, tagged.length)));
     }
     if (processed % 10 === 0) {
       onLog(
@@ -635,8 +635,8 @@ async function runAffplusWebJob(job: JobRow, countries: string[], onLog: WebLogF
   }
 
   // 3. CSV using the existing CPS schema: advertiser_name,country,website_url,ad_text.
-  setJobPhase(job.id, 'building_csv', `writing CPS CSV (${resolved} rows)`);
-  const allResults = getResults(job.id);
+  await setJobPhase(job.id, 'building_csv', `writing CPS CSV (${resolved} rows)`);
+  const allResults = await getResults(job.id);
   const { path: csvPath, rowsWritten } = buildCsv({
     jobId: job.id,
     productType: job.product_type,
@@ -651,10 +651,10 @@ async function runAffplusWebJob(job: JobRow, countries: string[], onLog: WebLogF
   }
 
   // No HQ-split for web/CPS (mobile-only feature).
-  markJobCompleted(job.id, csvPath, { ads: tagged.length, advertisers: rowsWritten });
+  await markJobCompleted(job.id, csvPath, { ads: tagged.length, advertisers: rowsWritten });
   onLog('info', `affplus web/CPS job completed`);
 
-  const fresh = getJob(job.id);
+  const fresh = await getJob(job.id);
   if (fresh) {
     void notifyJobCompleted(fresh)
       .then(() => onLog('info', 'notification dispatched'))

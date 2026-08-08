@@ -218,8 +218,8 @@ export function buildPublisherCsv(
  * Domains and names are normalized with the SAME helpers the publisher rollup
  * uses, so "Acme, Inc." in history matches "Acme Inc" here.
  */
-export function leadHistorySeed(): DedupeSeed {
-  const { names, urls } = existingLeadIdentities();
+export async function leadHistorySeed(): Promise<DedupeSeed>{
+  const { names, urls } = await existingLeadIdentities();
   const domains = new Set<string>();
   for (const u of urls) {
     const d = registrableDomain(u);
@@ -242,10 +242,10 @@ export function leadHistorySeed(): DedupeSeed {
  * pipeline writes to. Without this, store-first leads were invisible to the rest
  * of the app AND could never be de-duplicated against on a later run.
  */
-export function persistPublisherLeads(jobId: string, rows: PublisherRow[]): number {
+export async function persistPublisherLeads(jobId: string, rows: PublisherRow[]): Promise<number>{
   let n = 0;
   for (const r of rows) {
-    insertResult({
+    await insertResult({
       job_id: jobId,
       advertiser_name: r.name,
       page_url: r.website,

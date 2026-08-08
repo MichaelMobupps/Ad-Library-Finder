@@ -7,13 +7,13 @@ import { getDb, getGmailTokensForUser, getUserById, setUserDefaultRecipient } fr
  * helpers below operate on the per-user model.
  */
 
-export function getSetting(key: string): string | null {
-  const row = getDb().prepare(`SELECT value FROM settings WHERE key = ?`).get(key) as { value: string } | undefined;
+export async function getSetting(key: string): Promise<string | null>{
+  const row = await getDb().prepare(`SELECT value FROM settings WHERE key = ?`).get(key) as { value: string } | undefined;
   return row?.value ?? null;
 }
 
-export function setSetting(key: string, value: string) {
-  getDb()
+export async function setSetting(key: string, value: string) {
+  await getDb()
     .prepare(
       `INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)
        ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`
@@ -21,14 +21,14 @@ export function setSetting(key: string, value: string) {
     .run(key, value, Date.now());
 }
 
-export function deleteSetting(key: string) {
-  getDb().prepare(`DELETE FROM settings WHERE key = ?`).run(key);
+export async function deleteSetting(key: string) {
+  await getDb().prepare(`DELETE FROM settings WHERE key = ?`).run(key);
 }
 
 // ---------- per-user accessors ----------
 
-export function getDefaultRecipientForUser(userId: string): string | null {
-  const user = getUserById(userId);
+export async function getDefaultRecipientForUser(userId: string): Promise<string | null>{
+  const user = await getUserById(userId);
   // Zero-config default: if the user has not set an explicit default recipient,
   // fall back to the email they sign in with. Every user therefore receives
   // job-completion emails at their own address with no setup. An explicit
@@ -37,15 +37,15 @@ export function getDefaultRecipientForUser(userId: string): string | null {
   return user?.default_recipient || user?.email || null;
 }
 
-export function setDefaultRecipientForUser(userId: string, recipient: string | null) {
-  setUserDefaultRecipient(userId, recipient);
+export async function setDefaultRecipientForUser(userId: string, recipient: string | null) {
+  await setUserDefaultRecipient(userId, recipient);
 }
 
-export function getConnectedGmailEmailForUser(userId: string): string | null {
-  return getGmailTokensForUser(userId)?.gmail_email ?? null;
+export async function getConnectedGmailEmailForUser(userId: string): Promise<string | null>{
+  return await (await getGmailTokensForUser(userId))?.gmail_email ?? null;
 }
 
-export function isGmailConnectedForUser(userId: string): boolean {
-  const t = getGmailTokensForUser(userId);
+export async function isGmailConnectedForUser(userId: string): Promise<boolean>{
+  const t = await getGmailTokensForUser(userId);
   return !!(t && t.refresh_token);
 }

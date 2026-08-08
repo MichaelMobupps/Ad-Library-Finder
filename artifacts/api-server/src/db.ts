@@ -1,9 +1,24 @@
-import Database from 'better-sqlite3';
-import { existsSync, mkdirSync } from 'node:fs';
+/**
+ * Job / user / result storage.
+ *
+ * The ENGINE changed in order L-3.4g and nothing else about this module's
+ * contract did: same tables, same column names, same row shapes, same helper
+ * names. What moved is where the bytes live — from a `better-sqlite3` file on
+ * the deployment disk (wiped by every publish) to the platform-provisioned
+ * PostgreSQL behind `DATABASE_URL`.
+ *
+ * Every helper here is now `async`, because a network database cannot be read
+ * synchronously. `getDb()` still hands back something with `.prepare(sql)` on
+ * it, so the SQL each call site wrote is the SQL it still runs; see sql.ts for
+ * why that shape was kept and what it does NOT do.
+ */
 import { randomBytes } from 'node:crypto';
-import path from 'node:path';
-import { ensureStoreDiscoveryTables } from './storeDiscoveryDb.js';
-import { ensureChiefSchema } from './chief.js';
+import { runStoreDiscoveryBootRepairs } from './storeDiscoveryDb.js';
+import { ensureChiefPrincipal } from './chief.js';
+import { seedRescuedChiefJobs } from './rescueSeed.js';
+import { openDatabase, sql, type Db, type SqlHandle } from './sql.js';
+import { applyMigrations } from './migrations.js';
+import { log } from './logger.js';
 
 export type ProductType = 'mobile' | 'cps';
 export type JobStatus = 'pending' | 'running' | 'completed' | 'failed' | 'deferred' | 'cancelled';
@@ -123,213 +138,83 @@ export interface GmailTokenRow {
   updated_at: number;
 }
 
-const DATA_DIR = path.resolve('data');
-const DB_PATH = path.join(DATA_DIR, 'ad-library.sqlite');
-
-let db: Database.Database;
-
+/**
+ * Open the database, bring the schema up to date, and settle whatever the last
+ * process left behind. Throws — loudly, with no fallback — if `DATABASE_URL` is
+ * unset or the backend cannot be reached.
+ */
 export async function initDb() {
-  if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+  const backend = await openDatabase();
 
-  db = new Database(DB_PATH);
-  db.pragma('journal_mode = WAL');
-  db.pragma('foreign_keys = ON');
+  const migrations = await applyMigrations(sql(), { adopt: process.env.LEADFINDER_DB_ADOPT === '1' });
+  const state =
+    migrations.applied.length > 0
+      ? `applied ${migrations.applied.join(', ')}`
+      : migrations.adopted.length > 0
+        ? `ADOPTED ${migrations.adopted.join(', ')}`
+        : 'already current';
+  // The one boot line that names the backend. `describeBackend` (sql.ts) yields
+  // host:port/database and nothing else — no user, no password, no raw URL.
+  log.info(`db: postgres ${backend} — migrations ${state} (schema ${migrations.current.join(', ')})`);
 
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS jobs (
-      id TEXT PRIMARY KEY,
-      product_type TEXT NOT NULL,
-      countries TEXT NOT NULL,
-      status TEXT NOT NULL,
-      csv_path TEXT,
-      error TEXT,
-      created_at INTEGER NOT NULL,
-      started_at INTEGER,
-      completed_at INTEGER,
-      total_ads_scraped INTEGER NOT NULL DEFAULT 0,
-      total_advertisers INTEGER NOT NULL DEFAULT 0
-    );
+  // The Chief's system principal, and the one-off repair of legacy
+  // discovery_depth rows. Both idempotent; both used to live inside the
+  // "ensure the tables exist" helpers, which migrations.ts now owns instead.
+  await ensureChiefPrincipal();
+  await runStoreDiscoveryBootRepairs();
 
-    CREATE TABLE IF NOT EXISTS job_logs (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      job_id TEXT NOT NULL,
-      level TEXT NOT NULL,
-      message TEXT NOT NULL,
-      ts INTEGER NOT NULL,
-      FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_job_logs_job ON job_logs(job_id, ts);
-
-    CREATE TABLE IF NOT EXISTS job_results (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      job_id TEXT NOT NULL,
-      advertiser_name TEXT NOT NULL,
-      page_url TEXT,
-      landing_url TEXT,
-      classification TEXT,
-      store_url TEXT,
-      ad_text TEXT,
-      country TEXT NOT NULL,
-      created_at INTEGER NOT NULL,
-      FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_job_results_job ON job_results(job_id);
-    CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
-
-    CREATE TABLE IF NOT EXISTS settings (
-      key TEXT PRIMARY KEY,
-      value TEXT NOT NULL,
-      updated_at INTEGER NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS users (
-      id TEXT PRIMARY KEY,
-      email TEXT NOT NULL UNIQUE,
-      name TEXT,
-      default_recipient TEXT,
-      created_at INTEGER NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS sessions (
-      token TEXT PRIMARY KEY,
-      user_id TEXT NOT NULL,
-      created_at INTEGER NOT NULL,
-      expires_at INTEGER NOT NULL,
-      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-    );
-
-    CREATE TABLE IF NOT EXISTS gmail_tokens (
-      user_id TEXT PRIMARY KEY,
-      access_token TEXT,
-      refresh_token TEXT,
-      expires_at INTEGER,
-      gmail_email TEXT,
-      updated_at INTEGER NOT NULL,
-      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-    );
-
-    CREATE TABLE IF NOT EXISTS llm_spend (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      ts INTEGER NOT NULL,
-      spend_day TEXT NOT NULL,        -- Asia/Jerusalem calendar day 'YYYY-MM-DD'
-      source TEXT NOT NULL,           -- which call site spent (classifier | hq-resolver | web-resolver)
-      model TEXT NOT NULL,
-      input_tokens INTEGER NOT NULL DEFAULT 0,
-      output_tokens INTEGER NOT NULL DEFAULT 0,
-      cache_write_tokens INTEGER NOT NULL DEFAULT 0,
-      cache_read_tokens INTEGER NOT NULL DEFAULT 0,
-      web_searches INTEGER NOT NULL DEFAULT 0,
-      usd REAL NOT NULL
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_llm_spend_day ON llm_spend(spend_day);
-  `);
-
-  // Idempotent additive migrations on jobs
-  const jobCols = db.prepare(`PRAGMA table_info(jobs)`).all() as Array<{ name: string }>;
-  const colNames = new Set(jobCols.map((c) => c.name));
-  if (!colNames.has('recipient_email')) {
-    db.exec(`ALTER TABLE jobs ADD COLUMN recipient_email TEXT`);
-  }
-  if (!colNames.has('notification_status')) {
-    db.exec(`ALTER TABLE jobs ADD COLUMN notification_status TEXT`);
-  }
-  if (!colNames.has('created_by_user_id')) {
-    db.exec(`ALTER TABLE jobs ADD COLUMN created_by_user_id TEXT`);
-  }
-  if (!colNames.has('source')) {
-    db.exec(`ALTER TABLE jobs ADD COLUMN source TEXT NOT NULL DEFAULT 'meta'`);
-  }
-  if (!colNames.has('source_params')) {
-    db.exec(`ALTER TABLE jobs ADD COLUMN source_params TEXT`);
-  }
-  if (!colNames.has('phase')) {
-    db.exec(`ALTER TABLE jobs ADD COLUMN phase TEXT`);
-  }
-  if (!colNames.has('phase_detail')) {
-    db.exec(`ALTER TABLE jobs ADD COLUMN phase_detail TEXT`);
-  }
-  if (!colNames.has('phase_updated_at')) {
-    db.exec(`ALTER TABLE jobs ADD COLUMN phase_updated_at INTEGER`);
-  }
-  if (!colNames.has('hq_zip_path')) {
-    db.exec(`ALTER TABLE jobs ADD COLUMN hq_zip_path TEXT`);
-  }
-  if (!colNames.has('run_after')) {
-    db.exec(`ALTER TABLE jobs ADD COLUMN run_after INTEGER`);
-  }
-  if (!colNames.has('cancel_requested')) {
-    db.exec(`ALTER TABLE jobs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0`);
-  }
-  if (!colNames.has('leads_found')) {
-    db.exec(`ALTER TABLE jobs ADD COLUMN leads_found INTEGER NOT NULL DEFAULT 0`);
-    // Backfill finished jobs so old rows don't show 0 leads next to a non-zero total.
-    db.exec(`UPDATE jobs SET leads_found = total_advertisers WHERE total_advertisers > 0`);
-  }
-  if (!colNames.has('progress_pct')) {
-    db.exec(`ALTER TABLE jobs ADD COLUMN progress_pct REAL NOT NULL DEFAULT 0`);
-    db.exec(`UPDATE jobs SET progress_pct = 100 WHERE status = 'completed'`);
-  }
-
-  // Idempotent additive migrations on job_results: app-category enrichment
-  // (game vs non-game) for GATC mobile leads. Nullable, so every other pipeline
-  // (Meta / Affplus / AppGoblin) is unaffected — the columns simply stay NULL.
-  const resultCols = db.prepare(`PRAGMA table_info(job_results)`).all() as Array<{ name: string }>;
-  const resultColNames = new Set(resultCols.map((c) => c.name));
-  if (!resultColNames.has('app_category')) {
-    db.exec(`ALTER TABLE job_results ADD COLUMN app_category TEXT`);
-  }
-  if (!resultColNames.has('is_game')) {
-    db.exec(`ALTER TABLE job_results ADD COLUMN is_game INTEGER`); // 1=game, 0=non-game, NULL=unknown
-  }
-
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_jobs_user ON jobs(created_by_user_id)`);
-
-  // Store-first discovery tables (discovered_apps, store_app_detail, publishers).
-  // Created here so they exist before the queue or the /publishers route runs.
-  ensureStoreDiscoveryTables();
-
-  // The Chief's idempotency ledger and its system principal (order L-3.3a).
-  // A side table plus one users row — no column is added to `jobs`, so every
-  // human job response keeps the exact JSON shape it has always had.
-  ensureChiefSchema();
+  // The two chief jobs rescued from the live seam before this migration, so
+  // `lf_job_id` / `lf_lead_id` still resolve for the Chief. Idempotent.
+  await seedRescuedChiefJobs();
 
   // Garbage-collect expired sessions on startup
-  db.prepare(`DELETE FROM sessions WHERE expires_at < ?`).run(Date.now());
+  await getDb().prepare(`DELETE FROM sessions WHERE expires_at < ?`).run(Date.now());
 
   // On startup, settle jobs that were 'running' when the process died. A job
   // whose user had ALREADY pressed Stop resolves to 'cancelled' (that is what
   // the pipeline would have done had it lived to poll the flag); the rest are
   // failures. Order matters: the cancelled sweep must run first or the failed
   // sweep would claim its rows.
-  db.prepare(
-    `UPDATE jobs SET status='cancelled', phase='cancelled', phase_detail='stopped by user (server restarted before finalize)', completed_at=? WHERE status='running' AND cancel_requested=1`
-  ).run(Date.now());
-  db.prepare(
-    `UPDATE jobs SET status='failed', phase='failed', error='process restarted mid-job', completed_at=? WHERE status='running'`
-  ).run(Date.now());
+  await getDb()
+    .prepare(
+      `UPDATE jobs SET status='cancelled', phase='cancelled', phase_detail='stopped by user (server restarted before finalize)', completed_at=? WHERE status='running' AND cancel_requested=1`
+    )
+    .run(Date.now());
+  await getDb()
+    .prepare(
+      `UPDATE jobs SET status='failed', phase='failed', error='process restarted mid-job', completed_at=? WHERE status='running'`
+    )
+    .run(Date.now());
 }
 
-export function getDb(): Database.Database {
-  if (!db) throw new Error('DB not initialized');
-  return db;
+export function getDb(): Db {
+  return sql();
 }
 
 // ---------- Job helpers ----------
 
-export function createJob(input: {
-  id: string;
-  productType: ProductType;
-  countries: string[];
-  recipientEmail?: string | null;
-  createdByUserId: string;
-  source?: JobSource;
-  sourceParams?: Record<string, unknown> | null;
-}): JobRow {
+export async function createJob(
+  input: {
+    id: string;
+    productType: ProductType;
+    countries: string[];
+    recipientEmail?: string | null;
+    createdByUserId: string;
+    source?: JobSource;
+    sourceParams?: Record<string, unknown> | null;
+  },
+  /**
+   * Optional transaction handle. A caller that must write this job and
+   * something else atomically (chief.ts pairs it with its idempotency-ledger
+   * row) passes the handle its transaction gave it; a statement issued through
+   * getDb() instead would run on a different pooled connection and land outside
+   * that transaction. Defaults to the pool, which is what every other caller
+   * wants.
+   */
+  h: SqlHandle = getDb(),
+): Promise<JobRow> {
   const now = Date.now();
-  getDb()
+  await h
     .prepare(
       `INSERT INTO jobs (id, product_type, countries, status, created_at, total_ads_scraped, total_advertisers, recipient_email, created_by_user_id, source, source_params, phase, phase_detail, phase_updated_at)
        VALUES (?, ?, ?, 'pending', ?, 0, 0, ?, ?, ?, ?, 'queued', 'waiting for worker', ?)`
@@ -345,28 +230,28 @@ export function createJob(input: {
       input.sourceParams ? JSON.stringify(input.sourceParams) : null,
       now
     );
-  return getJob(input.id)!;
+  return (await getJob(input.id, h))!;
 }
 
-export function getJob(id: string): JobRow | null {
-  return (getDb().prepare(`SELECT * FROM jobs WHERE id = ?`).get(id) as JobRow) ?? null;
+export async function getJob(id: string, h: SqlHandle = getDb()): Promise<JobRow | null> {
+  return ((await h.prepare(`SELECT * FROM jobs WHERE id = ?`).get(id)) as JobRow) ?? null;
 }
 
-export function listJobsForUser(userId: string): JobRow[] {
-  return getDb()
+export async function listJobsForUser(userId: string): Promise<JobRow[]>{
+  return await getDb()
     .prepare(`SELECT * FROM jobs WHERE created_by_user_id = ? ORDER BY created_at DESC LIMIT 200`)
     .all(userId) as JobRow[];
 }
 
-export function listAllJobs(): JobRow[] {
-  return getDb().prepare(`SELECT * FROM jobs ORDER BY created_at DESC LIMIT 200`).all() as JobRow[];
+export async function listAllJobs(): Promise<JobRow[]>{
+  return await getDb().prepare(`SELECT * FROM jobs ORDER BY created_at DESC LIMIT 200`).all() as JobRow[];
 }
 
 export type ActivityJobRow = JobRow & { creator_email: string | null; creator_name: string | null };
 
 /** All jobs across ALL users with the creator's identity — the admin Activity view. */
-export function listAllJobsWithUsers(limit = 200): ActivityJobRow[] {
-  return getDb()
+export async function listAllJobsWithUsers(limit = 200): Promise<ActivityJobRow[]>{
+  return await getDb()
     .prepare(
       `SELECT jobs.*, users.email AS creator_email, users.name AS creator_name
          FROM jobs LEFT JOIN users ON users.id = jobs.created_by_user_id
@@ -381,8 +266,8 @@ export function listAllJobsWithUsers(limit = 200): ActivityJobRow[] {
  * passed, never anything the user already stopped. The dispatcher applies the
  * per-user / per-cap policies on top of this list.
  */
-export function listRunnableJobs(limit = 50): JobRow[] {
-  return getDb()
+export async function listRunnableJobs(limit = 50): Promise<JobRow[]>{
+  return await getDb()
     .prepare(
       `SELECT * FROM jobs
         WHERE cancel_requested = 0
@@ -400,22 +285,22 @@ export function listRunnableJobs(limit = 50): JobRow[] {
 // terminal writes must be no-ops — a settled job is never resurrected or
 // flipped. Every transition below states which prior states may take it.
 
-export function markJobRunning(id: string) {
+export async function markJobRunning(id: string) {
   const now = Date.now();
   // leads_found and progress_pct reset to 0: a deferred/resumed job replays
   // from the top (pipelines clear/skip their partials), so stale counters from
   // the prior attempt would overstate progress until the first live update.
   // Guard: never resurrects a job stopped between dispatch and this write.
-  getDb()
+  await getDb()
     .prepare(
       `UPDATE jobs SET status='running', started_at=?, leads_found=0, progress_pct=0, phase='starting', phase_detail='launching browser', phase_updated_at=? WHERE id = ? AND status NOT IN ('completed','failed','cancelled')`
     )
     .run(now, now, id);
 }
 
-export function markJobCompleted(id: string, csvPath: string, counts: { ads: number; advertisers: number }) {
+export async function markJobCompleted(id: string, csvPath: string, counts: { ads: number; advertisers: number }) {
   const now = Date.now();
-  getDb()
+  await getDb()
     .prepare(
       `UPDATE jobs SET status='completed', csv_path=?, completed_at=?, total_ads_scraped=?, total_advertisers=?, leads_found=?, progress_pct=100, phase='done', phase_detail='complete', phase_updated_at=? WHERE id = ? AND status='running'`
     )
@@ -427,11 +312,11 @@ export function markJobCompleted(id: string, csvPath: string, counts: { ads: num
  * Monotonic via MAX(): concurrent per-store streams update out of order and a
  * lower estimate must never walk the bar backwards.
  */
-export function setJobProgress(id: string, pct: number) {
+export async function setJobProgress(id: string, pct: number) {
   const clamped = Math.max(0, Math.min(100, pct));
-  getDb()
+  await getDb()
     .prepare(
-      `UPDATE jobs SET progress_pct = MAX(progress_pct, ?) WHERE id = ? AND status NOT IN ('completed','failed','cancelled')`
+      `UPDATE jobs SET progress_pct = GREATEST(progress_pct, ?) WHERE id = ? AND status NOT IN ('completed','failed','cancelled')`
     )
     .run(clamped, id);
 }
@@ -444,12 +329,12 @@ export function setJobProgress(id: string, pct: number) {
  * classified rows, the others replay from the top with deduped results.
  * Returns false when the job isn't in a resumable state.
  */
-export function resumeJob(id: string): boolean {
-  const job = getJob(id);
+export async function resumeJob(id: string): Promise<boolean>{
+  const job = await getJob(id);
   if (!job) return false;
   if (job.status !== 'cancelled' && job.status !== 'failed') return false;
   const now = Date.now();
-  getDb()
+  await getDb()
     .prepare(
       `UPDATE jobs SET status='pending', cancel_requested=0, error=NULL, completed_at=NULL, run_after=NULL,
               phase='queued', phase_detail='resumed — waiting for worker', phase_updated_at=? WHERE id = ?`
@@ -463,14 +348,14 @@ export function resumeJob(id: string): boolean {
  * the pipeline flushed one), job_results rows and leads_found all stay, so a
  * stopped job still delivers everything it found up to the stop.
  */
-export function markJobCancelled(id: string, detail: string, csvPath?: string | null) {
+export async function markJobCancelled(id: string, detail: string, csvPath?: string | null) {
   const now = Date.now();
   if (csvPath) {
     // Unguarded on purpose: pointing csv_path at a partial export is useful
     // even when the watchdog already failed the job.
-    getDb().prepare(`UPDATE jobs SET csv_path=? WHERE id = ?`).run(csvPath, id);
+    await getDb().prepare(`UPDATE jobs SET csv_path=? WHERE id = ?`).run(csvPath, id);
   }
-  getDb()
+  await getDb()
     .prepare(
       `UPDATE jobs SET status='cancelled', completed_at=?, phase='cancelled', phase_detail=?, phase_updated_at=? WHERE id = ? AND status NOT IN ('completed','failed','cancelled')`
     )
@@ -484,16 +369,16 @@ export function markJobCancelled(id: string, detail: string, csvPath?: string | 
  * (jobControl.throwIfCancelled) and finalizes with markJobCancelled.
  * Returns false when the job is already terminal.
  */
-export function requestJobCancel(id: string): boolean {
-  const job = getJob(id);
+export async function requestJobCancel(id: string): Promise<boolean>{
+  const job = await getJob(id);
   if (!job) return false;
   if (job.status === 'completed' || job.status === 'failed' || job.status === 'cancelled') return false;
-  getDb().prepare(`UPDATE jobs SET cancel_requested = 1 WHERE id = ?`).run(id);
+  await getDb().prepare(`UPDATE jobs SET cancel_requested = 1 WHERE id = ?`).run(id);
   if (job.status === 'pending' || job.status === 'deferred') {
-    markJobCancelled(id, 'stopped by user before start');
+    await markJobCancelled(id, 'stopped by user before start');
   } else {
     const now = Date.now();
-    getDb()
+    await getDb()
       .prepare(`UPDATE jobs SET phase_detail=?, phase_updated_at=? WHERE id = ?`)
       .run('stopping — finishing current step…', now, id);
   }
@@ -501,15 +386,15 @@ export function requestJobCancel(id: string): boolean {
 }
 
 /** Live "leads so far" counter — cheap single-column update, called mid-run. */
-export function setJobLeadsFound(id: string, n: number) {
-  getDb()
+export async function setJobLeadsFound(id: string, n: number) {
+  await getDb()
     .prepare(`UPDATE jobs SET leads_found = ? WHERE id = ? AND status NOT IN ('completed','failed','cancelled')`)
     .run(n, id);
 }
 
-export function markJobFailed(id: string, error: string) {
+export async function markJobFailed(id: string, error: string) {
   const now = Date.now();
-  getDb()
+  await getDb()
     .prepare(
       `UPDATE jobs SET status='failed', error=?, completed_at=?, phase='failed', phase_detail=?, phase_updated_at=? WHERE id = ? AND status NOT IN ('completed','failed','cancelled')`
     )
@@ -522,20 +407,20 @@ export function markJobFailed(id: string, error: string) {
  * Asia/Jerusalem midnight) passes. This is distinct from markJobFailed: a
  * deferred job is not terminal and is not emailed as a failure.
  */
-export function deferJob(id: string, runAfter: number, detail: string) {
+export async function deferJob(id: string, runAfter: number, detail: string) {
   const now = Date.now();
-  getDb()
+  await getDb()
     .prepare(
       `UPDATE jobs SET status='deferred', run_after=?, phase='deferred', phase_detail=?, phase_updated_at=? WHERE id = ? AND status='running'`
     )
     .run(runAfter, detail.slice(0, 200), now, id);
 }
 
-export function setJobPhase(id: string, phase: JobPhase, detail?: string | null) {
+export async function setJobPhase(id: string, phase: JobPhase, detail?: string | null) {
   const now = Date.now();
   // Guard: a watchdog-failed job's zombie pipeline must not make the row look
   // alive again by stamping fresh phases onto it.
-  getDb()
+  await getDb()
     .prepare(
       `UPDATE jobs SET phase=?, phase_detail=?, phase_updated_at=? WHERE id = ? AND status NOT IN ('completed','failed','cancelled')`
     )
@@ -547,23 +432,23 @@ export function setJobPhase(id: string, phase: JobPhase, detail?: string | null)
  * its last job_logs row (long phases — HQ split, store resolve — log without
  * changing phase). The queue watchdog uses this to detect wedged jobs.
  */
-export function jobHeartbeatAt(id: string): number | null {
-  const row = getDb()
+export async function jobHeartbeatAt(id: string): Promise<number | null>{
+  const row = await getDb()
     .prepare(
-      `SELECT MAX(COALESCE(phase_updated_at, started_at, created_at),
-                  COALESCE((SELECT MAX(ts) FROM job_logs WHERE job_id = jobs.id), 0)) AS beat
+      `SELECT GREATEST(COALESCE(phase_updated_at, started_at, created_at),
+                       COALESCE((SELECT MAX(ts) FROM job_logs WHERE job_id = jobs.id), 0)) AS beat
          FROM jobs WHERE id = ?`
     )
     .get(id) as { beat: number | null } | undefined;
   return row?.beat ?? null;
 }
 
-export function setJobNotificationStatus(id: string, status: 'sent' | 'failed') {
-  getDb().prepare(`UPDATE jobs SET notification_status=? WHERE id = ?`).run(status, id);
+export async function setJobNotificationStatus(id: string, status: 'sent' | 'failed') {
+  await getDb().prepare(`UPDATE jobs SET notification_status=? WHERE id = ?`).run(status, id);
 }
 
-export function setJobHqZipPath(id: string, zipPath: string | null) {
-  getDb().prepare(`UPDATE jobs SET hq_zip_path=? WHERE id = ?`).run(zipPath, id);
+export async function setJobHqZipPath(id: string, zipPath: string | null) {
+  await getDb().prepare(`UPDATE jobs SET hq_zip_path=? WHERE id = ?`).run(zipPath, id);
 }
 
 /**
@@ -574,20 +459,20 @@ export function setJobHqZipPath(id: string, zipPath: string | null) {
  * scraped so far downloadable. markJobCompleted overwrites it with the same
  * path at the end; markJobFailed leaves it intact.
  */
-export function setJobCsvPath(id: string, csvPath: string) {
-  getDb().prepare(`UPDATE jobs SET csv_path=? WHERE id = ?`).run(csvPath, id);
+export async function setJobCsvPath(id: string, csvPath: string) {
+  await getDb().prepare(`UPDATE jobs SET csv_path=? WHERE id = ?`).run(csvPath, id);
 }
 
 // ---------- Log helpers ----------
 
-export function appendLog(jobId: string, level: JobLogRow['level'], message: string) {
-  getDb()
+export async function appendLog(jobId: string, level: JobLogRow['level'], message: string) {
+  await getDb()
     .prepare(`INSERT INTO job_logs (job_id, level, message, ts) VALUES (?, ?, ?, ?)`)
     .run(jobId, level, message, Date.now());
 }
 
-export function getLogs(jobId: string): JobLogRow[] {
-  return getDb().prepare(`SELECT * FROM job_logs WHERE job_id = ? ORDER BY ts ASC`).all(jobId) as JobLogRow[];
+export async function getLogs(jobId: string): Promise<JobLogRow[]>{
+  return await getDb().prepare(`SELECT * FROM job_logs WHERE job_id = ? ORDER BY ts ASC`).all(jobId) as JobLogRow[];
 }
 
 // ---------- Result helpers ----------
@@ -600,8 +485,8 @@ export function getLogs(jobId: string): JobLogRow[] {
  * is not possible here — callers dedupe on email only WITHIN the current batch and
  * fall back to domain, then normalized name, against this history.
  */
-export function existingLeadIdentities(): { names: string[]; urls: string[] } {
-  const rows = getDb()
+export async function existingLeadIdentities(): Promise<{ names: string[]; urls: string[]; }>{
+  const rows = await getDb()
     .prepare(`SELECT advertiser_name, landing_url, page_url, store_url FROM job_results`)
     .all() as Array<{ advertiser_name: string; landing_url: string | null; page_url: string | null; store_url: string | null }>;
   const names: string[] = [];
@@ -618,7 +503,7 @@ export function existingLeadIdentities(): { names: string[]; urls: string[] } {
   return { names, urls };
 }
 
-export function insertResult(input: {
+export async function insertResult(input: {
   job_id: string;
   advertiser_name: string;
   page_url: string | null;
@@ -628,7 +513,7 @@ export function insertResult(input: {
   ad_text: string | null;
   country: string;
 }) {
-  getDb()
+  await getDb()
     .prepare(
       `INSERT INTO job_results (job_id, advertiser_name, page_url, landing_url, classification, store_url, ad_text, country, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
@@ -646,16 +531,16 @@ export function insertResult(input: {
     );
 }
 
-export function getResults(jobId: string): JobResultRow[] {
-  return getDb()
+export async function getResults(jobId: string): Promise<JobResultRow[]>{
+  return await getDb()
     .prepare(`SELECT * FROM job_results WHERE job_id = ? ORDER BY id ASC`)
     .all(jobId) as JobResultRow[];
 }
 
 /** Set the app-category enrichment fields on a single result row.
  *  is_game: true→1, false→0, null→NULL (unknown/unclassified). */
-export function setResultCategory(resultId: number, appCategory: string | null, isGame: boolean | null): void {
-  getDb()
+export async function setResultCategory(resultId: number, appCategory: string | null, isGame: boolean | null): Promise<void>{
+  await getDb()
     .prepare(`UPDATE job_results SET app_category = ?, is_game = ? WHERE id = ?`)
     .run(appCategory, isGame === null ? null : isGame ? 1 : 0, resultId);
 }
@@ -668,88 +553,88 @@ export function setResultCategory(resultId: number, appCategory: string | null, 
  * prior rows and skips them via a landing_url guard, which also avoids paying
  * for its uncached classify calls a second time.
  */
-export function clearJobResults(jobId: string) {
-  getDb().prepare(`DELETE FROM job_results WHERE job_id = ?`).run(jobId);
+export async function clearJobResults(jobId: string) {
+  await getDb().prepare(`DELETE FROM job_results WHERE job_id = ?`).run(jobId);
 }
 
 // ---------- User helpers ----------
 
-export function getUserByEmail(email: string): UserRow | null {
-  return (getDb().prepare(`SELECT * FROM users WHERE email = ?`).get(email) as UserRow) ?? null;
+export async function getUserByEmail(email: string): Promise<UserRow | null>{
+  return (await getDb().prepare(`SELECT * FROM users WHERE email = ?`).get(email) as UserRow) ?? null;
 }
 
-export function getUserById(id: string): UserRow | null {
-  return (getDb().prepare(`SELECT * FROM users WHERE id = ?`).get(id) as UserRow) ?? null;
+export async function getUserById(id: string): Promise<UserRow | null>{
+  return (await getDb().prepare(`SELECT * FROM users WHERE id = ?`).get(id) as UserRow) ?? null;
 }
 
-export function upsertUser(input: { id?: string; email: string; name?: string | null }): UserRow {
-  const existing = getUserByEmail(input.email);
+export async function upsertUser(input: { id?: string; email: string; name?: string | null }): Promise<UserRow>{
+  const existing = await getUserByEmail(input.email);
   if (existing) {
     if (input.name && input.name !== existing.name) {
-      getDb().prepare(`UPDATE users SET name = ? WHERE id = ?`).run(input.name, existing.id);
+      await getDb().prepare(`UPDATE users SET name = ? WHERE id = ?`).run(input.name, existing.id);
       return { ...existing, name: input.name };
     }
     return existing;
   }
   const id = input.id ?? `usr_${randomBytes(8).toString('hex')}`;
   const now = Date.now();
-  getDb()
+  await getDb()
     .prepare(
       `INSERT INTO users (id, email, name, default_recipient, created_at) VALUES (?, ?, ?, NULL, ?)`
     )
     .run(id, input.email, input.name ?? null, now);
-  return getUserById(id)!;
+  return (await getUserById(id))!;
 }
 
-export function setUserDefaultRecipient(userId: string, recipient: string | null) {
-  getDb().prepare(`UPDATE users SET default_recipient = ? WHERE id = ?`).run(recipient, userId);
+export async function setUserDefaultRecipient(userId: string, recipient: string | null) {
+  await getDb().prepare(`UPDATE users SET default_recipient = ? WHERE id = ?`).run(recipient, userId);
 }
 
 // ---------- Session helpers ----------
 
-export function createSession(userId: string, ttlMs: number): SessionRow {
+export async function createSession(userId: string, ttlMs: number): Promise<SessionRow>{
   const token = cryptoRandom(40);
   const now = Date.now();
   const expiresAt = now + ttlMs;
-  getDb()
+  await getDb()
     .prepare(`INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)`)
     .run(token, userId, now, expiresAt);
   return { token, user_id: userId, created_at: now, expires_at: expiresAt };
 }
 
-export function getSessionUser(token: string): UserRow | null {
-  const row = getDb()
+export async function getSessionUser(token: string): Promise<UserRow | null>{
+  const row = await getDb()
     .prepare(`SELECT * FROM sessions WHERE token = ?`)
     .get(token) as SessionRow | undefined;
   if (!row) return null;
   if (row.expires_at < Date.now()) {
-    deleteSession(token);
+    await deleteSession(token);
     return null;
   }
-  return getUserById(row.user_id);
+  return await getUserById(row.user_id);
 }
 
-export function deleteSession(token: string) {
-  getDb().prepare(`DELETE FROM sessions WHERE token = ?`).run(token);
+export async function deleteSession(token: string) {
+  await getDb().prepare(`DELETE FROM sessions WHERE token = ?`).run(token);
 }
 
 // ---------- Gmail token helpers ----------
 
-export function getGmailTokensForUser(userId: string): GmailTokenRow | null {
-  return (getDb().prepare(`SELECT * FROM gmail_tokens WHERE user_id = ?`).get(userId) as GmailTokenRow) ?? null;
+export async function getGmailTokensForUser(userId: string): Promise<GmailTokenRow | null>{
+  return (await getDb().prepare(`SELECT * FROM gmail_tokens WHERE user_id = ?`).get(userId) as GmailTokenRow) ?? null;
 }
 
-export function upsertGmailTokens(input: {
+export async function upsertGmailTokens(input: {
   userId: string;
   accessToken?: string | null;
   refreshToken?: string | null;
   expiresAt?: number | null;
   gmailEmail?: string | null;
 }) {
-  const existing = getGmailTokensForUser(input.userId);
+  const existing = await getGmailTokensForUser(input.userId);
   const now = Date.now();
   if (!existing) {
-    getDb()
+    await getDb()
       .prepare(
         `INSERT INTO gmail_tokens (user_id, access_token, refresh_token, expires_at, gmail_email, updated_at)
          VALUES (?, ?, ?, ?, ?, ?)`
@@ -771,7 +656,7 @@ export function upsertGmailTokens(input: {
     expires_at: input.expiresAt ?? existing.expires_at,
     gmail_email: input.gmailEmail ?? existing.gmail_email,
   };
-  getDb()
+  await getDb()
     .prepare(
       `UPDATE gmail_tokens
        SET access_token = ?, refresh_token = ?, expires_at = ?, gmail_email = ?, updated_at = ?
@@ -780,8 +665,8 @@ export function upsertGmailTokens(input: {
     .run(next.access_token, next.refresh_token, next.expires_at, next.gmail_email, now, input.userId);
 }
 
-export function deleteGmailTokens(userId: string) {
-  getDb().prepare(`DELETE FROM gmail_tokens WHERE user_id = ?`).run(userId);
+export async function deleteGmailTokens(userId: string) {
+  await getDb().prepare(`DELETE FROM gmail_tokens WHERE user_id = ?`).run(userId);
 }
 
 // ---------- internal ----------
@@ -790,6 +675,6 @@ function cryptoRandom(bytes: number): string {
   return randomBytes(bytes).toString('hex');
 }
 // Backwards-compat alias used by routes-auth.ts
-export function upsertUserByEmail(email: string, name?: string | null): UserRow {
-  return upsertUser({ email, name });
+export async function upsertUserByEmail(email: string, name?: string | null): Promise<UserRow>{
+  return await upsertUser({ email, name });
 }

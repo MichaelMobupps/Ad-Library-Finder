@@ -84,10 +84,13 @@ async function tick() {
   let lastWatchdogSweep = Date.now();
   while (running) {
     try {
-      dispatchRunnable();
+      // Deliberate fire-and-forget: a setInterval tick has no caller to await it.
+  // The catch is load-bearing — an unhandled rejection here would kill the
+  // server, and a dispatcher that throws once must not stop the next tick.
+  void dispatchRunnable().catch((err) => log.error(`queue: dispatch tick failed — ${(err as Error).message}`));
       if (Date.now() - lastWatchdogSweep >= WATCHDOG_INTERVAL_MS) {
         lastWatchdogSweep = Date.now();
-        watchdogSweep();
+        void watchdogSweep().catch((err) => log.error(`queue: watchdog tick failed — ${(err as Error).message}`));
       }
     } catch (err) {
       log.error('queue tick error', err);
@@ -104,20 +107,20 @@ async function tick() {
  * writes are no-ops thanks to the status guards in db.ts), free its slots so
  * the user's queue moves again, and recycle the shared browser for meta jobs.
  */
-function watchdogSweep() {
+async function watchdogSweep() {
   const now = Date.now();
   for (const jobId of [...inFlightJobs]) {
-    const job = getJob(jobId);
+    const job = await getJob(jobId);
     if (!job || job.status !== 'running') continue; // still starting, or already settled
-    const beat = jobHeartbeatAt(jobId) ?? job.started_at ?? now;
+    const beat = await jobHeartbeatAt(jobId) ?? job.started_at ?? now;
     const silentMs = now - beat;
     if (silentMs < STALL_TIMEOUT_MS) continue;
 
     const mins = Math.round(silentMs / 60_000);
     log.error(`watchdog: job ${jobId} silent for ${mins}min — killing it`);
-    requestJobCancel(jobId); // zombie unwinds at its next cancel checkpoint
-    markJobFailed(jobId, `stalled: no progress for ${mins} minutes — aborted by watchdog (partial results kept; use Resume to retry)`);
-    appendLog(jobId, 'error', `watchdog: no progress for ${mins} minutes — job aborted. Partial results are kept; Resume re-queues it.`);
+    await requestJobCancel(jobId); // zombie unwinds at its next cancel checkpoint
+    await markJobFailed(jobId, `stalled: no progress for ${mins} minutes — aborted by watchdog (partial results kept; use Resume to retry)`);
+    await appendLog(jobId, 'error', `watchdog: no progress for ${mins} minutes — job aborted. Partial results are kept; Resume re-queues it.`);
     if ((job.source ?? 'meta') === 'meta') {
       void forceRecycleBrowser(`watchdog killed ${jobId}`);
     }
@@ -125,14 +128,14 @@ function watchdogSweep() {
   }
 }
 
-function dispatchRunnable() {
+async function dispatchRunnable() {
   if (inFlightJobs.size >= MAX_CONCURRENT_JOBS) return;
   // Daily LLM cap: do not START a non-exempt job — it would scrape (non-LLM)
   // and then defer at the first LLM call, churning the queue. store_first is
   // EXEMPT: its pipeline is plain HTTP and its one LLM step (the trailing HQ
   // split) checks the cap itself and skips, so the exemption cannot overspend.
-  const capReached = spentTodayUsd() >= DAILY_CAP_USD;
-  for (const job of listRunnableJobs(50)) {
+  const capReached = await spentTodayUsd() >= DAILY_CAP_USD;
+  for (const job of await listRunnableJobs(50)) {
     if (inFlightJobs.size >= MAX_CONCURRENT_JOBS) break;
     if (inFlightJobs.has(job.id)) continue; // launched a tick ago, still 'pending' in DB
     const userKey = job.created_by_user_id || '(no-user)';
@@ -184,18 +187,18 @@ async function runJob(job: JobRow): Promise<void> {
 
 async function runMetaJob(job: JobRow) {
   // markJobRunning sets phase='starting' / detail='launching browser'.
-  markJobRunning(job.id);
-  const onLog = (level: 'info' | 'warn' | 'error' | 'debug', msg: string) => {
-    appendLog(job.id, level, msg);
+  await markJobRunning(job.id);
+  const onLog = async (level: 'info' | 'warn' | 'error' | 'debug', msg: string) => {
+    await appendLog(job.id, level, msg);
     log.info(`[job ${job.id}] ${msg}`);
   };
-  onLog('info', `job started: ${job.product_type}, countries=${job.countries}`);
+  await onLog('info', `job started: ${job.product_type}, countries=${job.countries}`);
 
   try {
     const countries: string[] = JSON.parse(job.countries);
     const keywords = keywordsFor(job.product_type);
 
-    onLog('info', `using ${keywords.length} keywords × ${countries.length} countries`);
+    await onLog('info', `using ${keywords.length} keywords × ${countries.length} countries`);
 
     const seenAdvertisers = new Set<string>();
     const collected: RawAd[] = [];
@@ -205,16 +208,16 @@ async function runMetaJob(job: JobRow) {
 
     for (const country of countries) {
       for (const keyword of keywords) {
-        throwIfCancelled(job.id);
+        await throwIfCancelled(job.id);
         queryIdx++;
-        setJobPhase(
+        await setJobPhase(
           job.id,
           'scraping',
           `${country} / "${keyword}" (${queryIdx}/${totalQueries})`
         );
         // Overall progress: scrape sweep is 0..50 of the run.
-        setJobProgress(job.id, 50 * (queryIdx / Math.max(1, totalQueries)));
-        onLog('info', `scrape ${country} / "${keyword}"`);
+        await setJobProgress(job.id, 50 * (queryIdx / Math.max(1, totalQueries)));
+        await onLog('info', `scrape ${country} / "${keyword}"`);
         const ads = await scrapeQuery(country, keyword, (m) => onLog('debug', m));
         let newCount = 0;
         for (const ad of ads) {
@@ -224,13 +227,13 @@ async function runMetaJob(job: JobRow) {
           collected.push(ad);
           newCount++;
         }
-        onLog('info', `  +${newCount} new advertisers (${ads.length} ads on page)`);
+        await onLog('info', `  +${newCount} new advertisers (${ads.length} ads on page)`);
       }
     }
 
-    onLog('info', `scraping done: ${collected.length} unique advertisers`);
-    onLog('info', `classifying landing URLs...`);
-    setJobPhase(job.id, 'classifying', `0/${collected.length} advertisers`);
+    await onLog('info', `scraping done: ${collected.length} unique advertisers`);
+    await onLog('info', `classifying landing URLs...`);
+    await setJobPhase(job.id, 'classifying', `0/${collected.length} advertisers`);
 
     let classified = 0;
     let matched = 0;
@@ -239,12 +242,12 @@ async function runMetaJob(job: JobRow) {
     // their LLM calls are not paid for twice (and no duplicate rows are written).
     // Empty on a fresh job, so first runs are unaffected.
     const alreadyDone = new Set(
-      getResults(job.id)
+      await (await getResults(job.id))
         .map((r) => r.landing_url)
         .filter((u): u is string => !!u),
     );
     for (const ad of collected) {
-      throwIfCancelled(job.id);
+      await throwIfCancelled(job.id);
       if (ad.landing_url && alreadyDone.has(ad.landing_url)) {
         classified++;
         continue;
@@ -255,7 +258,7 @@ async function runMetaJob(job: JobRow) {
           (cls.classification === 'mobile_google_play' || cls.classification === 'mobile_app_store')) ||
         (job.product_type === 'cps' && cls.classification === 'cps_web');
 
-      insertResult({
+      await insertResult({
         job_id: job.id,
         advertiser_name: ad.advertiser_name,
         page_url: ad.page_url,
@@ -269,27 +272,27 @@ async function runMetaJob(job: JobRow) {
       classified++;
       if (isMatch) {
         matched++;
-        setJobLeadsFound(job.id, matched); // live counter for the UI
+        await setJobLeadsFound(job.id, matched); // live counter for the UI
       }
       if (classified % 10 === 0 || classified === collected.length) {
-        setJobPhase(
+        await setJobPhase(
           job.id,
           'classifying',
           `${classified}/${collected.length} advertisers (${matched} matched)`
         );
         // Overall progress: classification is 50..90 of the run.
-        setJobProgress(job.id, 50 + 40 * (classified / Math.max(1, collected.length)));
+        await setJobProgress(job.id, 50 + 40 * (classified / Math.max(1, collected.length)));
       }
       if (classified % 25 === 0) {
-        onLog('info', `  classified ${classified}/${collected.length} (matched product type: ${matched})`);
+        await onLog('info', `  classified ${classified}/${collected.length} (matched product type: ${matched})`);
       }
     }
 
-    onLog('info', `classification done: ${matched} matched ${job.product_type}`);
-    setJobProgress(job.id, 90); // CSV + HQ split close out; completion pins 100
-    setJobPhase(job.id, 'building_csv', `writing CSV (${matched} matched rows)`);
+    await onLog('info', `classification done: ${matched} matched ${job.product_type}`);
+    await setJobProgress(job.id, 90); // CSV + HQ split close out; completion pins 100
+    await setJobPhase(job.id, 'building_csv', `writing CSV (${matched} matched rows)`);
 
-    const allResults = getResults(job.id);
+    const allResults = await getResults(job.id);
     // Operator-chosen lead cap (20/50/100/all) — caps the CSV and, below, the
     // HQ-split rows, so the Excel never disagrees with the CSV.
     const metaMaxLeads = normalizeMaxLeads(
@@ -301,13 +304,13 @@ async function runMetaJob(job: JobRow) {
       results: allResults,
       maxRows: metaMaxLeads,
     });
-    onLog('info', `CSV written: ${csvPath} (${rowsWritten} rows)`);
+    await onLog('info', `CSV written: ${csvPath} (${rowsWritten} rows)`);
 
     // HQ split (mobile only). Fire-and-forget for failures inside the split:
     // we don't want a downstream HQ-resolution issue to fail the whole job.
     if (job.product_type === 'mobile') {
-      throwIfCancelled(job.id);
-      setJobPhase(job.id, 'hq_splitting', `resolving HQ for ${rowsWritten} apps`);
+      await throwIfCancelled(job.id);
+      await setJobPhase(job.id, 'hq_splitting', `resolving HQ for ${rowsWritten} apps`);
       try {
         const outcome = await runHqSplit({
           jobId: job.id,
@@ -315,31 +318,31 @@ async function runMetaJob(job: JobRow) {
           onLog,
         });
         if (outcome.zipPath) {
-          setJobHqZipPath(job.id, outcome.zipPath);
+          await setJobHqZipPath(job.id, outcome.zipPath);
           const summary = Object.entries(outcome.perCountryCounts)
             .sort(([, a], [, b]) => b - a)
             .map(([c, n]) => `${c}=${n}`)
             .join(', ');
-          onLog('info', `hq-split: zip ready (${summary})`);
+          await onLog('info', `hq-split: zip ready (${summary})`);
         }
         if (outcome.playBlocked) {
-          onLog('warn', `hq-split: Play page-fetch was blocked/rate-limited — Android resolution may be degraded`);
+          await onLog('warn', `hq-split: Play page-fetch was blocked/rate-limited — Android resolution may be degraded`);
         }
       } catch (err) {
         if (err instanceof BudgetExceededError) throw err;
-        onLog('warn', `hq-split failed (non-fatal): ${(err as Error).message}`);
+        await onLog('warn', `hq-split failed (non-fatal): ${(err as Error).message}`);
       }
     }
 
     // markJobCompleted sets phase='done'.
-    markJobCompleted(job.id, csvPath, { ads: collected.length, advertisers: rowsWritten });
-    onLog('info', `job completed`);
+    await markJobCompleted(job.id, csvPath, { ads: collected.length, advertisers: rowsWritten });
+    await onLog('info', `job completed`);
 
     // Notify (fire-and-forget; we don't fail the job if the email fails)
-    const fresh = getJob(job.id);
+    const fresh = await getJob(job.id);
     if (fresh) {
-      void notifyJobCompleted(fresh).then(() => onLog('info', 'notification dispatched')).catch((e) => {
-        onLog('warn', `notification error: ${(e as Error).message}`);
+      void notifyJobCompleted(fresh).then(() => onLog('info', 'notification dispatched')).catch(async (e) => {
+        await onLog('warn', `notification error: ${(e as Error).message}`);
       });
     }
   } catch (err) {
@@ -352,32 +355,32 @@ async function runMetaJob(job: JobRow) {
         const cap = normalizeMaxLeads(
           job.source_params ? (JSON.parse(job.source_params) as Record<string, unknown>).maxLeads : null,
         );
-        const partial = buildCsv({ jobId: job.id, productType: job.product_type, results: getResults(job.id), maxRows: cap });
+        const partial = buildCsv({ jobId: job.id, productType: job.product_type, results: await getResults(job.id), maxRows: cap });
         csvPath = partial.path;
         kept = partial.rowsWritten;
       } catch {
         /* partial CSV is best-effort */
       }
-      markJobCancelled(job.id, `stopped by user — ${kept} lead(s) kept`, csvPath);
-      onLog('warn', `job stopped by user — ${kept} partial lead(s) exported`);
+      await markJobCancelled(job.id, `stopped by user — ${kept} lead(s) kept`, csvPath);
+      await onLog('warn', `job stopped by user — ${kept} partial lead(s) exported`);
       return;
     }
     if (err instanceof BudgetExceededError) {
       const runAfter = nextJerusalemMidnightMs();
       const when = new Date(runAfter).toISOString();
-      deferJob(job.id, runAfter, `LLM daily cap ($${DAILY_CAP_USD}) reached; resumes after ${when}`);
-      onLog('warn', `job deferred: LLM daily cap reached; resumes after ${when} (Jerusalem midnight)`);
+      await deferJob(job.id, runAfter, `LLM daily cap ($${DAILY_CAP_USD}) reached; resumes after ${when}`);
+      await onLog('warn', `job deferred: LLM daily cap reached; resumes after ${when} (Jerusalem midnight)`);
       return;
     }
     const msg = (err as Error).message || 'unknown error';
     log.error(`job ${job.id} failed`, err);
-    onLog('error', `job failed: ${msg}`);
-    markJobFailed(job.id, msg);
+    await onLog('error', `job failed: ${msg}`);
+    await markJobFailed(job.id, msg);
 
-    const fresh = getJob(job.id);
+    const fresh = await getJob(job.id);
     if (fresh) {
-      void notifyJobFailed(fresh).catch((e) => {
-        onLog('warn', `failure notification error: ${(e as Error).message}`);
+      void notifyJobFailed(fresh).catch(async (e) => {
+        await onLog('warn', `failure notification error: ${(e as Error).message}`);
       });
     }
   }

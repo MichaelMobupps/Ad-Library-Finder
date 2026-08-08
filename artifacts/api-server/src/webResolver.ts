@@ -595,14 +595,14 @@ Respond with ONLY this JSON object, no preamble and no markdown fences:
 {"url": "<https url or empty string>", "brand": "<advertiser/brand name or empty>", "confidence": "<high|medium|low>"}`;
 
   try {
-    assertBudget('web-resolver');
+    await assertBudget('web-resolver');
     const res = await getClient().messages.create({
       model: SEARCH_MODEL,
       max_tokens: 1500,
       messages: [{ role: 'user', content: prompt }],
       tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: SEARCH_MAX_USES }],
     });
-    recordSpend('web-resolver', SEARCH_MODEL, res.usage);
+    await recordSpend('web-resolver', SEARCH_MODEL, res.usage);
 
     const text = (res.content || [])
       .filter((b): b is Anthropic.TextBlock => b.type === 'text')

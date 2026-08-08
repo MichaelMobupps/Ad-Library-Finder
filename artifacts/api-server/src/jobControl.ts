@@ -28,14 +28,14 @@ const CHECK_INTERVAL_MS = 750;
 const lastCheck = new Map<string, { at: number; cancelled: boolean }>();
 
 /** True when a stop has been requested for this job. Throttled DB read. */
-export function isCancelRequested(jobId: string): boolean {
+export async function isCancelRequested(jobId: string): Promise<boolean>{
   const now = Date.now();
   const cached = lastCheck.get(jobId);
   // A cancelled answer is sticky — a stop is never un-requested mid-run.
   if (cached && (cached.cancelled || now - cached.at < CHECK_INTERVAL_MS)) {
     return cached.cancelled;
   }
-  const row = getDb().prepare(`SELECT cancel_requested FROM jobs WHERE id = ?`).get(jobId) as
+  const row = await getDb().prepare(`SELECT cancel_requested FROM jobs WHERE id = ?`).get(jobId) as
     | { cancel_requested: number }
     | undefined;
   const cancelled = !!row && row.cancel_requested === 1;
@@ -44,8 +44,8 @@ export function isCancelRequested(jobId: string): boolean {
 }
 
 /** Unwind the pipeline when a stop has been requested. Call between work items. */
-export function throwIfCancelled(jobId: string): void {
-  if (isCancelRequested(jobId)) throw new JobCancelledError(jobId);
+export async function throwIfCancelled(jobId: string): Promise<void>{
+  if (await isCancelRequested(jobId)) throw new JobCancelledError(jobId);
 }
 
 /** Drop the cached answer for a job (called when a run starts, so a job id that

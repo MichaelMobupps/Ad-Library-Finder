@@ -104,146 +104,20 @@ export interface PublisherRow {
   updated_at: number;
 }
 
-// ── DDL ──────────────────────────────────────────────────────────────────────
+// ── Boot repairs ─────────────────────────────────────────────────────────────
 
-export function ensureStoreDiscoveryTables(): void {
-  getDb().exec(`
-    CREATE TABLE IF NOT EXISTS discovered_apps (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      store TEXT NOT NULL,
-      app_id TEXT NOT NULL,
-      title TEXT,
-      vertical TEXT,
-      country TEXT NOT NULL,
-      source TEXT NOT NULL,
-      discovery_depth INTEGER NOT NULL DEFAULT 0,
-      chart TEXT,
-      rank INTEGER,
-      first_seen_at INTEGER NOT NULL,
-      last_seen_at INTEGER NOT NULL,
-      last_rank INTEGER,
-      -- Publisher identity as it appeared in the LIST payload (chart/search/
-      -- similar/catalog). Play's list rows already carry developer + developerId,
-      -- so this costs no extra request and lets a publisher be rolled up and
-      -- confirmed BEFORE its 1.2 MB detail page is ever fetched. See
-      -- provisionalPlayPublishers().
-      list_developer TEXT,
-      list_developer_id TEXT,
-      UNIQUE(store, app_id, country)
-    );
-    CREATE INDEX IF NOT EXISTS idx_discovered_apps_appid ON discovered_apps(store, app_id);
-    -- NB: the index on list_developer is created AFTER addColumnIfMissing below,
-    -- never here. On an existing database CREATE TABLE IF NOT EXISTS is a no-op,
-    -- so the column does not exist yet at this point and indexing it here is a
-    -- FATAL startup error ("no such column: list_developer") — i.e. every deploy
-    -- onto a live database would fail to boot.
-    CREATE INDEX IF NOT EXISTS idx_discovered_apps_vertical ON discovered_apps(vertical, source);
-
-    CREATE TABLE IF NOT EXISTS store_app_detail (
-      store TEXT NOT NULL,
-      app_id TEXT NOT NULL,
-      title TEXT,
-      developer TEXT,
-      developer_id TEXT,
-      developer_email TEXT,
-      developer_website TEXT,
-      min_installs INTEGER,
-      genre_id TEXT,
-      category_raw TEXT,
-      is_game INTEGER,
-      store_updated_at INTEGER,
-      artist_id TEXT,
-      seller_name TEXT,
-      bundle_id TEXT,
-      enrich_status TEXT NOT NULL DEFAULT 'failed',
-      attempts INTEGER NOT NULL DEFAULT 0,
-      last_live_check_at INTEGER,
-      delisted_at INTEGER,
-      created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL,
-      PRIMARY KEY (store, app_id)
-    );
-    CREATE INDEX IF NOT EXISTS idx_store_app_detail_dev ON store_app_detail(developer_id);
-
-    CREATE TABLE IF NOT EXISTS publishers (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      merge_key TEXT NOT NULL UNIQUE,
-      name TEXT NOT NULL,
-      play_developer_id TEXT,
-      apple_seller_name TEXT,
-      website TEXT,
-      email TEXT,
-      countries_charted TEXT NOT NULL DEFAULT '[]',
-      countries_seen TEXT NOT NULL DEFAULT '[]',
-      verticals TEXT NOT NULL DEFAULT '[]',
-      charted_app_count INTEGER NOT NULL DEFAULT 0,
-      app_count INTEGER NOT NULL DEFAULT 0,
-      best_rank INTEGER,
-      both_stores INTEGER NOT NULL DEFAULT 0,
-      in_band INTEGER NOT NULL DEFAULT 0,
-      source_mix TEXT NOT NULL DEFAULT '{}',
-      gatc_advertiser_id TEXT,
-      gatc_ads_count INTEGER,
-      meta_active_ads INTEGER,
-      confirmed_advertiser INTEGER NOT NULL DEFAULT 0,
-      is_game_publisher INTEGER NOT NULL DEFAULT 0,
-      is_charted INTEGER NOT NULL DEFAULT 0,
-      preview_url TEXT,
-      preview_title TEXT,
-      score REAL NOT NULL DEFAULT 0,
-      last_confirm_at INTEGER,
-      created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL
-    );
-    /* Identity index for the publishers upsert (spec step 9, verification 5).
-       merge_key is derived from a merged group's CONTENTS, so it changes shape
-       the run a group gains its first Play app or unions with another group;
-       keyed only on merge_key, that run INSERTs a second row for an entity that
-       already has one. This table remembers every key a publisher has been seen
-       under — 'p:<playDeveloperId>', 'a:<sellerName>', 'w:<website domain>',
-       'n:<name>' — so identity survives a merge_key that moves. The PRIMARY KEY
-       is what makes one key resolve to exactly one publisher. */
-    CREATE TABLE IF NOT EXISTS publisher_identity (
-      identity_key TEXT PRIMARY KEY,
-      publisher_id INTEGER NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS idx_publisher_identity_pub ON publisher_identity(publisher_id);
-
-    CREATE INDEX IF NOT EXISTS idx_publishers_score ON publishers(score DESC);
-    CREATE INDEX IF NOT EXISTS idx_publishers_playdev ON publishers(play_developer_id);
-    CREATE INDEX IF NOT EXISTS idx_publishers_seller ON publishers(apple_seller_name);
-    CREATE INDEX IF NOT EXISTS idx_discovered_depth ON discovered_apps(store, source, discovery_depth);
-  `);
-
-  // CREATE TABLE IF NOT EXISTS is a no-op on an existing database, so a column
-  // added after first deploy must be ALTERed in explicitly or every read of it
-  // throws "no such column" against a live DB.
-  addColumnIfMissing('publishers', 'countries_seen', `TEXT NOT NULL DEFAULT '[]'`);
-  addColumnIfMissing('publishers', 'last_confirm_at', 'INTEGER');
-  // Liveness sweep: when the store last confirmed the listing exists, and when it
-  // was first observed GONE. delisted_at is the tombstone — set only on an
-  // unambiguous store "not found", never on a failed request.
-  addColumnIfMissing('store_app_detail', 'last_live_check_at', 'INTEGER');
-  addColumnIfMissing('store_app_detail', 'delisted_at', 'INTEGER');
-  // Publisher identity carried by the LIST payload — the basis of the fast lane
-  // (provisionalPlayPublishers), so it must exist on databases created before it.
-  addColumnIfMissing('discovered_apps', 'list_developer', 'TEXT');
-  addColumnIfMissing('discovered_apps', 'list_developer_id', 'TEXT');
-  getDb().exec(
-    `CREATE INDEX IF NOT EXISTS idx_discovered_apps_listdev ON discovered_apps(store, list_developer);`,
-  );
-
-  backfillDiscoveryDepth();
-}
-
-/** Idempotent ALTER: adds `column` to `table` only when it isn't already there. */
-function addColumnIfMissing(table: string, column: string, decl: string): void {
-  const db = getDb();
-  const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
-  if (cols.length === 0) return; // table not created yet — the DDL above owns it
-  if (cols.some((c) => c.name === column)) return;
-  db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${decl}`);
-  log.info(`store-discovery: added missing column ${table}.${column}`);
+/**
+ * What used to be here: `ensureStoreDiscoveryTables()`, a wall of
+ * `CREATE TABLE IF NOT EXISTS` followed by `addColumnIfMissing()` calls that
+ * read `PRAGMA table_info` and ALTERed anything a previous release had not
+ * created. Every one of those tables and columns is now migration 1
+ * (migrations.ts), applied once and recorded, so none of it has anything left
+ * to do — and `PRAGMA` was SQLite-only in any case.
+ *
+ * What remains is the one repair that is about DATA rather than shape.
+ */
+export async function runStoreDiscoveryBootRepairs(): Promise<void> {
+  await backfillDiscoveryDepth();
 }
 
 /**
@@ -271,20 +145,20 @@ function addColumnIfMissing(table: string, column: string, decl: string): void {
  */
 const DEPTH_BACKFILL_MARKER = 'store_discovery.depth_backfill_v1';
 
-function backfillDiscoveryDepth(): void {
+async function backfillDiscoveryDepth(): Promise<void>{
   const db = getDb();
-  const done = db.prepare(`SELECT value FROM settings WHERE key = ?`).get(DEPTH_BACKFILL_MARKER);
+  const done = await db.prepare(`SELECT value FROM settings WHERE key = ?`).get(DEPTH_BACKFILL_MARKER);
   if (done) return;
-  const nonGraph = db
+  const nonGraph = await db
     .prepare(
       `UPDATE discovered_apps SET discovery_depth = ?
         WHERE source IN ('search', 'developer_catalog') AND discovery_depth < ?`,
     )
     .run(NON_GRAPH_DEPTH, NON_GRAPH_DEPTH);
-  const flattened = db
+  const flattened = await db
     .prepare(`UPDATE discovered_apps SET discovery_depth = ? WHERE source = 'similar' AND discovery_depth = 0`)
     .run(SIMILAR_MAX_DEPTH);
-  db.prepare(
+  await db.prepare(
     `INSERT INTO settings (key, value, updated_at) VALUES (?, '1', ?)
        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
   ).run(DEPTH_BACKFILL_MARKER, Date.now());
@@ -384,24 +258,40 @@ export function bestChartSighting(args: {
   };
 }
 
-export function upsertDiscoveredApp(input: UpsertAppInput): { id: number; inserted: boolean } {
+export async function upsertDiscoveredApp(
+  input: UpsertAppInput,
+  retry = 0,
+): Promise<{ id: number; inserted: boolean }> {
   const now = Date.now();
   const db = getDb();
-  const existing = db
+  const existing = await db
     .prepare(`SELECT id, rank, chart FROM discovered_apps WHERE store = ? AND app_id = ? AND country = ?`)
     .get(input.store, input.app_id, input.country) as
     | { id: number; rank: number | null; chart: string | null }
     | undefined;
 
   if (!existing) {
-    const info = db
+    // RETURNING id, because `lastInsertRowid` was a better-sqlite3 concept and
+    // has no equivalent here — the identity value has to be asked for.
+    //
+    // ON CONFLICT DO NOTHING covers the gap the port opened: the SELECT above
+    // and this INSERT used to be one uninterruptible synchronous turn, so
+    // "no row exists" could not stop being true between them. Two pipeline
+    // workers can now interleave there, and UNIQUE(store, app_id, country)
+    // would turn that race into a thrown error mid-crawl. When the insert is
+    // skipped, `inserted` comes back undefined and the retry below takes the
+    // update path — exactly what this call would have done had it read a
+    // moment later.
+    const inserted = (await db
       .prepare(
         `INSERT INTO discovered_apps
            (store, app_id, title, vertical, country, source, discovery_depth, chart, rank, first_seen_at, last_seen_at, last_rank,
             list_developer, list_developer_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (store, app_id, country) DO NOTHING
+         RETURNING id`,
       )
-      .run(
+      .get(
         input.store,
         input.app_id,
         input.title ?? null,
@@ -416,8 +306,16 @@ export function upsertDiscoveredApp(input: UpsertAppInput): { id: number; insert
         input.rank ?? null,
         emptyToNull(input.list_developer),
         emptyToNull(input.list_developer_id),
+      )) as { id: number } | undefined;
+    if (inserted) return { id: Number(inserted.id), inserted: true };
+    // Lost the race. Re-read and fall through to the update path; `retry`
+    // bounds it so a genuinely impossible state cannot spin forever.
+    if (retry >= 2) {
+      throw new Error(
+        `upsertDiscoveredApp: ${input.store}/${input.app_id}/${input.country} neither inserted nor found after ${retry} attempts`,
       );
-    return { id: Number(info.lastInsertRowid), inserted: true };
+    }
+    return await upsertDiscoveredApp(input, retry + 1);
   }
 
   // Update: always refresh last_seen; keep title/vertical if newly known; a chart
@@ -430,7 +328,7 @@ export function upsertDiscoveredApp(input: UpsertAppInput): { id: number; insert
     newRank: input.rank ?? null,
     newChart: input.chart ?? null,
   });
-  db.prepare(
+  await db.prepare(
     `UPDATE discovered_apps
         SET last_seen_at = ?,
             title = COALESCE(?, title),
@@ -439,7 +337,7 @@ export function upsertDiscoveredApp(input: UpsertAppInput): { id: number; insert
             chart = CASE WHEN ? = 1 THEN ? ELSE chart END,
             rank = CASE WHEN ? = 1 THEN ? ELSE rank END,
             last_rank = CASE WHEN ? = 1 THEN ? ELSE last_rank END,
-            discovery_depth = CASE WHEN ? = 1 THEN MIN(discovery_depth, ?) ELSE discovery_depth END,
+            discovery_depth = CASE WHEN ? = 1 THEN LEAST(discovery_depth, ?) ELSE discovery_depth END,
             -- COALESCE(existing, new): first writer wins, and a later sighting
             -- that happens to omit the identity can never blank one we already
             -- hold. (Same shape as title/vertical above, opposite argument order
@@ -472,9 +370,9 @@ export function upsertDiscoveredApp(input: UpsertAppInput): { id: number; insert
   return { id: existing.id, inserted: false };
 }
 
-export function getDiscoveredApp(store: StoreKind, appId: string, country: string): DiscoveredAppRow | null {
+export async function getDiscoveredApp(store: StoreKind, appId: string, country: string): Promise<DiscoveredAppRow | null>{
   return (
-    (getDb()
+    (await getDb()
       .prepare(`SELECT * FROM discovered_apps WHERE store = ? AND app_id = ? AND country = ?`)
       .get(store, appId, country) as DiscoveredAppRow) ?? null
   );
@@ -499,10 +397,10 @@ export const sightedCountrySql = (col: string): string =>
  *  storefront the detail fetch must run against (see sightedCountrySql) —
  *  fetching a geo-restricted app elsewhere 404s it into a permanent 'failed'
  *  after MAX_ENRICH_ATTEMPTS. */
-export function distinctAppsForStore(
+export async function distinctAppsForStore(
   store: StoreKind,
-): Array<{ app_id: string; min_depth: number; is_chart: number; country: string }> {
-  return getDb()
+): Promise<{ app_id: string; min_depth: number; is_chart: number; country: string; }[]>{
+  return await getDb()
     .prepare(
       `SELECT app_id,
               MIN(discovery_depth) AS min_depth,
@@ -531,17 +429,17 @@ export function distinctAppsForStore(
  * geo-restricted seed queried in us yields nothing and contributes zero graph
  * edges — the same silent loss the enrichment and catalog phases guard against.
  */
-export function similarSeedApps(
+export async function similarSeedApps(
   store: StoreKind,
   depth: number,
   verticals: string[],
-): Array<{ app_id: string; vertical: string | null; country: string }> {
+): Promise<{ app_id: string; vertical: string | null; country: string; }[]>{
   if (verticals.length === 0) return [];
   const placeholders = verticals.map(() => '?').join(',');
   // MIN(vertical) just picks one deterministic vertical for an app sighted under
   // several; it is carried onto the app's similar results so vertical attribution
   // survives the crawl (a depth-1 app has no chart vertical of its own).
-  return getDb()
+  return await getDb()
     .prepare(
       `SELECT app_id,
               MIN(vertical) AS vertical,
@@ -555,13 +453,13 @@ export function similarSeedApps(
     .all(store, ...verticals, depth) as Array<{ app_id: string; vertical: string | null; country: string }>;
 }
 
-export function countDiscoveredApps(): number {
-  return (getDb().prepare(`SELECT COUNT(*) AS n FROM discovered_apps`).get() as { n: number }).n;
+export async function countDiscoveredApps(): Promise<number>{
+  return (await getDb().prepare(`SELECT COUNT(*) AS n FROM discovered_apps`).get() as { n: number }).n;
 }
 
 /** Source → count across all discovered_apps (funnel widget input). */
-export function discoveredCountsBySource(): Record<string, number> {
-  const rows = getDb()
+export async function discoveredCountsBySource(): Promise<Record<string, number>>{
+  const rows = await getDb()
     .prepare(`SELECT source, COUNT(*) AS n FROM discovered_apps GROUP BY source`)
     .all() as Array<{ source: string; n: number }>;
   const out: Record<string, number> = {};
@@ -571,16 +469,16 @@ export function discoveredCountsBySource(): Record<string, number> {
 
 // ── store_app_detail (permanent enrichment cache) helpers ────────────────────
 
-export function getAppDetail(store: StoreKind, appId: string): StoreAppDetailRow | null {
+export async function getAppDetail(store: StoreKind, appId: string): Promise<StoreAppDetailRow | null>{
   return (
-    (getDb().prepare(`SELECT * FROM store_app_detail WHERE store = ? AND app_id = ?`).get(store, appId) as
+    (await getDb().prepare(`SELECT * FROM store_app_detail WHERE store = ? AND app_id = ?`).get(store, appId) as
       | StoreAppDetailRow) ?? null
   );
 }
 
-export function upsertAppDetail(rec: Omit<StoreAppDetailRow, 'created_at' | 'updated_at'>): void {
+export async function upsertAppDetail(rec: Omit<StoreAppDetailRow, 'created_at' | 'updated_at'>): Promise<void>{
   const now = Date.now();
-  getDb()
+  await getDb()
     .prepare(
       `INSERT INTO store_app_detail
          (store, app_id, title, developer, developer_id, developer_email, developer_website,
@@ -724,11 +622,11 @@ export function mergePublisherFields(survivor: PublisherRow, orphan: PublisherRo
  * duplicating them. The JOIN keeps a key that outlived an absorbed row from
  * resolving to an id that is gone.
  */
-function resolvePublisherIds(keys: string[]): number[] {
+async function resolvePublisherIds(keys: string[]): Promise<number[]>{
   if (keys.length === 0) return [];
   const ph = keys.map(() => '?').join(',');
   return (
-    getDb()
+    await getDb()
       .prepare(
         `SELECT p.id AS id FROM publisher_identity i JOIN publishers p ON p.id = i.publisher_id
           WHERE i.identity_key IN (${ph})
@@ -742,12 +640,12 @@ function resolvePublisherIds(keys: string[]): number[] {
 
 /** Point every key at `publisherId`. Keys are cumulative: an identity a
  *  publisher was once known by keeps resolving to it after its merge_key moves. */
-function rememberPublisherIdentity(publisherId: number, keys: string[]): void {
-  const stmt = getDb().prepare(
+async function rememberPublisherIdentity(publisherId: number, keys: string[]): Promise<void>{
+  const stmt = await getDb().prepare(
     `INSERT INTO publisher_identity (identity_key, publisher_id) VALUES (?, ?)
      ON CONFLICT(identity_key) DO UPDATE SET publisher_id = excluded.publisher_id`,
   );
-  for (const k of keys) stmt.run(k, publisherId);
+  for (const k of keys) await stmt.run(k, publisherId);
 }
 
 /**
@@ -756,13 +654,13 @@ function rememberPublisherIdentity(publisherId: number, keys: string[]): void {
  * claims BOTH rows — the same domain/name/developerId evidence the rollup
  * merges on — and once the orphan is gone there is nothing left to absorb.
  */
-function absorbPublisher(survivorId: number, orphanId: number): void {
+async function absorbPublisher(survivorId: number, orphanId: number): Promise<void>{
   if (survivorId === orphanId) return;
   const db = getDb();
-  const survivor = getPublisher(survivorId);
-  const orphan = getPublisher(orphanId);
+  const survivor = await getPublisher(survivorId);
+  const orphan = await getPublisher(orphanId);
   if (!survivor || !orphan) return;
-  db.prepare(
+  await db.prepare(
     `UPDATE publishers
         SET name = @name, play_developer_id = @play_developer_id, apple_seller_name = @apple_seller_name,
             website = @website, email = @email, countries_charted = @countries_charted,
@@ -775,8 +673,8 @@ function absorbPublisher(survivorId: number, orphanId: number): void {
             updated_at = @now
       WHERE id = @id`,
   ).run({ ...mergePublisherFields(survivor, orphan), id: survivorId, now: Date.now() });
-  db.prepare(`UPDATE publisher_identity SET publisher_id = ? WHERE publisher_id = ?`).run(survivorId, orphanId);
-  db.prepare(`DELETE FROM publishers WHERE id = ?`).run(orphanId);
+  await db.prepare(`UPDATE publisher_identity SET publisher_id = ? WHERE publisher_id = ?`).run(survivorId, orphanId);
+  await db.prepare(`DELETE FROM publishers WHERE id = ?`).run(orphanId);
   log.info(`store-discovery: absorbed duplicate publisher #${orphanId} into #${survivorId} ("${survivor.name}")`);
 }
 
@@ -793,7 +691,7 @@ function absorbPublisher(survivorId: number, orphanId: number): void {
  * runs over a growing corpus converge on one row, and folds in any duplicate an
  * earlier run already created.
  */
-export function upsertPublisher(
+export async function upsertPublisher(
   p: PublisherUpsert,
   identityKeys: string[],
   opts?: {
@@ -812,7 +710,7 @@ export function upsertPublisher(
      */
     preserveEnriched?: boolean;
   },
-): number {
+): Promise<number>{
   const now = Date.now();
   const db = getDb();
   const keys = [...new Set([p.merge_key, ...identityKeys])];
@@ -821,14 +719,14 @@ export function upsertPublisher(
   // statement below lands on it through its own ON CONFLICT and insert/update
   // stay one code path. Any other row the group claims is absorbed first, which
   // is also what frees that merge_key if a duplicate happened to hold it.
-  const claimed = resolvePublisherIds(keys);
+  const claimed = await resolvePublisherIds(keys);
   if (claimed.length > 0) {
     const survivorId = claimed[0]; // oldest row wins, so created_at survives
-    for (const orphanId of claimed.slice(1)) absorbPublisher(survivorId, orphanId);
-    db.prepare(`UPDATE publishers SET merge_key = ? WHERE id = ?`).run(p.merge_key, survivorId);
+    for (const orphanId of claimed.slice(1)) await absorbPublisher(survivorId, orphanId);
+    await db.prepare(`UPDATE publishers SET merge_key = ? WHERE id = ?`).run(p.merge_key, survivorId);
   }
 
-  db.prepare(
+  await db.prepare(
     `INSERT INTO publishers
        (merge_key, name, play_developer_id, apple_seller_name, website, email, countries_charted, countries_seen, verticals,
         charted_app_count, app_count, best_rank, both_stores, in_band, source_mix, gatc_advertiser_id,
@@ -848,17 +746,17 @@ export function upsertPublisher(
         countries_charted = publishers.countries_charted,
         countries_seen = publishers.countries_seen,
         verticals = publishers.verticals,
-        charted_app_count = MAX(publishers.charted_app_count, excluded.charted_app_count),
-        app_count = MAX(publishers.app_count, excluded.app_count),
+        charted_app_count = GREATEST(publishers.charted_app_count, excluded.charted_app_count),
+        app_count = GREATEST(publishers.app_count, excluded.app_count),
         best_rank = CASE
           WHEN publishers.best_rank IS NULL THEN excluded.best_rank
           WHEN excluded.best_rank IS NULL THEN publishers.best_rank
-          ELSE MIN(publishers.best_rank, excluded.best_rank) END,
+          ELSE LEAST(publishers.best_rank, excluded.best_rank) END,
         both_stores = publishers.both_stores,
         in_band = publishers.in_band,
         source_mix = publishers.source_mix,
         is_game_publisher = publishers.is_game_publisher,
-        is_charted = MAX(publishers.is_charted, excluded.is_charted),
+        is_charted = GREATEST(publishers.is_charted, excluded.is_charted),
         preview_url = COALESCE(publishers.preview_url, excluded.preview_url),
         preview_title = COALESCE(publishers.preview_title, excluded.preview_title),`
          : `name = excluded.name,
@@ -882,8 +780,8 @@ export function upsertPublisher(
      }
         updated_at = @now`,
   ).run({ ...p, now });
-  const row = db.prepare(`SELECT id FROM publishers WHERE merge_key = ?`).get(p.merge_key) as { id: number };
-  rememberPublisherIdentity(row.id, keys);
+  const row = await db.prepare(`SELECT id FROM publishers WHERE merge_key = ?`).get(p.merge_key) as { id: number };
+  await rememberPublisherIdentity(row.id, keys);
   return row.id;
 }
 
@@ -900,15 +798,15 @@ export function upsertPublisher(
  * back to unconfirmed. A provider that genuinely re-measures and finds zero can
  * still decay the flag — only a pass that measured nothing leaves it alone.
  */
-export function setPublisherConfirmation(
+export async function setPublisherConfirmation(
   id: number,
   fields: {
     gatc_advertiser_id: string | null;
     gatc_ads_count: number | null;
     meta_active_ads: number | null;
   },
-): void {
-  getDb()
+): Promise<void>{
+  await getDb()
     .prepare(
       `UPDATE publishers
           SET gatc_advertiser_id = COALESCE(?, gatc_advertiser_id),
@@ -934,37 +832,37 @@ export function setPublisherConfirmation(
     );
 }
 
-export function setPublisherScore(id: number, score: number): void {
-  getDb().prepare(`UPDATE publishers SET score = ?, updated_at = ? WHERE id = ?`).run(score, Date.now(), id);
+export async function setPublisherScore(id: number, score: number): Promise<void>{
+  await getDb().prepare(`UPDATE publishers SET score = ?, updated_at = ? WHERE id = ?`).run(score, Date.now(), id);
 }
 
-export function getPublisher(id: number): PublisherRow | null {
-  return (getDb().prepare(`SELECT * FROM publishers WHERE id = ?`).get(id) as PublisherRow) ?? null;
+export async function getPublisher(id: number): Promise<PublisherRow | null>{
+  return (await getDb().prepare(`SELECT * FROM publishers WHERE id = ?`).get(id) as PublisherRow) ?? null;
 }
 
-export function listPublishersByScore(limit = 5000): PublisherRow[] {
-  return getDb()
+export async function listPublishersByScore(limit = 5000): Promise<PublisherRow[]>{
+  return await getDb()
     .prepare(`SELECT * FROM publishers ORDER BY score DESC, charted_app_count DESC LIMIT ?`)
     .all(limit) as PublisherRow[];
 }
 
-export function countPublishers(): number {
-  return (getDb().prepare(`SELECT COUNT(*) AS n FROM publishers`).get() as { n: number }).n;
+export async function countPublishers(): Promise<number>{
+  return (await getDb().prepare(`SELECT COUNT(*) AS n FROM publishers`).get() as { n: number }).n;
 }
 
-export function countConfirmedPublishers(): number {
-  return (getDb().prepare(`SELECT COUNT(*) AS n FROM publishers WHERE confirmed_advertiser = 1`).get() as { n: number }).n;
+export async function countConfirmedPublishers(): Promise<number>{
+  return (await getDb().prepare(`SELECT COUNT(*) AS n FROM publishers WHERE confirmed_advertiser = 1`).get() as { n: number }).n;
 }
 
 /** Count of apps with a successful enrichment (funnel widget). */
-export function countEnrichedApps(): number {
-  return (getDb().prepare(`SELECT COUNT(*) AS n FROM store_app_detail WHERE enrich_status = 'done'`).get() as { n: number }).n;
+export async function countEnrichedApps(): Promise<number>{
+  return (await getDb().prepare(`SELECT COUNT(*) AS n FROM store_app_detail WHERE enrich_status = 'done'`).get() as { n: number }).n;
 }
 
 /** Count of enriched Play apps whose minInstalls falls in [min,max] (funnel). */
-export function countInBandApps(min: number, max: number): number {
+export async function countInBandApps(min: number, max: number): Promise<number>{
   return (
-    getDb()
+    await getDb()
       .prepare(
         `SELECT COUNT(*) AS n FROM store_app_detail
           WHERE store = 'google_play' AND enrich_status = 'done'
@@ -974,8 +872,8 @@ export function countInBandApps(min: number, max: number): number {
   ).n;
 }
 
-export function countPublishersWithEmail(): number {
-  return (getDb()
+export async function countPublishersWithEmail(): Promise<number>{
+  return (await getDb()
     .prepare(`SELECT COUNT(*) AS n FROM publishers WHERE email IS NOT NULL AND email <> ''`)
     .get() as { n: number }).n;
 }
@@ -992,8 +890,8 @@ export function countPublishersWithEmail(): number {
  * budget was spent in SQLite insertion order and could be exhausted entirely on
  * out-of-band tail developers before a single charted one was reached.
  */
-export function playDevelopersWithContact(): Array<{ id: string; country: string }> {
-  return getDb()
+export async function playDevelopersWithContact(): Promise<{ id: string; country: string; }[]>{
+  return await getDb()
     .prepare(
       `SELECT d.developer_id AS id,
               ${sightedCountrySql('a.country')} AS country
@@ -1004,17 +902,17 @@ export function playDevelopersWithContact(): Array<{ id: string; country: string
           AND (d.developer_website IS NOT NULL OR d.developer_email IS NOT NULL)
         GROUP BY d.developer_id
         ORDER BY MAX(CASE WHEN a.source = 'chart' THEN 1 ELSE 0 END) DESC,
-                 MAX(CASE WHEN d.min_installs BETWEEN @min AND @max THEN 1 ELSE 0 END) DESC,
+                 MAX(CASE WHEN d.min_installs BETWEEN ? AND ? THEN 1 ELSE 0 END) DESC,
                  MAX(COALESCE(d.min_installs, 0)) DESC`,
     )
-    .all({ min: TAIL_MIN_INSTALLS, max: TAIL_MAX_INSTALLS }) as Array<{ id: string; country: string }>;
+    .all(TAIL_MIN_INSTALLS, TAIL_MAX_INSTALLS) as Array<{ id: string; country: string }>;
 }
 
 /** Distinct Apple artistIds whose enriched detail carries a seller URL — the
  *  step-8 developer-catalog expansion set (Apple). Charted artists first, for
  *  the same budget reason as the Play list above; `country` as there. */
-export function appleArtistsWithContact(): Array<{ id: string; country: string }> {
-  return getDb()
+export async function appleArtistsWithContact(): Promise<{ id: string; country: string; }[]>{
+  return await getDb()
     .prepare(
       `SELECT d.artist_id AS id,
               ${sightedCountrySql('a.country')} AS country
@@ -1050,16 +948,16 @@ export function appleArtistsWithContact(): Array<{ id: string; country: string }
  * on a 15-second timer just to discover that nothing moved. This is one indexed
  * count, so an idle tick costs effectively nothing.
  */
-export function countDoneAppDetails(): number {
+export async function countDoneAppDetails(): Promise<number>{
   return (
-    getDb()
+    await getDb()
       .prepare(`SELECT COUNT(*) AS c FROM store_app_detail WHERE enrich_status = 'done' AND delisted_at IS NULL`)
       .get() as { c: number }
   ).c;
 }
 
-export function allDoneAppDetails(): StoreAppDetailRow[] {
-  return getDb()
+export async function allDoneAppDetails(): Promise<StoreAppDetailRow[]>{
+  return await getDb()
     .prepare(`SELECT * FROM store_app_detail WHERE enrich_status = 'done' AND delisted_at IS NULL`)
     .all() as StoreAppDetailRow[];
 }
@@ -1081,13 +979,13 @@ export function allDoneAppDetails(): StoreAppDetailRow[] {
  * per staleness window, and markAppLiveness clears the tombstone the moment the
  * store answers with the listing again.
  */
-export function listLivenessCandidates(
+export async function listLivenessCandidates(
   store: StoreKind,
   staleBefore: number,
   limit: number,
-): Array<{ app_id: string; country: string }> {
+): Promise<{ app_id: string; country: string; }[]>{
   if (limit <= 0) return [];
-  return getDb()
+  return await getDb()
     .prepare(
       `SELECT d.app_id AS app_id,
               ${sightedCountrySql('a.country')} AS country
@@ -1109,8 +1007,8 @@ export function listLivenessCandidates(
  * advances the checked-at stamp. Callers must never pass an inconclusive result
  * here — 'unknown' means ask again later, not gone.
  */
-export function markAppLiveness(store: StoreKind, appId: string, gone: boolean): void {
-  getDb()
+export async function markAppLiveness(store: StoreKind, appId: string, gone: boolean): Promise<void>{
+  await getDb()
     .prepare(
       `UPDATE store_app_detail
           SET last_live_check_at = @now,
@@ -1121,8 +1019,8 @@ export function markAppLiveness(store: StoreKind, appId: string, gone: boolean):
 }
 
 /** Count of apps currently tombstoned as removed from their store. */
-export function countDelistedApps(): number {
-  return (getDb().prepare(`SELECT COUNT(*) AS n FROM store_app_detail WHERE delisted_at IS NOT NULL`).get() as {
+export async function countDelistedApps(): Promise<number>{
+  return (await getDb().prepare(`SELECT COUNT(*) AS n FROM store_app_detail WHERE delisted_at IS NOT NULL`).get() as {
     n: number;
   }).n;
 }
@@ -1130,8 +1028,8 @@ export function countDelistedApps(): number {
 /** Every identity key → publisher mapping. Lets a caller attribute an app to the
  *  publisher that OWNS it even after a merge, rather than to whichever single
  *  developerId/sellerName happened to land on the publishers row. */
-export function allPublisherIdentities(): Array<{ identity_key: string; publisher_id: number }> {
-  return getDb()
+export async function allPublisherIdentities(): Promise<{ identity_key: string; publisher_id: number; }[]>{
+  return await getDb()
     .prepare(`SELECT identity_key, publisher_id FROM publisher_identity`)
     .all() as Array<{ identity_key: string; publisher_id: number }>;
 }
@@ -1148,8 +1046,8 @@ export interface DiscoveredLite {
 
 /** Minimal discovered_apps projection used to aggregate a publisher's chart
  *  provenance (countries, best rank, source mix, verticals) during rollup. */
-export function allDiscoveredLite(): DiscoveredLite[] {
-  return getDb()
+export async function allDiscoveredLite(): Promise<DiscoveredLite[]>{
+  return await getDb()
     .prepare(`SELECT store, app_id, country, source, rank, vertical, title FROM discovered_apps`)
     .all() as DiscoveredLite[];
 }
@@ -1262,8 +1160,8 @@ interface RawDevGroup {
  * Raw per-developer aggregates straight from SQL. Grouped on the RAW name here
  * (SQL cannot call mergeNameKey); the caller folds these into normalised groups.
  */
-export function rawPlayListDeveloperGroups(limit = 20_000): RawDevGroup[] {
-  return getDb()
+export async function rawPlayListDeveloperGroups(limit = 20_000): Promise<RawDevGroup[]>{
+  return await getDb()
     .prepare(
       `WITH preview AS (
          -- The group's representative app, chosen DETERMINISTICALLY.
@@ -1299,8 +1197,8 @@ export function rawPlayListDeveloperGroups(limit = 20_000): RawDevGroup[] {
               SUM(CASE WHEN d.source = 'search' THEN 1 ELSE 0 END)    AS src_search,
               SUM(CASE WHEN d.source = 'similar' THEN 1 ELSE 0 END)   AS src_similar,
               SUM(CASE WHEN d.source = 'developer_catalog' THEN 1 ELSE 0 END) AS src_catalog,
-              GROUP_CONCAT(DISTINCT d.country)                       AS countries,
-              GROUP_CONCAT(DISTINCT d.vertical)                      AS verticals,
+              string_agg(DISTINCT d.country, ',')                    AS countries,
+              string_agg(DISTINCT d.vertical, ',')                   AS verticals,
               -- From the CTE above: deterministic, not implementation-defined.
               MAX(pv.app_id)                                         AS preview_app_id,
               MAX(pv.title)                                          AS preview_title
@@ -1321,9 +1219,9 @@ export function rawPlayListDeveloperGroups(limit = 20_000): RawDevGroup[] {
 
 /** Play rows carrying list identity — the fast lane's input size. One indexed
  *  count, used to skip the whole pass when nothing new has been discovered. */
-export function countPlayListIdentityRows(): number {
+export async function countPlayListIdentityRows(): Promise<number>{
   return (
-    getDb()
+    await getDb()
       .prepare(
         `SELECT COUNT(*) AS c FROM discovered_apps
           WHERE store = 'google_play' AND list_developer IS NOT NULL AND TRIM(list_developer) <> ''`,
@@ -1335,13 +1233,13 @@ export function countPlayListIdentityRows(): number {
 /** Apps of the given RAW developer names that still lack enrichment — the
  *  "enrich only the winners" worklist. Chart apps first, so contact details come
  *  from the publisher's most visible titles. */
-export function unenrichedAppsForPlayDevelopers(
+export async function unenrichedAppsForPlayDevelopers(
   rawDevelopers: string[],
   limit = 25,
-): Array<{ app_id: string; country: string }> {
+): Promise<{ app_id: string; country: string; }[]>{
   if (rawDevelopers.length === 0) return [];
   const holes = rawDevelopers.map(() => '?').join(',');
-  return getDb()
+  return await getDb()
     .prepare(
       `SELECT d.app_id, d.country
          FROM discovered_apps d
@@ -1355,8 +1253,8 @@ export function unenrichedAppsForPlayDevelopers(
     .all(...rawDevelopers, limit) as Array<{ app_id: string; country: string }>;
 }
 
-export function listPublishersForConfirmation(): PublisherRow[] {
-  return getDb()
+export async function listPublishersForConfirmation(): Promise<PublisherRow[]>{
+  return await getDb()
     .prepare(
       `SELECT * FROM publishers
         WHERE is_charted = 1 OR in_band = 1

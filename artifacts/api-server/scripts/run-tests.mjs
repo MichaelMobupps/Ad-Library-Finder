@@ -15,9 +15,8 @@
  * are listed in NETWORK_MODULES and skipped by default (pass --all to include).
  */
 
-import { readdirSync, readFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { readdirSync, readFileSync, existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
-import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -85,15 +84,32 @@ console.log(
     `${totalPassed} assertions passed, ${totalFailed} failed`,
 );
 
-// Fast-lane gate: needs a REAL sqlite database, so it runs in a throwaway cwd
-// (db.ts resolves data/ relative to the working directory) — that keeps the
-// dev database untouched while still exercising the actual rollup/merge code.
-const flDir = mkdtempSync(path.join(tmpdir(), 'fastlane-'));
-const fastLane = spawnSync(process.execPath, [path.join(ROOT, 'scripts', 'check-fast-lane.mjs')], {
-  cwd: flDir,
+// Storage-seam source gate: the sqlite file stays banned from server code, no
+// storage write is left unawaited, and no shipped migration is destructive.
+// Static — it reads the source and the built migrations, and touches no
+// database at all — so it runs first and fails fast.
+const seam = spawnSync(process.execPath, [path.join(ROOT, 'scripts', 'check-storage-seam.mjs')], {
+  cwd: ROOT,
   encoding: 'utf8',
 });
-rmSync(flDir, { recursive: true, force: true });
+if (seam.status === 0) {
+  for (const line of `${seam.stdout || ''}`.trim().split('\n')) {
+    if (line.trim()) console.log(line);
+  }
+} else {
+  console.log('  ✗ STORAGE SEAM BROKEN');
+  for (const line of `${seam.stdout || ''}${seam.stderr || ''}`.trim().split('\n')) console.log(`      ${line}`);
+  failedModules.push('storage-seam');
+}
+
+// Fast-lane gate: needs a REAL database, so it builds its own ephemeral
+// PostgreSQL cluster (scripts/pgtest.mjs) and deletes it afterwards. It used to
+// need a throwaway cwd instead, because db.ts resolved data/ relative to the
+// working directory; since order L-3.4g there is no such file to escape from.
+const fastLane = spawnSync(process.execPath, [path.join(ROOT, 'scripts', 'check-fast-lane.mjs')], {
+  cwd: ROOT,
+  encoding: 'utf8',
+});
 if (fastLane.status === 0) {
   console.log('  ✓ fast lane (provisional publisher ↔ full rollup) invariants hold');
 } else {

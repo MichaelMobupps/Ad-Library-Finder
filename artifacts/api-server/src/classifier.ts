@@ -174,7 +174,7 @@ Respond ONLY with this JSON shape, no preamble, no markdown:
 {"classification": "<one of the four>", "store_url": "<url or null>"}`;
 
   try {
-    assertBudget('classifier');
+    await assertBudget('classifier');
     const res = await getClient().messages.create({
       model: 'claude-sonnet-4-5',
       max_tokens: 8000,
@@ -182,7 +182,7 @@ Respond ONLY with this JSON shape, no preamble, no markdown:
       thinking: { type: 'enabled', budget_tokens: 3000 },
       messages: [{ role: 'user', content: prompt }],
     });
-    recordSpend('classifier', 'claude-sonnet-4-5', res.usage);
+    await recordSpend('classifier', 'claude-sonnet-4-5', res.usage);
 
     const textBlock = res.content.find((b) => b.type === 'text');
     if (!textBlock || textBlock.type !== 'text') {

@@ -141,7 +141,7 @@ export async function resolveWebHq(
 }
 
 export async function runHqSplitWeb(opts: SplitOptions): Promise<WebHqSplitOutcome> {
-  ensureHqCacheTable();
+  await ensureHqCacheTable();
   if (!existsSync(ZIP_DIR)) mkdirSync(ZIP_DIR, { recursive: true });
 
   const web = opts.results.filter((r) => r.classification === 'cps_web' && r.landing_url);
@@ -168,7 +168,7 @@ export async function runHqSplitWeb(opts: SplitOptions): Promise<WebHqSplitOutco
     const r = web[i];
     const url = r.landing_url!;
 
-    let hq: ResolvedHq | null = lookupHqCache(url);
+    let hq: ResolvedHq | null = await lookupHqCache(url);
     if (hq) {
       outcome.cacheHits++;
     } else {
@@ -184,7 +184,7 @@ export async function runHqSplitWeb(opts: SplitOptions): Promise<WebHqSplitOutco
         else outcome.llmCalls++;
 
         hq = await resolveWebHq(url, r.advertiser_name || '', r.ad_text || '');
-        storeHqCache(url, hq);
+        await storeHqCache(url, hq);
       } catch (err) {
         if (err instanceof BudgetExceededError) throw err;
         opts.onLog('error', `web-hq-split: resolve threw for ${url} — ${(err as Error).message}`);
@@ -274,7 +274,7 @@ const isMain =
   process.argv[1] &&
   (process.argv[1].endsWith('hqSplitWeb.js') || process.argv[1].endsWith('hqSplitWeb.ts'));
 if (isMain) {
-  runHqSplitWebUnitTests().then(({ passed, failed, failures }) => {
+  void runHqSplitWebUnitTests().then(({ passed, failed, failures }) => {
     console.log(`hqSplitWeb unit tests: ${passed} passed, ${failed} failed`);
     for (const f of failures) console.log('  ' + f);
     process.exit(failed === 0 ? 0 : 1);
