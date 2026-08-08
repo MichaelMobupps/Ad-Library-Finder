@@ -23,6 +23,12 @@
  *   4. THE SERVER REFUSES TO BOOT WITHOUT A DATABASE. No fallback, no local
  *      file, no silent degradation.
  *
+ *   5. THE DATABASE PASSWORD NEVER REACHES THE LOG. `DATABASE_URL` carries a
+ *      credential, and the boot line names the backend. Proved by booting
+ *      against a URL that HAS a password and reading every byte the process
+ *      wrote — the cluster uses trust auth, so the password is accepted and
+ *      ignored, which is exactly what makes it a usable canary.
+ *
  * Every phase runs against an ephemeral cluster. The queue is NEVER started, so
  * no job executes, nothing is scraped and no mail is sent.
  *
@@ -248,6 +254,31 @@ try {
     check(
       !/sqlite|data\/ad-library/i.test(out),
       'it does not fall back to a local file (no sqlite anywhere in the failure)',
+    );
+  }
+
+  // ── 5. the password never reaches the log ────────────────────────────────
+  {
+    const CANARY = 'pAssw0rd-canary-must-not-appear';
+    // Same socket, same database — only a password is added. Trust auth accepts
+    // it and ignores it, so this boots normally while giving us a string that
+    // must not survive into any output.
+    const withPassword = cluster.url.replace('postgres@localhost', `postgres:${CANARY}@localhost`);
+    const res = spawnSync(process.execPath, [SELF, '--phase=read'], {
+      cwd: ROOT,
+      encoding: 'utf8',
+      env: { ...childEnv(), DATABASE_URL: withPassword },
+    });
+    const out = `${res.stdout || ''}${res.stderr || ''}`;
+    check(res.status === 0, 'phase 5: the server boots against a password-bearing DATABASE_URL');
+    check(!out.includes(CANARY), 'phase 5: the password appears NOWHERE in the process output');
+    check(
+      /db: postgres [^\s]+ — migrations/.test(out),
+      'phase 5: the boot line still names the backend (host:port/database)',
+    );
+    check(
+      !/postgresql:\/\//.test(out) && !/postgres:\/\//.test(out),
+      'phase 5: no raw connection URL is printed at all',
     );
   }
 

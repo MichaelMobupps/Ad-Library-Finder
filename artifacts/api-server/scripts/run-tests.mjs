@@ -139,6 +139,27 @@ if (durability.status === 0) {
   failedModules.push('durability');
 }
 
+// L-3.4g smoke: both modes on separate ports against ephemeral clusters, with
+// the runner disabled. Pins the property the whole order exists for — the
+// rescued chief job answers over the seam EXACTLY as the live deployment did,
+// compared against the recorded fixture rather than a hand-written expectation
+// — plus byte-identical baseline probes across modes and a download that
+// survives a real restart. Kept in the gate rather than run by hand, because a
+// smoke nobody runs is a smoke that rots.
+const smoke = spawnSync(process.execPath, [path.join(ROOT, 'scripts', 'smoke-l34g.mjs')], {
+  cwd: ROOT,
+  encoding: 'utf8',
+});
+if (smoke.status === 0) {
+  console.log('  ✓ L-3.4g smoke (seam parity with live, both modes, downloads across a restart)');
+} else {
+  console.log('  ✗ L-3.4g SMOKE BROKEN');
+  for (const line of `${smoke.stdout || ''}${smoke.stderr || ''}`.trim().split('\n')) {
+    if (!/^\[\d{4}-/.test(line)) console.log(`      ${line}`);
+  }
+  failedModules.push('smoke-l34g');
+}
+
 // Cross-package mirror gate: constants/validators duplicated into the dashboard
 // must behave identically to the server's copy. A unit suite cannot see across
 // the package boundary, so this runs as its own step.
