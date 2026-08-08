@@ -25,7 +25,7 @@ settingsRouter.get('/', (req: Request, res: Response) => {
 });
 
 // PUT /api/settings/recipient { email: string }
-settingsRouter.put('/recipient', (req: Request, res: Response) => {
+settingsRouter.put('/recipient', async (req: Request, res: Response) => {
   const user = (req as RequestWithUser).user!;
   const { email } = req.body as { email: string };
   if (typeof email !== 'string') return res.status(400).json({ error: 'email required' });
@@ -33,14 +33,14 @@ settingsRouter.put('/recipient', (req: Request, res: Response) => {
   if (trimmed && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmed)) {
     return res.status(400).json({ error: 'invalid email format' });
   }
-  setDefaultRecipientForUser(user.id, trimmed || null);
+  await setDefaultRecipientForUser(user.id, trimmed || null);
   res.json({ defaultRecipient: trimmed || null });
 });
 
 // POST /api/settings/disconnect-gmail
-settingsRouter.post('/disconnect-gmail', (req: Request, res: Response) => {
+settingsRouter.post('/disconnect-gmail', async (req: Request, res: Response) => {
   const user = (req as RequestWithUser).user!;
-  deleteGmailTokens(user.id);
+  await deleteGmailTokens(user.id);
   res.json({ ok: true });
 });
 
@@ -48,13 +48,13 @@ settingsRouter.post('/disconnect-gmail', (req: Request, res: Response) => {
 settingsRouter.post('/test-email', async (req: Request, res: Response) => {
   const user = (req as RequestWithUser).user!;
   try {
-    const to = getDefaultRecipientForUser(user.id);
+    const to = await getDefaultRecipientForUser(user.id);
     if (!to) return res.status(400).json({ error: 'no default recipient set' });
-    if (!isGmailConnectedForUser(user.id)) {
+    if (!(await isGmailConnectedForUser(user.id))) {
       return res.status(400).json({ error: 'Gmail not connected for this user' });
     }
 
-    const senderEmail = getConnectedGmailEmailForUser(user.id);
+    const senderEmail = await getConnectedGmailEmailForUser(user.id);
     await sendEmailFromUser(user.id, {
       to,
       subject: 'Ad Library Finder — test email',

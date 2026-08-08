@@ -197,7 +197,7 @@ export async function confirmPublishers(
     onLog?: LogFn;
     /** Job Stop button — polled between publishers; a stop ends the pass early
      *  with every verdict recorded so far already persisted. */
-    shouldStop?: () => boolean;
+    shouldStop?: () => boolean | Promise<boolean>;
     /** Called after each publisher so the pipeline can surface a LIVE counter. */
     onProgress?: (s: ConfirmSummary) => void;
     /**
@@ -230,7 +230,7 @@ export async function confirmPublishers(
     skipped: false, reachedTarget: false, note: '',
   };
 
-  const queue = filterUncheckedSince(listPublishersForConfirmation(), opts.skipConfirmedSince);
+  const queue = filterUncheckedSince(await listPublishersForConfirmation(), opts.skipConfirmedSince);
   summary.queued = queue.length;
   if (queue.length === 0) {
     summary.note = 'no eligible publishers';
@@ -267,7 +267,7 @@ export async function confirmPublishers(
 
   let consecBlocks = 0;
   for (const p of queue) {
-    if (opts.shouldStop?.()) {
+    if (await opts.shouldStop?.()) {
       summary.note = `stop requested — ended after ${summary.processed}/${queue.length} publishers (verdicts so far are saved)`;
       onLog?.('warn', `confirm: ${summary.note}`);
       break;
@@ -294,7 +294,7 @@ export async function confirmPublishers(
     // Pass null for a provider that did not run this pass, so it preserves what
     // is already stored instead of erasing it. confirmed_advertiser is derived
     // from the resulting counts inside setPublisherConfirmation.
-    setPublisherConfirmation(p.id, {
+    await setPublisherConfirmation(p.id, {
       gatc_advertiser_id: result.advertiserId,
       gatc_ads_count: result.gatcMeasured ? result.adsCount : null,
       meta_active_ads: result.metaMeasured ? result.metaAds : null,

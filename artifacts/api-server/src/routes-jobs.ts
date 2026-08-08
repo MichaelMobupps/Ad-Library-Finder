@@ -1,7 +1,5 @@
 import { Router, Request, Response } from 'express';
 import { nanoid } from 'nanoid';
-import { existsSync, createReadStream } from 'node:fs';
-import path from 'node:path';
 import {
   createJob,
   getJob,
@@ -10,12 +8,12 @@ import {
   requestJobCancel,
   resumeJob,
   getLogs,
-  getResults,
   ProductType,
   JobSource,
 } from './db.js';
 import { clearCancelState } from './jobControl.js';
-import { buildCsv, normalizeMaxLeads, LEAD_LIMIT_CHOICES } from './csv.js';
+import { normalizeMaxLeads, LEAD_LIMIT_CHOICES } from './csv.js';
+import { renderJobCsv, renderJobHqZip } from './download.js';
 import { RequestWithUser, requireAdmin, isAdminUser } from './auth.js';
 import { fetchAppgoblinCategoryList } from './appgoblinScraper.js';
 import {
@@ -227,7 +225,7 @@ const KNOWN_VERTICAL_IDS = new Set(GOOGLE_ADS_VERTICALS.map((v) => v.id));
 const KNOWN_LANG_CODES = new Set(GOOGLE_ADS_LANGUAGES.map((l) => l.code));
 
 // POST /api/jobs
-jobsRouter.post('/', (req: Request<{}, {}, CreateJobBody>, res: Response) => {
+jobsRouter.post('/', async (req: Request<{}, {}, CreateJobBody>, res: Response) => {
   const user = (req as RequestWithUser).user!;
   const { countries, productTypes, recipientEmail, source, appgoblinCategory, appgoblinAdNetwork, googleAds, storeFirst, maxLeads } = req.body;
 
@@ -419,71 +417,75 @@ jobsRouter.post('/', (req: Request<{}, {}, CreateJobBody>, res: Response) => {
     recipient = t || null;
   }
 
-  const created = productTypes.map((pt) => {
-    const id = `job_${nanoid(10)}`;
-    return createJob({
-      id,
-      productType: pt,
-      countries: normCountries,
-      recipientEmail: recipient,
-      createdByUserId: user.id,
-      source: jobSource,
-      sourceParams,
-    });
-  });
+  // Promise.all, not a bare map: the response body IS this array, and an array
+  // of unresolved promises serialises to [{}, {}].
+  const created = await Promise.all(
+    productTypes.map(async (pt) => {
+      const id = `job_${nanoid(10)}`;
+      return await createJob({
+        id,
+        productType: pt,
+        countries: normCountries,
+        recipientEmail: recipient,
+        createdByUserId: user.id,
+        source: jobSource,
+        sourceParams,
+      });
+    }),
+  );
 
   res.json({ jobs: created });
 });
 
-jobsRouter.get('/', (req, res) => {
+jobsRouter.get('/', async (req, res) => {
   const user = (req as RequestWithUser).user!;
-  res.json({ jobs: listJobsForUser(user.id) });
+  res.json({ jobs: await listJobsForUser(user.id) });
 });
 
 // GET /api/jobs/activity — ADMIN ONLY: every user's jobs (running + history) with
 // the creator's identity, for the Activity view. Defined BEFORE /:id so Express
 // does not match "activity" as a job id.
-jobsRouter.get('/activity', requireAdmin, (_req: Request, res: Response) => {
-  res.json({ jobs: listAllJobsWithUsers(200) });
+jobsRouter.get('/activity', requireAdmin, async (_req: Request, res: Response) => {
+  res.json({ jobs: await listAllJobsWithUsers(200) });
 });
 
 // POST /api/jobs/:id/stop — request a mid-run stop. The job's owner can stop
 // their own job; an admin can stop anyone's. Partial results are kept: a pending
 // job cancels instantly, a running one finishes its current step and finalizes
 // with whatever it scraped so far.
-jobsRouter.post('/:id/stop', (req, res) => {
+jobsRouter.post('/:id/stop', async (req, res) => {
   const user = (req as RequestWithUser).user!;
-  const job = getJob(req.params.id);
+  const job = await getJob(req.params.id);
   if (!job) return res.status(404).json({ error: 'not found' });
   if (job.created_by_user_id && job.created_by_user_id !== user.id && !isAdminUser(user)) {
     return res.status(404).json({ error: 'not found' });
   }
-  const ok = requestJobCancel(job.id);
+  const ok = await requestJobCancel(job.id);
   if (!ok) {
     return res.status(409).json({ error: `job is already ${job.status} — nothing to stop` });
   }
-  res.json({ job: getJob(job.id) });
+  res.json({ job: await getJob(job.id) });
 });
 
 // POST /api/jobs/:id/resume — re-queue a stopped or failed job under the same
 // id. The job's owner can resume their own; an admin can resume anyone's.
 // store_first genuinely continues where it stopped (durable rotation stamps +
 // caches); the other sources replay safely with deduped results.
-jobsRouter.post('/:id/resume', (req, res) => {
+jobsRouter.post('/:id/resume', async (req, res) => {
   const user = (req as RequestWithUser).user!;
-  const job = getJob(req.params.id);
+  const job = await getJob(req.params.id);
   if (!job) return res.status(404).json({ error: 'not found' });
   if (job.created_by_user_id && job.created_by_user_id !== user.id && !isAdminUser(user)) {
     return res.status(404).json({ error: 'not found' });
   }
-  const ok = resumeJob(job.id);
+  const ok = await resumeJob(job.id);
   if (!ok) {
     return res.status(409).json({ error: `job is ${job.status} — only stopped or failed jobs can be resumed` });
   }
   // Drop any sticky in-process "cancelled" answer for this id so the worker
   // sees a clean flag the moment it picks the job up.
   clearCancelState(job.id);
-  res.json({ job: getJob(job.id) });
+  res.json({ job: await getJob(job.id) });
 });
 
 // GET /api/jobs/appgoblin-categories — list the real AppGoblin category slugs.
@@ -539,24 +541,24 @@ jobsRouter.get('/store-first-config', (_req: Request, res: Response) => {
 // buildPublishersPage; `publishers` is the capped top slice of the matches,
 // `total`/`totalUnfiltered` are the real counts. Callers that pass no params
 // still get the top PUBLISHERS_PAGE_LIMIT rows by score, as before.
-jobsRouter.get('/publishers', requireAdmin, (req: Request, res: Response) => {
-  const page = buildPublishersPage(listPublishersByScore(1_000_000), req.query);
+jobsRouter.get('/publishers', requireAdmin, async (req: Request, res: Response) => {
+  const page = buildPublishersPage(await listPublishersByScore(1_000_000), req.query);
   res.json({
     ...page,
     funnel: {
-      bySource: discoveredCountsBySource(),
-      totalApps: countDiscoveredApps(),
-      enriched: countEnrichedApps(),
-      inBand: countInBandApps(TAIL_MIN_INSTALLS, TAIL_MAX_INSTALLS),
-      publishers: countPublishers(),
-      confirmed: countConfirmedPublishers(),
+      bySource: await discoveredCountsBySource(),
+      totalApps: await countDiscoveredApps(),
+      enriched: await countEnrichedApps(),
+      inBand: await countInBandApps(TAIL_MIN_INSTALLS, TAIL_MAX_INSTALLS),
+      publishers: await countPublishers(),
+      confirmed: await countConfirmedPublishers(),
     },
   });
 });
 
 // GET /api/jobs/publishers.csv — Prospector export of the publisher table
 // (score desc), honouring the same filter query params as the Publishers view.
-jobsRouter.get('/publishers.csv', requireAdmin, (req: Request, res: Response) => {
+jobsRouter.get('/publishers.csv', requireAdmin, async (req: Request, res: Response) => {
   // Deliberately NO dedupe of any kind here — neither the lead-history seed (the
   // pipeline persists everything it exports into job_results, so seeding history
   // would make this download empty) nor the batch dedupe (two distinct publisher
@@ -565,7 +567,7 @@ jobsRouter.get('/publishers.csv', requireAdmin, (req: Request, res: Response) =>
   // nothing silently dropped — while the pipeline's own export is the
   // "new since last run" feed that does dedupe. Streamed from memory: no file,
   // so downloads no longer accumulate orphans under csv-output/.
-  const rows = filterPublishers(listPublishersByScore(1_000_000), req.query);
+  const rows = filterPublishers(await listPublishersByScore(1_000_000), req.query);
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
   res.setHeader('Content-Disposition', 'attachment; filename="store_first-publishers.csv"');
   res.send(publisherViewCsv(rows));
@@ -579,71 +581,83 @@ function canReadJob(req: Request, jobOwner: string | null): boolean {
   return !jobOwner || jobOwner === user.id || isAdminUser(user);
 }
 
-jobsRouter.get('/:id', (req, res) => {
-  const job = getJob(req.params.id);
+jobsRouter.get('/:id', async (req, res) => {
+  const job = await getJob(req.params.id);
   if (!job) return res.status(404).json({ error: 'not found' });
   if (!canReadJob(req, job.created_by_user_id)) {
     return res.status(404).json({ error: 'not found' });
   }
-  const logs = getLogs(req.params.id);
+  const logs = await getLogs(req.params.id);
   res.json({ job, logs });
 });
 
-jobsRouter.get('/:id/csv', (req, res) => {
-  const job = getJob(req.params.id);
+/**
+ * The result CSV — REGENERATED FROM THE DATABASE, never read off disk.
+ *
+ * It used to stream `job.csv_path`, a file under `csv-output/` on the
+ * deployment's filesystem. That disk does not survive a publish, so every
+ * emailed download link broke at the next deploy and answered "CSV not yet
+ * ready" for a job that had finished weeks earlier with its rows still in the
+ * database. Rebuilding from `job_results` costs a query and makes the link
+ * outlive any number of publishes.
+ *
+ * `?product=cps|mobile` is unchanged: it exports the job's stored rows under
+ * the OTHER product filter, the recovery path for a mobile google_ads job that
+ * discovered web leads. It is no longer a special case — every response on this
+ * route is now built the same way.
+ */
+jobsRouter.get('/:id/csv', async (req, res) => {
+  const job = await getJob(req.params.id);
   if (!job) return res.status(404).json({ error: 'not found' });
   if (!canReadJob(req, job.created_by_user_id)) {
     return res.status(404).json({ error: 'not found' });
   }
 
-  // ?product=cps|mobile — export the job's results under the OTHER product
-  // filter. Recovery path for e.g. a mobile google_ads job that discovered web
-  // (cps_web) leads: those rows are stored in job_results but excluded from the
-  // mobile CSV; this rebuilds a CSV from the stored rows without re-scraping.
   const override = String(req.query.product || '').toLowerCase();
-  if (override && (override === 'cps' || override === 'mobile') && override !== job.product_type) {
-    const results = getResults(job.id);
-    if (results.length === 0) {
-      return res.status(404).json({ error: 'no stored results to export' });
-    }
-    const { path: p, rowsWritten } = buildCsv({
-      jobId: job.id,
-      productType: override as ProductType,
-      results,
-    });
-    if (rowsWritten === 0) {
-      return res.status(404).json({ error: `no ${override} rows in this job's results` });
-    }
-    const fname = path.basename(p);
-    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-    res.setHeader('Content-Disposition', `attachment; filename="${fname}"`);
-    return createReadStream(p).pipe(res);
-  }
+  const productType =
+    override === 'cps' || override === 'mobile' ? (override as ProductType) : job.product_type;
 
-  if (!job.csv_path || !existsSync(job.csv_path)) {
-    return res.status(404).json({ error: 'CSV not yet ready' });
+  const rendered = await renderJobCsv(job, productType);
+  if (!rendered) {
+    return res.status(404).json({
+      error:
+        productType === job.product_type
+          ? 'CSV not yet ready'
+          : `no ${productType} rows in this job's results`,
+    });
   }
-  const fname = path.basename(job.csv_path);
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-  res.setHeader('Content-Disposition', `attachment; filename="${fname}"`);
-  createReadStream(job.csv_path).pipe(res);
+  res.setHeader('Content-Disposition', `attachment; filename="${rendered.filename}"`);
+  res.send(rendered.body);
 });
 
-// Per-HQ-country .xlsx bundle (mobile jobs only). The orchestrator sets
-// hq_zip_path after the CSV has been written and HQ resolution succeeded.
-jobsRouter.get('/:id/hq-zip', (req, res) => {
-  const job = getJob(req.params.id);
+/**
+ * The per-HQ-country .xlsx bundle — also regenerated from the database.
+ *
+ * Rebuilt from the job's exported rows plus the `hq_cache` table the split
+ * populated while the job ran. It makes NO vendor call: an HQ that is not in
+ * the cache buckets under "Unknown" rather than being re-resolved, so a
+ * download can never spend money or block on a store fetch. See download.ts.
+ *
+ * `hq_zip_path` still gates the route — it is the marker saying the split
+ * actually ran for this job — but nothing reads the file it points at.
+ */
+jobsRouter.get('/:id/hq-zip', async (req, res) => {
+  const job = await getJob(req.params.id);
   if (!job) return res.status(404).json({ error: 'not found' });
   if (!canReadJob(req, job.created_by_user_id)) {
     return res.status(404).json({ error: 'not found' });
   }
-  if (!job.hq_zip_path || !existsSync(job.hq_zip_path)) {
+  if (!job.hq_zip_path) {
     return res.status(404).json({ error: 'HQ-split zip not yet ready' });
   }
-  const fname = path.basename(job.hq_zip_path);
+  const rendered = await renderJobHqZip(job);
+  if (!rendered) {
+    return res.status(404).json({ error: 'HQ-split zip not yet ready' });
+  }
   res.setHeader('Content-Type', 'application/zip');
-  res.setHeader('Content-Disposition', `attachment; filename="${fname}"`);
-  createReadStream(job.hq_zip_path).pipe(res);
+  res.setHeader('Content-Disposition', `attachment; filename="${rendered.filename}"`);
+  res.send(rendered.body);
 });
 
 // ── offline tests (no network, no DB — pure row shaping) ─────────────────────

@@ -92,9 +92,9 @@ authRouter.get('/google/callback', async (req: Request, res: Response) => {
     }
 
     // Allowed. Upsert user, persist tokens, issue session.
-    const user = upsertUserByEmail(email, name);
-    persistGmailTokensForUser(user.id, email, tokens);
-    const { cookie } = loginUser(user.id);
+    const user = await upsertUserByEmail(email, name);
+    await persistGmailTokensForUser(user.id, email, tokens);
+    const { cookie } = await loginUser(user.id);
 
     log.info(`Sign-in OK: ${email} (user=${user.id})`);
     res.setHeader('Set-Cookie', cookie);
@@ -108,9 +108,9 @@ authRouter.get('/google/callback', async (req: Request, res: Response) => {
 });
 
 // POST /api/auth/logout — clear the session
-authRouter.post('/logout', (req: Request, res: Response) => {
+authRouter.post('/logout', async (req: Request, res: Response) => {
   const r = req as RequestWithUser;
-  logoutSession(r.sessionToken);
+  await logoutSession(r.sessionToken);
   res.setHeader('Set-Cookie', buildClearCookie());
   res.json({ ok: true });
 });

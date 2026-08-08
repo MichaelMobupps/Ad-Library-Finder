@@ -1,0 +1,7 @@
+{
+  "job_id": "job_7nQAfTUr1v",
+  "resolved": false,
+  "http_status": 404,
+  "rescued_at": "2026-08-08T14:26:02.729Z",
+  "note": "This job did not resolve on the live deployment at rescue time."
+}

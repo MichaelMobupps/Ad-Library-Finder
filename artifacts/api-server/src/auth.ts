@@ -89,10 +89,10 @@ export function buildClearCookie(): string {
 /**
  * Attach the current user (if any) to req.user. Does NOT enforce.
  */
-export function userContextMiddleware(req: Request, _res: Response, next: NextFunction) {
+export async function userContextMiddleware(req: Request, _res: Response, next: NextFunction) {
   const token = readSessionCookie(req);
   if (token) {
-    const user = getSessionUser(token);
+    const user = await getSessionUser(token);
     if (user) {
       (req as RequestWithUser).user = user;
       (req as RequestWithUser).sessionToken = token;
@@ -118,14 +118,14 @@ export interface RequestWithUser extends Request {
   sessionToken?: string;
 }
 
-export function loginUser(userId: string): { token: string; cookie: string } {
-  const session = createSession(userId, SESSION_TTL_MS);
+export async function loginUser(userId: string): Promise<{ token: string; cookie: string; }>{
+  const session = await createSession(userId, SESSION_TTL_MS);
   return { token: session.token, cookie: buildSessionCookie(session.token) };
 }
 
-export function logoutSession(token: string | undefined) {
+export async function logoutSession(token: string | undefined) {
   if (!token) return;
-  deleteSession(token);
+  await deleteSession(token);
 }
 
 // Lightweight HTML page for the domain-restriction refusal. Kept here (not in

@@ -287,7 +287,7 @@ ${fenceFields([
       system: SYSTEM_PROMPT,
       messages: [{ role: 'user', content: userContent }],
     });
-    recordSpend('hq-resolver', 'claude-sonnet-4-5', res.usage);
+    await recordSpend('hq-resolver', 'claude-sonnet-4-5', res.usage);
     const textBlock = res.content.find((b) => b.type === 'text');
     if (!textBlock || textBlock.type !== 'text') return null;
     const cleaned = textBlock.text.replace(/```json|```/g, '').trim();
@@ -318,7 +318,7 @@ export async function resolveHq(page: StorePageInfo): Promise<ResolvedHq> {
   // LAYER 1: ask the LLM. Gate first — this point is only reached on a cache
   // miss (hqSplit checks the cache before calling), so the gate never blocks a
   // free cache hit, only a paid resolution.
-  assertBudget('hq-resolver');
+  await assertBudget('hq-resolver');
   const llmOut = await callLlmForCompany({
     appName: page.appName || '',
     publisherName: page.publisherName || '',

@@ -135,15 +135,15 @@ export function nextJerusalemMidnightMs(from: Date = new Date()): number {
  * Record one call's cost. Never throws (a ledger write failure must not break a
  * resolved result). Returns the USD charged for logging by the caller.
  */
-export function recordSpend(
+export async function recordSpend(
   source: string,
   model: string,
   usage: LlmUsage | null | undefined,
-): number {
+): Promise<number>{
   const usd = costUsd(model, usage);
   const u = usage ?? {};
   try {
-    getDb()
+    await getDb()
       .prepare(
         `INSERT INTO llm_spend
            (ts, spend_day, source, model, input_tokens, output_tokens, cache_write_tokens, cache_read_tokens, web_searches, usd)
@@ -169,9 +169,9 @@ export function recordSpend(
 }
 
 /** Total USD spent on the current Asia/Jerusalem day. */
-export function spentTodayUsd(): number {
+export async function spentTodayUsd(): Promise<number>{
   try {
-    const row = getDb()
+    const row = await getDb()
       .prepare(`SELECT COALESCE(SUM(usd), 0) AS total FROM llm_spend WHERE spend_day = ?`)
       .get(jerusalemDay()) as { total: number } | undefined;
     return row?.total || 0;
@@ -185,8 +185,8 @@ export function spentTodayUsd(): number {
  * Budget gate. Call immediately before an LLM request. Throws
  * BudgetExceededError when today's Jerusalem spend is at or above the cap.
  */
-export function assertBudget(source: string): void {
-  const spent = spentTodayUsd();
+export async function assertBudget(source: string): Promise<void>{
+  const spent = await spentTodayUsd();
   if (spent >= DAILY_CAP_USD) {
     log.warn(
       `[budget] ${source}: daily cap reached ($${spent.toFixed(2)}/$${DAILY_CAP_USD}); deferring`,

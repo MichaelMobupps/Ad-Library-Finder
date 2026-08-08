@@ -27,9 +27,11 @@
  * stored with surrounding whitespace).
  *
  * SAFETY: startQueue() is never called (buildApp() does not start it), so no
- * job ever executes, nothing scrapes and no mail is sent; each mode runs in its
- * own throwaway cwd, so db.ts's path.resolve('data') makes a fresh sqlite file
- * and the real database is never opened; the listener binds 127.0.0.1 on an
+ * job ever executes, nothing scrapes and no mail is sent; each mode gets its
+ * own database inside an EPHEMERAL PostgreSQL cluster built by pgtest.mjs
+ * seconds earlier, and assertEphemeral() refuses to let a child boot against
+ * anything else — the workspace's own DATABASE_URL is stripped from the child
+ * environment rather than inherited; the listener binds 127.0.0.1 on an
  * EPHEMERAL port.
  *
  * Run standalone:  node artifacts/api-server/scripts/check-chief-surface.mjs
@@ -41,6 +43,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { startCluster, assertEphemeral } from './pgtest.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');
@@ -54,6 +57,7 @@ const TOKEN = 'test-chief-token-3f9a2c7e51b04d8ea6';
 const mode = (process.argv.find((a) => a.startsWith('--mode=')) || '').slice(7);
 if (!mode) {
   let failed = 0;
+  const cluster = await startCluster('chief');
   for (const [m, env] of [
     ['dark', { CHIEF_TOKEN: TOKEN }],
     ['lit', { CHIEF_TOKEN: TOKEN, BASE_PATH: `${PREFIX}/`, PUBLIC_BASE_URL: `https://tools.mobupps.net${PREFIX}` }],
@@ -67,6 +71,9 @@ if (!mode) {
     delete childEnv.BASE_PATH;
     delete childEnv.PUBLIC_BASE_URL;
     delete childEnv.CHIEF_TOKEN;
+    // Each mode gets its OWN database in the throwaway cluster, so one mode's
+    // fixtures can never be visible to another's assertions.
+    childEnv.DATABASE_URL = cluster.createDatabase(`chief_${m.replace(/-/g, '_')}`);
     const res = spawnSync(process.execPath, [fileURLToPath(import.meta.url), `--mode=${m}`], {
       cwd: dir,
       encoding: 'utf8',
@@ -113,20 +120,36 @@ let passed = 0;
 const failures = [];
 const check = (cond, desc) => (cond ? passed++ : failures.push(`FAIL [${mode}] ${desc}`));
 
+assertEphemeral(process.env.DATABASE_URL);
 const db = await import(`${DIST}/db.js`);
+const { closeDatabase } = await import(`${DIST}/sql.js`);
 const { buildApp } = await import(`${DIST}/app.js`);
 const chief = await import(`${DIST}/chief.js`);
 const notifier = await import(`${DIST}/notifier.js`);
 const { jerusalemDay } = await import(`${DIST}/llmBudget.js`);
+const CHIEF_ID = chief.CHIEF_PRINCIPAL_ID;
 
 await db.initDb();
 
-const human = db.upsertUserByEmail('gate-human@mobupps.com', 'Gate Human');
-const humanSession = db.createSession(human.id, 30 * 24 * 3600 * 1000);
+/**
+ * Chief-owned jobs that exist BEFORE this gate creates any.
+ *
+ * initDb() seeds the jobs rescued from the live seam (rescueSeed.ts), and those
+ * are owned by the machine principal, so "the Chief has no jobs yet" stopped
+ * being true at boot in order L-3.4g. Every count below is therefore a DELTA
+ * against this baseline rather than an absolute — which is also the stronger
+ * assertion, since it stays honest however many jobs are seeded later.
+ */
+const chiefJobsAtBoot = (
+  await db.getDb().prepare(`SELECT COUNT(*) AS n FROM jobs WHERE created_by_user_id = ?`).get(CHIEF_ID)
+).n;
+
+const human = await db.upsertUserByEmail('gate-human@mobupps.com', 'Gate Human');
+const humanSession = await db.createSession(human.id, 30 * 24 * 3600 * 1000);
 // ADMIN_EMAILS defaults to michael@mobupps.com — this is the admin surface.
-const admin = db.upsertUserByEmail('michael@mobupps.com', 'Gate Admin');
-const adminSession = db.createSession(admin.id, 30 * 24 * 3600 * 1000);
-const humanJob = db.createJob({
+const admin = await db.upsertUserByEmail('michael@mobupps.com', 'Gate Admin');
+const adminSession = await db.createSession(admin.id, 30 * 24 * 3600 * 1000);
+const humanJob = await db.createJob({
   id: 'job_HUMAN00001',
   productType: 'mobile',
   countries: ['US'],
@@ -317,17 +340,17 @@ if (FULL) {
   check(st.json.server_time.endsWith('Z'), 'status: server_time is UTC');
 
   // active_jobs is a COUNT, not a constant: move a job and it moves.
-  db.markJobRunning(humanJob.id);
+  await db.markJobRunning(humanJob.id);
   const st2 = await request('GET', CHIEF('/status'), { token: bearer() });
   check(st2.json.active_jobs === 1, `status: active_jobs counts a running job (got ${st2.json.active_jobs})`);
-  db.markJobFailed(humanJob.id, 'gate: settled back');
+  await db.markJobFailed(humanJob.id, 'gate: settled back');
   const st3 = await request('GET', CHIEF('/status'), { token: bearer() });
   check(st3.json.active_jobs === 0, 'status: active_jobs falls back when the job settles');
 
   // spend_today_usd comes off this app's OWN ledger. It is 0 above because the
   // ledger is empty, not because a literal was hardcoded — write a row and it
   // moves. (This app DOES have a paid vendor: the Anthropic API.)
-  db.getDb()
+  await db.getDb()
     .prepare(
       `INSERT INTO llm_spend (ts, spend_day, source, model, input_tokens, output_tokens, cache_write_tokens, cache_read_tokens, web_searches, usd)
        VALUES (?, ?, 'gate', 'claude-sonnet-4-5', 0, 0, 0, 0, 0, ?)`,
@@ -335,7 +358,7 @@ if (FULL) {
     .run(Date.now(), jerusalemDay(), 1.23);
   const st4 = await request('GET', CHIEF('/status'), { token: bearer() });
   check(st4.json.spend_today_usd === 1.23, `status: spend is READ from the ledger (got ${st4.json.spend_today_usd})`);
-  db.getDb().prepare(`DELETE FROM llm_spend WHERE source = 'gate'`).run();
+  await db.getDb().prepare(`DELETE FROM llm_spend WHERE source = 'gate'`).run();
 
   // ───────────────────────────────────────────────────────────────────────────
   // 4. CREATE — ordering, refusals, and the happy path.
@@ -440,7 +463,9 @@ if (FULL) {
   );
 
   // A refusal must not have created anything.
-  const afterRefusals = db.getDb().prepare(`SELECT COUNT(*) AS n FROM jobs WHERE created_by_user_id = ?`).get(chief.CHIEF_PRINCIPAL_ID).n;
+  const afterRefusals =
+    (await db.getDb().prepare(`SELECT COUNT(*) AS n FROM jobs WHERE created_by_user_id = ?`).get(CHIEF_ID)).n -
+    chiefJobsAtBoot;
   check(afterRefusals === 1, `refusals create no jobs (only the charset one exists, got ${afterRefusals})`);
 
   // The happy path.
@@ -462,7 +487,7 @@ if (FULL) {
   );
 
   // …and the row it wrote is an ordinary job owned by the principal.
-  const row = db.getJob(job.job_id);
+  const row = await db.getJob(job.job_id);
   check(row.created_by_user_id === chief.CHIEF_PRINCIPAL_ID, 'the job is owned by the system principal');
   check(row.recipient_email === null, 'the job has no recipient');
   check(row.status === 'pending', 'the job is queued, not started');
@@ -483,7 +508,7 @@ if (FULL) {
   ]) {
     const res = await post(command({ source: src, target_type: target, external_id: `chief-src-${src}-${target}`, ...extra }));
     check(res.status === 201, `${src}/${target} creates (got ${res.status})`);
-    const created2 = db.getJob(res.json.job.job_id);
+    const created2 = await db.getJob(res.json.job.job_id);
     check(
       created2.source === stored && created2.product_type === target,
       `${src}/${target} runs the ${stored} engine (stored ${created2.source}/${created2.product_type})`,
@@ -499,8 +524,8 @@ if (FULL) {
       `${src}/${target} still reads back as ${src} on a later GET (got ${readBack.json.job.source})`,
     );
   }
-  const gaMobileRow = db.getJob(
-    db.getDb().prepare(`SELECT job_id FROM chief_jobs WHERE external_id = 'chief-src-google_ads-mobile'`).get().job_id,
+  const gaMobileRow = await db.getJob(
+    (await db.getDb().prepare(`SELECT job_id FROM chief_jobs WHERE external_id = 'chief-src-google_ads-mobile'`).get()).job_id,
   );
   check(
     gaMobileRow.source_params ===
@@ -524,14 +549,14 @@ if (FULL) {
     'the Chief\'s original command reads back in the vocabulary it was sent in',
   );
   check(theOriginal.json?.job?.state === 'pending', 'the Chief\'s original command sits queued, not started');
-  const originalRow = db.getJob(theOriginal.json.job.job_id);
+  const originalRow = await db.getJob(theOriginal.json.job.job_id);
   check(originalRow.source === 'store_first', 'and it is stored against the engine that actually does mobile');
   check(
     JSON.parse(originalRow.source_params).maxLeads === 20,
     'and its lead cap reached the engine — store_first honours maxLeads',
   );
-  const gaRow = db.getJob(
-    db.getDb().prepare(`SELECT job_id FROM chief_jobs WHERE external_id = 'chief-src-google_ads-cps'`).get().job_id,
+  const gaRow = await db.getJob(
+    (await db.getDb().prepare(`SELECT job_id FROM chief_jobs WHERE external_id = 'chief-src-google_ads-cps'`).get()).job_id,
   );
   check(
     gaRow.source_params ===
@@ -546,9 +571,9 @@ if (FULL) {
   check(again.status === 200, `a repeated external_id -> 200, not 201 (got ${again.status})`);
   check(again.json?.created === false, 'the repeat reports created:false');
   check(again.json.job.job_id === job.job_id, 'the repeat returns the SAME job');
-  const countAfterRepeat = db.getDb()
+  const countAfterRepeat = (await db.getDb()
     .prepare(`SELECT COUNT(*) AS n FROM chief_jobs WHERE external_id = 'chief-ext-happy'`)
-    .get().n;
+    .get()).n;
   check(countAfterRepeat === 1, 'the repeat wrote no second mapping');
 
   // Casing and whitespace are NOT the same key — the bytes are the key.
@@ -556,7 +581,7 @@ if (FULL) {
   check(upper.status === 201 && upper.json.job.job_id !== job.job_id, 'a differently-cased key is a different job');
   const padded = await post(command({ external_id: ' chief-ext-happy ' }));
   check(padded.status === 201 && padded.json.job.job_id !== job.job_id, 'a whitespace-padded key is a different job');
-  const paddedRow = db.getDb().prepare(`SELECT external_id FROM chief_jobs WHERE job_id = ?`).get(padded.json.job.job_id);
+  const paddedRow = await db.getDb().prepare(`SELECT external_id FROM chief_jobs WHERE job_id = ?`).get(padded.json.job.job_id);
   check(paddedRow.external_id === ' chief-ext-happy ', 'the key is stored byte for byte');
 
   // Five simultaneous identical commands: exactly one job.
@@ -567,7 +592,7 @@ if (FULL) {
   check(racers.every((r) => r.status === 200 || r.status === 201), 'every racer got a success');
   check(raceIds.size === 1, `five simultaneous identical commands produce ONE job (got ${raceIds.size})`);
   check(racers.filter((r) => r.json?.created === true).length === 1, 'exactly one racer reports created:true');
-  const raceRows = db.getDb().prepare(`SELECT COUNT(*) AS n FROM chief_jobs WHERE external_id = 'chief-race'`).get().n;
+  const raceRows = (await db.getDb().prepare(`SELECT COUNT(*) AS n FROM chief_jobs WHERE external_id = 'chief-race'`).get()).n;
   check(raceRows === 1, 'one mapping row for the race');
 
   // The uniqueness is the DATABASE's, not the read-then-write above: prove the
@@ -577,26 +602,30 @@ if (FULL) {
   // 500 instead of an idempotent answer.
   let constraintCode = null;
   try {
-    db.getDb()
+    await db.getDb()
       .prepare(`INSERT INTO chief_jobs (external_id, job_id, created_at) VALUES (?, ?, ?)`)
       .run('chief-ext-happy', humanJob.id, Date.now());
   } catch (err) {
     constraintCode = err.code;
   }
+  // 23505 = PostgreSQL unique_violation. One SQLSTATE now covers both the
+  // PRIMARY KEY and the UNIQUE collision below, where SQLite raised two
+  // different codes; createCommandedJob's isUniqueConstraintError() keys on the
+  // same value, and this is the assertion that keeps the two in step.
   check(
-    constraintCode === 'SQLITE_CONSTRAINT_PRIMARYKEY',
+    constraintCode === '23505',
     `a duplicate external_id is refused by the database itself (got ${constraintCode})`,
   );
   let jobUniqueCode = null;
   try {
-    db.getDb()
+    await db.getDb()
       .prepare(`INSERT INTO chief_jobs (external_id, job_id, created_at) VALUES (?, ?, ?)`)
       .run('a-second-key-for-the-same-job', job.job_id, Date.now());
   } catch (err) {
     jobUniqueCode = err.code;
   }
   check(
-    jobUniqueCode === 'SQLITE_CONSTRAINT_UNIQUE',
+    jobUniqueCode === '23505',
     `one job cannot carry two idempotency keys (got ${jobUniqueCode})`,
   );
 
@@ -649,7 +678,7 @@ if (FULL) {
   const leadJobId = leadJobRes.json.job.job_id;
   // 120 exportable rows, plus 5 that this app does not consider cps leads.
   for (let i = 1; i <= 120; i++) {
-    db.insertResult({
+    await db.insertResult({
       job_id: leadJobId,
       advertiser_name: `Advertiser ${String(i).padStart(3, '0')}`,
       page_url: null,
@@ -661,7 +690,7 @@ if (FULL) {
     });
   }
   for (let i = 0; i < 5; i++) {
-    db.insertResult({
+    await db.insertResult({
       job_id: leadJobId,
       advertiser_name: `Rejected ${i}`,
       page_url: null,
@@ -727,7 +756,7 @@ if (FULL) {
   const fatRes = await post(command({ source: 'meta', target_type: 'cps', lead_count: 100, external_id: 'chief-fat' }));
   const fatJobId = fatRes.json.job.job_id;
   for (let i = 0; i < 100; i++) {
-    db.insertResult({
+    await db.insertResult({
       job_id: fatJobId,
       advertiser_name: `Fat ${i}`,
       page_url: null,
@@ -753,19 +782,19 @@ if (FULL) {
   // ───────────────────────────────────────────────────────────────────────────
   // 8. NO EMAIL — proved by the difference against a human job.
   // ───────────────────────────────────────────────────────────────────────────
-  await notifier.notifyJobCompleted(db.getJob(job.job_id));
-  await notifier.notifyJobFailed(db.getJob(job.job_id));
-  const afterNotify = db.getJob(job.job_id);
+  await notifier.notifyJobCompleted(await db.getJob(job.job_id));
+  await notifier.notifyJobFailed(await db.getJob(job.job_id));
+  const afterNotify = await db.getJob(job.job_id);
   check(afterNotify.notification_status === null, 'a commanded job records no notification status at all');
-  const chiefLogs = db.getLogs(job.job_id).map((l) => l.message).join('\n');
+  const chiefLogs = (await db.getLogs(job.job_id)).map((l) => l.message).join('\n');
   check(chiefLogs.includes('email suppressed: commanded job'), 'the suppression is recorded in the job log');
   check(!chiefLogs.includes('Gmail'), 'no sender was ever resolved for it');
   // The same call on a HUMAN job takes the ordinary path and marks it failed
   // (no Gmail connected in this sandbox) — so the difference is the guard.
-  await notifier.notifyJobCompleted(db.getJob(humanJob.id));
-  check(db.getJob(humanJob.id).notification_status === 'failed', 'a human job DOES go down the email path');
+  await notifier.notifyJobCompleted(await db.getJob(humanJob.id));
+  check((await db.getJob(humanJob.id)).notification_status === 'failed', 'a human job DOES go down the email path');
   check(
-    db.getLogs(humanJob.id).some((l) => l.message.includes('sender Gmail not connected')),
+    (await db.getLogs(humanJob.id)).some((l) => l.message.includes('sender Gmail not connected')),
     'and says so in its own log — the two paths are distinguishable',
   );
 
@@ -824,7 +853,7 @@ if (FULL) {
   // 10. 503 — a failed read is never a fabricated value. Runs LAST: it closes
   //     the database under the server on purpose.
   // ───────────────────────────────────────────────────────────────────────────
-  db.getDb().close();
+  await closeDatabase();
   const dead = await request('GET', CHIEF('/status'), { token: bearer() });
   check(dead.status === 503, `status with an unreadable database -> 503 (got ${dead.status})`);
   check(dead.json?.error === 'status unavailable', '503 says so, and reports no numbers');
@@ -852,7 +881,8 @@ if (mode === 'unset') {
   const createAttempt = await post(command());
   check(createAttempt.status === 401, 'no job can be commanded without a secret');
   check(
-    db.getDb().prepare(`SELECT COUNT(*) AS n FROM jobs WHERE created_by_user_id = ?`).get(chief.CHIEF_PRINCIPAL_ID).n === 0,
+    (await db.getDb().prepare(`SELECT COUNT(*) AS n FROM jobs WHERE created_by_user_id = ?`).get(CHIEF_ID)).n ===
+      chiefJobsAtBoot,
     'and none was created',
   );
 }
@@ -879,7 +909,7 @@ if (mode === 'padded') {
 
 srv.close();
 try {
-  db.getDb().close();
+  await closeDatabase();
 } catch {
   /* mode 10 already closed it */
 }

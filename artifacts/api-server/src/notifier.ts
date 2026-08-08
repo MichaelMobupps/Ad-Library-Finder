@@ -16,9 +16,9 @@ import { log } from './logger.js';
  */
 const SEND_TIMEOUT_MS = Number(process.env.NOTIFY_SEND_TIMEOUT_MS) || 120_000;
 
-function resolveRecipient(job: JobRow): string | null {
+async function resolveRecipient(job: JobRow): Promise<string | null> {
   if (job.recipient_email) return job.recipient_email;
-  if (job.created_by_user_id) return getDefaultRecipientForUser(job.created_by_user_id);
+  if (job.created_by_user_id) return await getDefaultRecipientForUser(job.created_by_user_id);
   return null;
 }
 
@@ -42,9 +42,9 @@ function resolveRecipient(job: JobRow): string | null {
  * "no email was ever in question"; writing 'failed' would put a red mark in the
  * admin Activity view for a job that was never supposed to send.
  */
-function suppressedForChief(job: JobRow, kind: 'completion' | 'failure'): boolean {
+async function suppressedForChief(job: JobRow, kind: 'completion' | 'failure'): Promise<boolean>{
   if (!isChiefJob(job)) return false;
-  appendLog(job.id, 'info', `${kind} email suppressed: commanded job — the Chief collects results over the API`);
+  await appendLog(job.id, 'info', `${kind} email suppressed: commanded job — the Chief collects results over the API`);
   return true;
 }
 
@@ -86,17 +86,17 @@ function fmtDuration(startMs: number | null, endMs: number | null): string {
  * Resolve the sender for a job: the user who created it. The user's Gmail
  * must be connected. Returns null with a logged reason if not sendable.
  */
-function resolveSender(job: JobRow): { userId: string; gmailEmail: string } | null {
+async function resolveSender(job: JobRow): Promise<{ userId: string; gmailEmail: string; } | null>{
   if (!job.created_by_user_id) {
     log.warn(`Job ${job.id} has no created_by_user_id — cannot send (legacy job?)`);
     return null;
   }
-  const user = getUserById(job.created_by_user_id);
+  const user = await getUserById(job.created_by_user_id);
   if (!user) {
     log.warn(`Job ${job.id} created_by_user_id=${job.created_by_user_id} does not exist`);
     return null;
   }
-  const tokens = getGmailTokensForUser(user.id);
+  const tokens = await getGmailTokensForUser(user.id);
   if (!tokens || !tokens.refresh_token) {
     log.warn(`Job ${job.id} owner ${user.email} has no Gmail connected — cannot send`);
     return null;
@@ -105,18 +105,18 @@ function resolveSender(job: JobRow): { userId: string; gmailEmail: string } | nu
 }
 
 export async function notifyJobCompleted(job: JobRow) {
-  if (suppressedForChief(job, 'completion')) return;
-  const sender = resolveSender(job);
+  if ((await suppressedForChief(job, 'completion'))) return;
+  const sender = await resolveSender(job);
   if (!sender) {
-    appendLog(job.id, 'warn', 'completion email skipped: sender Gmail not connected — connect Gmail in Settings');
-    setJobNotificationStatus(job.id, 'failed');
+    await appendLog(job.id, 'warn', 'completion email skipped: sender Gmail not connected — connect Gmail in Settings');
+    await setJobNotificationStatus(job.id, 'failed');
     return;
   }
-  const to = resolveRecipient(job);
+  const to = await resolveRecipient(job);
   if (!to) {
-    appendLog(job.id, 'warn', 'completion email skipped: no recipient resolved — set a default recipient in Settings');
+    await appendLog(job.id, 'warn', 'completion email skipped: no recipient resolved — set a default recipient in Settings');
     log.info(`Job ${job.id} done but no recipient resolved — skipping email`);
-    setJobNotificationStatus(job.id, 'failed');
+    await setJobNotificationStatus(job.id, 'failed');
     return;
   }
 
@@ -184,27 +184,27 @@ export async function notifyJobCompleted(job: JobRow) {
       SEND_TIMEOUT_MS,
       'gmail send (completion)'
     );
-    appendLog(job.id, 'info', `completion email sent to ${to}${attachments.length ? ` with ${attachments.length} attachment(s)` : ''}`);
-    setJobNotificationStatus(job.id, 'sent');
+    await appendLog(job.id, 'info', `completion email sent to ${to}${attachments.length ? ` with ${attachments.length} attachment(s)` : ''}`);
+    await setJobNotificationStatus(job.id, 'sent');
   } catch (err) {
-    appendLog(job.id, 'error', `completion email failed: ${(err as Error).message}`);
+    await appendLog(job.id, 'error', `completion email failed: ${(err as Error).message}`);
     log.error(`notify completed failed for ${job.id}`, (err as Error).message);
-    setJobNotificationStatus(job.id, 'failed');
+    await setJobNotificationStatus(job.id, 'failed');
   }
 }
 
 export async function notifyJobFailed(job: JobRow) {
-  if (suppressedForChief(job, 'failure')) return;
-  const sender = resolveSender(job);
+  if ((await suppressedForChief(job, 'failure'))) return;
+  const sender = await resolveSender(job);
   if (!sender) {
-    appendLog(job.id, 'warn', 'failure email skipped: sender Gmail not connected');
-    setJobNotificationStatus(job.id, 'failed');
+    await appendLog(job.id, 'warn', 'failure email skipped: sender Gmail not connected');
+    await setJobNotificationStatus(job.id, 'failed');
     return;
   }
-  const to = resolveRecipient(job);
+  const to = await resolveRecipient(job);
   if (!to) {
-    appendLog(job.id, 'warn', 'failure email skipped: no recipient resolved');
-    setJobNotificationStatus(job.id, 'failed');
+    await appendLog(job.id, 'warn', 'failure email skipped: no recipient resolved');
+    await setJobNotificationStatus(job.id, 'failed');
     return;
   }
 
@@ -230,11 +230,11 @@ export async function notifyJobFailed(job: JobRow) {
       SEND_TIMEOUT_MS,
       'gmail send (failure)'
     );
-    appendLog(job.id, 'info', `failure email sent to ${to}`);
-    setJobNotificationStatus(job.id, 'sent');
+    await appendLog(job.id, 'info', `failure email sent to ${to}`);
+    await setJobNotificationStatus(job.id, 'sent');
   } catch (err) {
-    appendLog(job.id, 'error', `failure email send failed: ${(err as Error).message}`);
+    await appendLog(job.id, 'error', `failure email send failed: ${(err as Error).message}`);
     log.error(`notify failed-job email failed for ${job.id}`, (err as Error).message);
-    setJobNotificationStatus(job.id, 'failed');
+    await setJobNotificationStatus(job.id, 'failed');
   }
 }

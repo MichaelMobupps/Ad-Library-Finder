@@ -144,7 +144,9 @@ function rotateProxyExit(onLog?: LogFn, reason: 'blocked' | 'scheduled' = 'block
   requestsOnCurrentExit = 0;
   const old = proxyDispatcher;
   proxyDispatcher = undefined; // rebuilt lazily by the next request
-  if (old) old.close().catch(() => {});
+  // Deliberate fire-and-forget: nothing waits on an old dispatcher closing,
+  // and its failure to close is not a reason to fail the caller.
+  if (old) void old.close().catch(() => {});
   cookieJar.clear();
   warmedUp = false; // the next warm-up call really warms the NEW exit
   // A scheduled rotation happens every PROXY_ROTATE_EVERY requests, so it logs
@@ -1111,7 +1113,7 @@ export interface DiscoverOptions {
   onAdvertiser?: (adv: GoogleAdsAdvertiser) => Promise<void>;
   /** Polled before each keyword; return true to stop discovery early (e.g. the
    *  pipeline hit its per-job advertiser cap). */
-  shouldStop?: () => boolean;
+  shouldStop?: () => boolean | Promise<boolean>;
 }
 
 /**
@@ -1210,7 +1212,7 @@ export async function discoverAdvertisers(
   }
 
   for (let i = 0; i < keywords.length; i++) {
-    if (opts.shouldStop?.()) {
+    if (await opts.shouldStop?.()) {
       onLog?.('info', `google-ads: discovery stopped early by caller at keyword ${i + 1}/${keywords.length}`);
       break;
     }
@@ -1287,7 +1289,7 @@ export async function discoverAdvertisers(
           onLog?.('warn', `google-ads: onAdvertiser hook threw for "${adv.name}" (non-fatal): ${(err as Error).message}`);
         }
       }
-      if (opts.shouldStop?.()) break;
+      if (await opts.shouldStop?.()) break;
     }
     if (added > 0) onLog?.('debug', `google-ads: "${kw}" → +${added} advertisers (total ${out.advertisers.length})`);
     opts.onProgress?.(i + 1, keywords.length, out.advertisers.length);

@@ -32,7 +32,8 @@
  */
 import http from 'node:http';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { startCluster, assertEphemeral } from './pgtest.mjs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -46,6 +47,7 @@ const PREFIX = '/leadfinder';
 const mode = (process.argv.find((a) => a.startsWith('--mode=')) || '').slice(7);
 if (!mode) {
   let failed = 0;
+  const cluster = await startCluster('legacy');
   for (const [m, env] of [
     ['dark', {}],
     ['lit', { BASE_PATH: `${PREFIX}/`, PUBLIC_BASE_URL: `https://tools.mobupps.net${PREFIX}` }],
@@ -56,6 +58,7 @@ if (!mode) {
     const childEnv = { ...process.env };
     delete childEnv.BASE_PATH;
     delete childEnv.PUBLIC_BASE_URL;
+    childEnv.DATABASE_URL = cluster.createDatabase(`legacy_${m.replace(/-/g, '_')}`);
     const res = spawnSync(process.execPath, [fileURLToPath(import.meta.url), `--mode=${m}`], {
       cwd: dir,
       encoding: 'utf8',
@@ -76,23 +79,50 @@ let passed = 0;
 const failures = [];
 const check = (cond, desc) => (cond ? passed++ : failures.push(`FAIL [${mode}] ${desc}`));
 
-const { initDb, upsertUserByEmail, createSession, createJob, setJobCsvPath, setJobHqZipPath, getDb } =
+assertEphemeral(process.env.DATABASE_URL);
+const { closeDatabase } = await import(`${DIST}/sql.js`);
+const { initDb, upsertUserByEmail, createSession, createJob, insertResult, setJobCsvPath, setJobHqZipPath, getDb } =
   await import(`${DIST}/db.js`);
 const { buildApp } = await import(`${DIST}/app.js`);
 const urls = await import(`${DIST}/urls.js`);
 
 await initDb();
-const user = upsertUserByEmail('gate@mobupps.com', 'Gate');
-const session = createSession(user.id, 30 * 24 * 3600 * 1000);
-const job = createJob({ id: 'job_GATE000001', productType: 'mobile', countries: ['US'], createdByUserId: user.id });
-mkdirSync('files', { recursive: true });
-const CSV_BYTES = 'advertiser,country\nACME,US\n';
-const csvFile = path.resolve('files', 'leads_job_GATE000001.csv');
-writeFileSync(csvFile, CSV_BYTES);
-setJobCsvPath(job.id, csvFile);
-const zipFile = path.resolve('files', 'hq_split_job_GATE000001.zip');
-writeFileSync(zipFile, 'PKgate');
-setJobHqZipPath(job.id, zipFile);
+const user = await upsertUserByEmail('gate@mobupps.com', 'Gate');
+const session = await createSession(user.id, 30 * 24 * 3600 * 1000);
+const job = await createJob({ id: 'job_GATE000001', productType: 'mobile', countries: ['US'], createdByUserId: user.id });
+
+// The downloadable fixture is a ROW, not a file.
+//
+// This gate used to write leads_job_GATE000001.csv and a stub zip to disk and
+// point csv_path/hq_zip_path at them, because the download routes streamed
+// whatever those columns named. Since order L-3.4g they regenerate both
+// artefacts from job_results — precisely so that an emailed link survives a
+// publish, which the file on the deployment disk did not. A file fixture would
+// now prove nothing: the route never opens it.
+//
+// csv_path and hq_zip_path are still set, because they remain the markers
+// saying "this job produced these artefacts" and hq-zip is gated on one. They
+// deliberately name paths that DO NOT EXIST, so if either route ever goes back
+// to reading the filesystem this gate fails instead of quietly passing.
+await insertResult({
+  job_id: job.id,
+  advertiser_name: 'ACME',
+  page_url: null,
+  landing_url: null,
+  classification: 'mobile_google_play',
+  store_url: 'https://play.google.com/store/apps/details?id=com.acme',
+  ad_text: null,
+  country: 'US',
+});
+await setJobCsvPath(job.id, '/nonexistent/leads_job_GATE000001.csv');
+await setJobHqZipPath(job.id, '/nonexistent/hq_split_job_GATE000001.zip');
+
+// What the regenerated CSV actually is, asked of the same code the route uses,
+// so this expectation cannot drift away from the exporter.
+const { renderJobCsv, renderJobHqZip } = await import(`${DIST}/download.js`);
+const { getJob } = await import(`${DIST}/db.js`);
+const CSV_BYTES = (await renderJobCsv(await getJob(job.id))).body;
+const ZIP_BYTES = (await renderJobHqZip(await getJob(job.id))).body;
 
 const app = buildApp();
 const srv = await new Promise((r) => {
@@ -115,6 +145,10 @@ function req(method, target, cookie) {
             type: (res.headers['content-type'] || '').split(';')[0],
             disposition: res.headers['content-disposition'] ?? null,
             body: Buffer.concat(chunks).toString('utf8'),
+            // The .zip download is binary; decoding it as utf8 replaces every
+            // invalid sequence with U+FFFD, so a byte comparison has to use the
+            // raw buffer. `body` stays a string for every text assertion.
+            raw: Buffer.concat(chunks),
           }),
         );
       },
@@ -242,7 +276,10 @@ if (!LIT) {
   check(clicked[1]?.res.type !== 'text/html', 'hop 2 is NOT the SPA page');
 
   const zipClicked = await browserWalk('GET', ZIP_LEGACY, true);
-  check(zipClicked[1]?.res.status === 200 && zipClicked[1]?.res.body === 'PKgate', 'the HQ-split link serves its bytes too');
+  check(
+    zipClicked[1]?.res.status === 200 && zipClicked[1].res.raw.equals(ZIP_BYTES),
+    'the HQ-split link serves its bytes too',
+  );
 
   // 6. The same click while signed out: an auth challenge, not a loop.
   const anon = await browserWalk('GET', CSV_LEGACY, false);
@@ -375,7 +412,7 @@ if (!LIT) {
 }
 
 srv.close();
-getDb().close();
+await closeDatabase();
 
 console.log(`legacy-redirects [${mode}]: ${passed} passed, ${failures.length} failed`);
 for (const f of failures) console.log(`  ${f}`);

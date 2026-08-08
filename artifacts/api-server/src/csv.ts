@@ -117,9 +117,16 @@ export function selectExportRows(
   return maxRows != null && maxRows > 0 ? filtered.slice(0, maxRows) : filtered;
 }
 
-export function buildCsv(input: BuildCsvInput): { path: string; rowsWritten: number } {
-  if (!existsSync(CSV_DIR)) mkdirSync(CSV_DIR, { recursive: true });
-
+/**
+ * The CSV as a STRING, plus the filename it is served or saved under.
+ *
+ * Split out of buildCsv in order L-3.4g so a download can be regenerated from
+ * the database without a file existing anywhere: the download route calls this
+ * and streams the result, while the pipelines still call buildCsv to leave a
+ * file on disk for the completion email to attach. One row-shaping
+ * implementation, so a download and an emailed attachment cannot disagree.
+ */
+export function renderCsv(input: BuildCsvInput): { csv: string; filename: string; rowsWritten: number } {
   const { jobId, productType, results } = input;
 
   let header: string;
@@ -179,8 +186,13 @@ export function buildCsv(input: BuildCsvInput): { path: string; rowsWritten: num
     );
   }
 
-  const csv = [header, ...rows].join('\n') + '\n';
-  const fname = `${productType}-${jobId}.csv`;
+  return { csv: [header, ...rows].join('\n') + '\n', filename: `${productType}-${jobId}.csv`, rowsWritten: rows.length };
+}
+
+export function buildCsv(input: BuildCsvInput): { path: string; rowsWritten: number } {
+  if (!existsSync(CSV_DIR)) mkdirSync(CSV_DIR, { recursive: true });
+
+  const { csv, filename: fname, rowsWritten } = renderCsv(input);
   const fpath = path.join(CSV_DIR, fname);
   // Atomic write: some pipelines (Google Ads) now rebuild this file repeatedly
   // WHILE the job runs, and the download route may serve it at any moment.
@@ -190,7 +202,7 @@ export function buildCsv(input: BuildCsvInput): { path: string; rowsWritten: num
   writeFileSync(tmp, csv, 'utf8');
   renameSync(tmp, fpath);
 
-  return { path: fpath, rowsWritten: rows.length };
+  return { path: fpath, rowsWritten };
 }
 // ─────────────────────────────────────────────────────────────
 // Self-tests (deterministic; no DB, no filesystem). Exercises the

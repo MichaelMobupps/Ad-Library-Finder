@@ -87,19 +87,19 @@ function pageUrlFor(app: AppgoblinApp): string {
 }
 
 export async function runAppgoblinJob(job: JobRow): Promise<void> {
-  markJobRunning(job.id);
-  const onLog = (level: 'info' | 'warn' | 'error' | 'debug', msg: string) => {
-    appendLog(job.id, level, msg);
+  await markJobRunning(job.id);
+  const onLog = async (level: 'info' | 'warn' | 'error' | 'debug', msg: string) => {
+    await appendLog(job.id, level, msg);
     log.info(`[job ${job.id}] ${msg}`);
   };
 
-  onLog('info', `appgoblin job started: countries=${job.countries}`);
+  await onLog('info', `appgoblin job started: countries=${job.countries}`);
 
   try {
     // Resume-safety: a job deferred for the daily cap replays from the top.
     // Drop any rows it inserted on the prior run so the deliverable is not
     // duplicated. No-op on a fresh job.
-    clearJobResults(job.id);
+    await clearJobResults(job.id);
 
     // Read discovery params from the job's source_params JSON column.
     let params: AppgoblinSourceParams = {};
@@ -115,41 +115,41 @@ export async function runAppgoblinJob(job: JobRow): Promise<void> {
     if (!category && !adNetworkDomain) {
       throw new Error('appgoblin: job missing source_params (category or adNetworkDomain required)');
     }
-    onLog(
+    await onLog(
       'info',
       `appgoblin: discovery axis — category=${category || '(none)'} adNetwork=${adNetworkDomain || '(none)'}`,
     );
 
-    setJobPhase(job.id, 'scraping', adNetworkDomain ? `ad-network: ${adNetworkDomain}` : `category: ${category}`);
+    await setJobPhase(job.id, 'scraping', adNetworkDomain ? `ad-network: ${adNetworkDomain}` : `category: ${category}`);
 
     const countries: string[] = JSON.parse(job.countries);
     const informationalCountry = countries[0] || '';
 
     // Stop pressed while this job sat in the queue: bail before the scrape —
     // the next check is only AFTER scrapeAppgoblin returns, which can be long.
-    throwIfCancelled(job.id);
-    setJobProgress(job.id, 5); // scrape is the long haul: 5..55 of the run
+    await throwIfCancelled(job.id);
+    await setJobProgress(job.id, 5); // scrape is the long haul: 5..55 of the run
     const scrape = await scrapeAppgoblin({
       category,
       adNetworkDomain,
       onLog,
     });
 
-    onLog(
+    await onLog(
       'info',
       `appgoblin: scrape complete — ${scrape.apps.length} unique apps from ${scrape.companiesFetched} companies` +
         (scrape.blocked ? ' (some fetches were blocked/failed)' : ''),
     );
     if (scrape.notes.length > 0) {
-      for (const note of scrape.notes) onLog('warn', `appgoblin: ${note}`);
+      for (const note of scrape.notes) await onLog('warn', `appgoblin: ${note}`);
     }
     if (scrape.apps.length === 0) {
-      onLog('warn', 'appgoblin: 0 apps discovered; check the category slug or ad-network domain');
+      await onLog('warn', 'appgoblin: 0 apps discovered; check the category slug or ad-network domain');
     }
 
-    throwIfCancelled(job.id);
-    setJobProgress(job.id, 55);
-    setJobPhase(job.id, 'classifying', `${scrape.apps.length} apps to classify`);
+    await throwIfCancelled(job.id);
+    await setJobProgress(job.id, 55);
+    await setJobPhase(job.id, 'classifying', `${scrape.apps.length} apps to classify`);
 
     let inserted = 0;
     let skippedNoStore = 0;
@@ -157,13 +157,13 @@ export async function runAppgoblinJob(job: JobRow): Promise<void> {
     for (const app of scrape.apps) {
       clsIdx++;
       // Overall progress: classification is 55..85 of the run.
-      if (clsIdx % 10 === 0) setJobProgress(job.id, 55 + 30 * (clsIdx / Math.max(1, scrape.apps.length)));
+      if (clsIdx % 10 === 0) await setJobProgress(job.id, 55 + 30 * (clsIdx / Math.max(1, scrape.apps.length)));
       const cls = classifyApp(app);
       if (!cls) {
         skippedNoStore++;
         continue;
       }
-      insertResult({
+      await insertResult({
         job_id: job.id,
         advertiser_name: app.name,
         page_url: pageUrlFor(app),
@@ -174,17 +174,17 @@ export async function runAppgoblinJob(job: JobRow): Promise<void> {
         country: informationalCountry,
       });
       inserted++;
-      if (inserted % 10 === 0) setJobLeadsFound(job.id, inserted); // live counter
+      if (inserted % 10 === 0) await setJobLeadsFound(job.id, inserted); // live counter
     }
-    setJobLeadsFound(job.id, inserted);
-    onLog('info', `appgoblin: inserted ${inserted} rows (skipped ${skippedNoStore} with unknown store)`);
+    await setJobLeadsFound(job.id, inserted);
+    await onLog('info', `appgoblin: inserted ${inserted} rows (skipped ${skippedNoStore} with unknown store)`);
 
-    setJobProgress(job.id, 85); // CSV + HQ split close out; completion pins 100
-    setJobPhase(job.id, 'building_csv', `writing CSV (${inserted} rows)`);
+    await setJobProgress(job.id, 85); // CSV + HQ split close out; completion pins 100
+    await setJobPhase(job.id, 'building_csv', `writing CSV (${inserted} rows)`);
 
     // Operator-chosen lead cap (20/50/100/all) applies to the CSV and the HQ
     // split alike, so the Excel never disagrees with the CSV.
-    const allResults = getResults(job.id);
+    const allResults = await getResults(job.id);
     const agMaxLeads = normalizeMaxLeads(
       params.maxLeads ?? null,
     );
@@ -194,10 +194,10 @@ export async function runAppgoblinJob(job: JobRow): Promise<void> {
       results: allResults,
       maxRows: agMaxLeads,
     });
-    onLog('info', `appgoblin: CSV written: ${csvPath} (${rowsWritten} rows)`);
+    await onLog('info', `appgoblin: CSV written: ${csvPath} (${rowsWritten} rows)`);
 
     if (job.product_type === 'mobile') {
-      setJobPhase(job.id, 'hq_splitting', `resolving HQ for ${rowsWritten} apps`);
+      await setJobPhase(job.id, 'hq_splitting', `resolving HQ for ${rowsWritten} apps`);
       try {
         const outcome = await runHqSplit({
           jobId: job.id,
@@ -205,26 +205,26 @@ export async function runAppgoblinJob(job: JobRow): Promise<void> {
           onLog,
         });
         if (outcome.zipPath) {
-          setJobHqZipPath(job.id, outcome.zipPath);
+          await setJobHqZipPath(job.id, outcome.zipPath);
           const summary = Object.entries(outcome.perCountryCounts)
             .sort(([, a], [, b]) => b - a)
             .map(([c, n]) => `${c}=${n}`)
             .join(', ');
-          onLog('info', `appgoblin hq-split: zip ready (${summary})`);
+          await onLog('info', `appgoblin hq-split: zip ready (${summary})`);
         }
         if (outcome.playBlocked) {
-          onLog('warn', `appgoblin hq-split: Play page-fetch was blocked/rate-limited — Android resolution may be degraded`);
+          await onLog('warn', `appgoblin hq-split: Play page-fetch was blocked/rate-limited — Android resolution may be degraded`);
         }
       } catch (err) {
         if (err instanceof BudgetExceededError) throw err;
-        onLog('warn', `appgoblin hq-split failed (non-fatal): ${(err as Error).message}`);
+        await onLog('warn', `appgoblin hq-split failed (non-fatal): ${(err as Error).message}`);
       }
     }
 
-    markJobCompleted(job.id, csvPath, { ads: scrape.apps.length, advertisers: rowsWritten });
-    onLog('info', `appgoblin job completed`);
+    await markJobCompleted(job.id, csvPath, { ads: scrape.apps.length, advertisers: rowsWritten });
+    await onLog('info', `appgoblin job completed`);
 
-    const fresh = getJob(job.id);
+    const fresh = await getJob(job.id);
     if (fresh) {
       void notifyJobCompleted(fresh)
         .then(() => onLog('info', 'notification dispatched'))
@@ -238,27 +238,27 @@ export async function runAppgoblinJob(job: JobRow): Promise<void> {
         const cap = normalizeMaxLeads(
           job.source_params ? (JSON.parse(job.source_params) as Record<string, unknown>).maxLeads : null,
         );
-        const partial = buildCsv({ jobId: job.id, productType: job.product_type, results: getResults(job.id), maxRows: cap });
+        const partial = buildCsv({ jobId: job.id, productType: job.product_type, results: await getResults(job.id), maxRows: cap });
         csvPath = partial.path;
         kept = partial.rowsWritten;
       } catch { /* best-effort */ }
-      markJobCancelled(job.id, `stopped by user — ${kept} lead(s) kept`, csvPath);
-      onLog('warn', `appgoblin job stopped by user — ${kept} partial lead(s) exported`);
+      await markJobCancelled(job.id, `stopped by user — ${kept} lead(s) kept`, csvPath);
+      await onLog('warn', `appgoblin job stopped by user — ${kept} partial lead(s) exported`);
       return;
     }
     if (err instanceof BudgetExceededError) {
       const runAfter = nextJerusalemMidnightMs();
       const when = new Date(runAfter).toISOString();
-      deferJob(job.id, runAfter, `LLM daily cap ($${DAILY_CAP_USD}) reached; resumes after ${when}`);
-      onLog('warn', `appgoblin job deferred: LLM daily cap reached; resumes after ${when} (Jerusalem midnight)`);
+      await deferJob(job.id, runAfter, `LLM daily cap ($${DAILY_CAP_USD}) reached; resumes after ${when}`);
+      await onLog('warn', `appgoblin job deferred: LLM daily cap reached; resumes after ${when} (Jerusalem midnight)`);
       return;
     }
     const msg = (err as Error).message || 'unknown error';
     log.error(`appgoblin job ${job.id} failed`, err);
-    onLog('error', `appgoblin job failed: ${msg}`);
-    markJobFailed(job.id, msg);
+    await onLog('error', `appgoblin job failed: ${msg}`);
+    await markJobFailed(job.id, msg);
 
-    const fresh = getJob(job.id);
+    const fresh = await getJob(job.id);
     if (fresh) {
       void notifyJobFailed(fresh).catch((e) => onLog('warn', `failure notification error: ${(e as Error).message}`));
     }

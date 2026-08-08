@@ -135,8 +135,8 @@ export function extractPlayApplicationCategory(html: string): string | null {
 
 // ── Permanent cache (mirrors hqCache; keyed on app_id) ───────────────────────
 
-export function ensureAppCategoryTable(): void {
-  getDb().exec(`
+export async function ensureAppCategoryTable(): Promise<void>{
+  await getDb().exec(`
     CREATE TABLE IF NOT EXISTS app_category_cache (
       app_id TEXT PRIMARY KEY,
       store TEXT NOT NULL,
@@ -160,9 +160,9 @@ interface CacheRow {
   attempts: number;
 }
 
-export function lookupAppCategoryCache(appId: string): (AppCategory & { attempts: number }) | null {
+export async function lookupAppCategoryCache(appId: string): Promise<(AppCategory & { attempts: number; }) | null>{
   if (!appId) return null;
-  const row = getDb()
+  const row = await getDb()
     .prepare(`SELECT * FROM app_category_cache WHERE app_id = ?`)
     .get(appId) as CacheRow | undefined;
   if (!row) return null;
@@ -177,9 +177,9 @@ export function lookupAppCategoryCache(appId: string): (AppCategory & { attempts
   };
 }
 
-function storeAppCategoryCache(rec: AppCategory, attempts: number): void {
+async function storeAppCategoryCache(rec: AppCategory, attempts: number): Promise<void>{
   if (!rec.app_id) return;
-  getDb()
+  await getDb()
     .prepare(
       `INSERT INTO app_category_cache (app_id, store, category_raw, is_game, enrichment_source, failed, attempts, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -205,14 +205,14 @@ function storeAppCategoryCache(rec: AppCategory, attempts: number): void {
 }
 
 /** Count cached rows — used by tests to assert the second pass makes 0 requests. */
-export function countAppCategoryCache(): number {
-  const row = getDb().prepare(`SELECT COUNT(*) AS n FROM app_category_cache`).get() as { n: number };
+export async function countAppCategoryCache(): Promise<number>{
+  const row = await getDb().prepare(`SELECT COUNT(*) AS n FROM app_category_cache`).get() as { n: number };
   return row.n;
 }
 
 /** Test helper: delete one entry (NOT exposed as a route). */
-export function deleteAppCategoryCacheEntry(appId: string): void {
-  getDb().prepare(`DELETE FROM app_category_cache WHERE app_id = ?`).run(appId);
+export async function deleteAppCategoryCacheEntry(appId: string): Promise<void>{
+  await getDb().prepare(`DELETE FROM app_category_cache WHERE app_id = ?`).run(appId);
 }
 
 // ── Live enrichment ──────────────────────────────────────────────────────────
@@ -298,7 +298,7 @@ export async function enrichStoreUrls(
   storeUrls: string[],
   onLog?: LogFn,
 ): Promise<{ byStoreUrl: Map<string, AppCategory>; summary: EnrichSummary }> {
-  ensureAppCategoryTable();
+  await ensureAppCategoryTable();
   const byStoreUrl = new Map<string, AppCategory>();
   const summary: EnrichSummary = { apps: 0, enriched: 0, cached: 0, games: 0, nonGames: 0, unclassified: 0, requests: 0 };
 
@@ -321,7 +321,7 @@ export async function enrichStoreUrls(
     refByUrl.set(url, ref);
 
     // Cache-first (permanent for successes; retry-bounded for failures).
-    const cached = lookupAppCategoryCache(ref.app_id);
+    const cached = await lookupAppCategoryCache(ref.app_id);
     if (cached && (!cached.failed || cached.attempts >= MAX_ENRICH_ATTEMPTS)) {
       const rec: AppCategory = { ...cached, enrichment_source: cached.enrichment_source ?? 'cache' };
       byStoreUrl.set(url, rec);
@@ -337,9 +337,9 @@ export async function enrichStoreUrls(
     bucket.set(ref.app_id, list);
   }
 
-  const priorAttempts = (appId: string) => lookupAppCategoryCache(appId)?.attempts ?? 0;
-  const applyRecord = (rec: AppCategory, urls: string[]) => {
-    storeAppCategoryCache(rec, priorAttempts(rec.app_id) + 1);
+  const priorAttempts = async (appId: string) => (await lookupAppCategoryCache(appId))?.attempts ?? 0;
+  const applyRecord = async (rec: AppCategory, urls: string[]) => {
+    await storeAppCategoryCache(rec, (await priorAttempts(rec.app_id)) + 1);
     for (const u of urls) byStoreUrl.set(u, rec);
     if (rec.failed) summary.unclassified++;
     else { summary.enriched++; tally(rec); }
@@ -355,7 +355,7 @@ export async function enrichStoreUrls(
     for (const id of batch) {
       const urls = appleToFetch.get(id)!;
       const rec = map.get(id) ?? { app_id: id, store: 'app_store' as AppStore, category_raw: null, is_game: null, enrichment_source: null, failed: true };
-      applyRecord(rec, urls);
+      await applyRecord(rec, urls);
     }
   }
 
@@ -366,7 +366,7 @@ export async function enrichStoreUrls(
     if (i > 0 && PLAY_MIN_INTERVAL_MS > 0) await sleep(PLAY_MIN_INTERVAL_MS);
     summary.requests++;
     const rec = await fetchPlayCategory(id, onLog);
-    applyRecord(rec, playToFetch.get(id)!);
+    await applyRecord(rec, playToFetch.get(id)!);
   }
 
   return { byStoreUrl, summary };

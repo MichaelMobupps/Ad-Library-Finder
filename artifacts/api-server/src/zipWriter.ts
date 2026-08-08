@@ -64,10 +64,17 @@ function crc32Of(buf: Buffer): number {
  * Build a .zip archive from an array of entries. Returns the full byte buffer.
  * Files larger than 64 KiB use deflate; smaller files use store (zero gain
  * from deflate on tiny payloads and easier to inspect in tests).
+ *
+ * `modifiedAt` stamps every entry's DOS date/time. It defaults to now, which is
+ * right for an archive being written during a run — but a download REGENERATED
+ * from the database (download.ts) passes the job's own completion time instead,
+ * because otherwise the same job downloaded twice produces different bytes and
+ * "this link answers identically across a restart" is not a claim anyone can
+ * check. DOS timestamps have two-second granularity, which is exactly enough
+ * resolution to make that difference an intermittent one.
  */
-export function buildZip(entries: ZipEntry[]): Buffer {
-  const now = new Date();
-  const { time: dosTime, date: dosDate } = dosTimeDate(now);
+export function buildZip(entries: ZipEntry[], modifiedAt: Date = new Date()): Buffer {
+  const { time: dosTime, date: dosDate } = dosTimeDate(modifiedAt);
 
   // Phase 1: build per-entry blobs.
   const built: BuiltEntry[] = [];

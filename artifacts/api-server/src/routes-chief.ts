@@ -80,14 +80,14 @@ const unavailable = (res: Response, what: string, err: unknown) => {
 // ── GET /api/chief/status ────────────────────────────────────────────────────
 // Liveness plus the three facts the Chief schedules against. Every value is
 // read; none is asserted. A failed read is a 503, never a plausible zero.
-chiefRouter.get('/status', (_req: Request, res: Response) => {
+chiefRouter.get('/status', async (_req: Request, res: Response) => {
   try {
     res.json({
       app: 'leadfinder',
       ok: true,
-      accepting_jobs: acceptingJobs(),
-      active_jobs: activeJobCount(),
-      spend_today_usd: spendTodayUsd(jerusalemDay()),
+      accepting_jobs: await acceptingJobs(),
+      active_jobs: await activeJobCount(),
+      spend_today_usd: await spendTodayUsd(jerusalemDay()),
       server_time: new Date().toISOString(),
     });
   } catch (err) {
@@ -100,7 +100,7 @@ chiefRouter.get('/status', (_req: Request, res: Response) => {
 
 // ── POST /api/chief/jobs ─────────────────────────────────────────────────────
 // Create a discovery job, or hand back the one this external_id already names.
-chiefRouter.post('/jobs', (req: Request, res: Response) => {
+chiefRouter.post('/jobs', async (req: Request, res: Response) => {
   if (!req.is('application/json')) {
     return res.status(415).json({ error: 'Content-Type: application/json required' });
   }
@@ -111,7 +111,7 @@ chiefRouter.post('/jobs', (req: Request, res: Response) => {
   // The same predicate /status reports, so the flag can never promise something
   // this path refuses. Today it is false only when the database is unreadable.
   try {
-    if (!acceptingJobs()) {
+    if (!await acceptingJobs()) {
       return res.status(503).json({ error: 'not accepting jobs' });
     }
   } catch (err) {
@@ -120,7 +120,7 @@ chiefRouter.post('/jobs', (req: Request, res: Response) => {
   }
 
   try {
-    const { job, created } = createCommandedJob(parsed.value);
+    const { job, created } = await createCommandedJob(parsed.value);
     return res
       .status(created ? 201 : 200)
       .json({ created, job: jobToChiefDto(job, parsed.value.external_id) });
@@ -135,11 +135,11 @@ chiefRouter.post('/jobs', (req: Request, res: Response) => {
 // own, so a human's job is indistinguishable from one that never existed.
 // (handler params intentionally un-annotated: the Express 5 types infer
 // `{ id: string }` from the route string, exactly as routes-jobs.ts relies on.)
-chiefRouter.get('/jobs/:id', (req, res) => {
+chiefRouter.get('/jobs/:id', async (req, res) => {
   try {
-    const job = getChiefJob(req.params.id);
+    const job = await getChiefJob(req.params.id);
     if (!job) return notFound(res);
-    return res.json({ job: jobToChiefDto(job, externalIdForJob(job.id)) });
+    return res.json({ job: jobToChiefDto(job, await externalIdForJob(job.id)) });
   } catch (err) {
     return unavailable(res, 'job read', err);
   }
@@ -155,10 +155,10 @@ chiefRouter.get('/jobs/:id', (req, res) => {
 // only ever appended, so an offset stays meaningful across polls of a running
 // job — which is why a partial read is allowed rather than refused. `final`
 // says whether what came back can still change.
-chiefRouter.get('/jobs/:id/leads', (req, res) => {
+chiefRouter.get('/jobs/:id/leads', async (req, res) => {
   let job;
   try {
-    job = getChiefJob(req.params.id);
+    job = await getChiefJob(req.params.id);
   } catch (err) {
     return unavailable(res, 'leads read', err);
   }
@@ -169,7 +169,7 @@ chiefRouter.get('/jobs/:id/leads', (req, res) => {
 
   let rows;
   try {
-    rows = selectExportRows(getResults(job.id), job.product_type, jobLeadCount(job));
+    rows = selectExportRows(await getResults(job.id), job.product_type, jobLeadCount(job));
   } catch (err) {
     return unavailable(res, 'leads read', err);
   }

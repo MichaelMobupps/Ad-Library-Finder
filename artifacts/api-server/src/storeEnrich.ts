@@ -97,16 +97,22 @@ function tally(summary: EnrichSummary, isGame: number | null): void {
  * cached minInstalls (desc); then remaining non-chart by most-recent cached
  * store update (desc); then the rest (unknown — arbitrary but stable).
  */
-function orderWorklist(items: EnrichWorkItem[]): EnrichWorkItem[] {
-  const withMeta = items.map((it, idx) => {
-    const cached = getAppDetail(it.store, it.app_id);
-    return {
-      it,
-      idx,
-      minInstalls: cached?.min_installs ?? null,
-      updated: cached?.store_updated_at ?? null,
-    };
-  });
+async function orderWorklist(items: EnrichWorkItem[]): Promise<EnrichWorkItem[]> {
+  // The cached metadata each row is ordered BY now comes from the database, so
+  // it has to be resolved before the comparator runs — a comparator cannot
+  // await, and sorting an array of pending promises would order the worklist by
+  // nothing at all while still looking like it worked.
+  const withMeta = await Promise.all(
+    items.map(async (it, idx) => {
+      const cached = await getAppDetail(it.store, it.app_id);
+      return {
+        it,
+        idx,
+        minInstalls: cached?.min_installs ?? null,
+        updated: cached?.store_updated_at ?? null,
+      };
+    }),
+  );
   withMeta.sort((a, b) => {
     // 1. chart apps first
     if (a.it.is_chart !== b.it.is_chart) return a.it.is_chart ? -1 : 1;
@@ -138,7 +144,7 @@ export async function enrichApps(
   items: EnrichWorkItem[],
   onLog?: LogFn,
   opts?: {
-    shouldStop?: () => boolean;
+    shouldStop?: () => boolean | Promise<boolean>;
     /** Fetch-stream progress: (network units done, total units) — one unit is a
      *  Play detail fetch or an Apple lookup batch. Cache hits are excluded, so
      *  this tracks the part of the pass that actually costs wall-clock. */
@@ -175,7 +181,7 @@ export async function enrichApps(
   }
   summary.apps = unique.length;
 
-  const ordered = orderWorklist(unique);
+  const ordered = await orderWorklist(unique);
 
   // Split into cached-terminal (no fetch) vs to-fetch, preserving order.
   const toFetchPlay: EnrichWorkItem[] = [];
@@ -190,7 +196,7 @@ export async function enrichApps(
   };
 
   for (const it of ordered) {
-    const cached = getAppDetail(it.store, it.app_id);
+    const cached = await getAppDetail(it.store, it.app_id);
     if (cacheIsTerminal(cached)) {
       if (cached!.enrich_status === 'failed') summary.failed++;
       else {
@@ -235,23 +241,23 @@ export async function enrichApps(
   // ── Play: one detail fetch per app (already throttled inside playSource). ──
   const playStream = async () => {
     for (const it of toFetchPlay) {
-      if (opts?.shouldStop?.()) {
+      if (await opts?.shouldStop?.()) {
         onLog?.('warn', 'enrich: stop requested — ending Play enrichment early (cache keeps everything done so far)');
         return;
       }
-      const prior = getAppDetail(it.store, it.app_id);
+      const prior = await getAppDetail(it.store, it.app_id);
       const attempts = (prior?.attempts ?? 0) + 1;
       summary.requests++;
       // eslint-disable-next-line no-await-in-loop
       const d = await playAppDetail(it.app_id, it.country || 'us', onLog);
       tick();
       if (!d) {
-        upsertAppDetail(failedRow(it.store, it.app_id, prior, attempts));
+        await upsertAppDetail(failedRow(it.store, it.app_id, prior, attempts));
         summary.failed++;
         continue;
       }
       const isGame = playIsGame(d.genreId);
-      upsertAppDetail({
+      await upsertAppDetail({
         store: 'google_play',
         app_id: d.appId,
         title: d.title || null,
@@ -283,7 +289,7 @@ export async function enrichApps(
   const appleStream = async () => {
     for (const [cc, group] of appleGroups) {
       for (let i = 0; i < group.length; i += ITUNES_LOOKUP_BATCH) {
-        if (opts?.shouldStop?.()) {
+        if (await opts?.shouldStop?.()) {
           onLog?.('warn', 'enrich: stop requested — ending Apple lookups early (cache keeps everything done so far)');
           return;
         }
@@ -292,7 +298,7 @@ export async function enrichApps(
         // eslint-disable-next-line no-await-in-loop
         const map = await appleLookup(batch.map((b) => b.app_id), cc, onLog);
         tick();
-        enrichAppleBatch(batch, map, summary);
+        await enrichAppleBatch(batch, map, summary);
       }
     }
   };
@@ -317,22 +323,22 @@ export function groupByEnrichCountry(items: EnrichWorkItem[]): Map<string, Enric
 }
 
 /** Write one /lookup batch's results (or failures) onto the cache + summary. */
-function enrichAppleBatch(
+async function enrichAppleBatch(
   batch: EnrichWorkItem[],
   map: Map<string, AppleAppDetail>,
   summary: EnrichSummary,
-): void {
+): Promise<void>{
   for (const it of batch) {
-    const prior = getAppDetail(it.store, it.app_id);
+    const prior = await getAppDetail(it.store, it.app_id);
     const attempts = (prior?.attempts ?? 0) + 1;
     const d = map.get(it.app_id);
     if (!d) {
-      upsertAppDetail(failedRow(it.store, it.app_id, prior, attempts));
+      await upsertAppDetail(failedRow(it.store, it.app_id, prior, attempts));
       summary.failed++;
       continue;
     }
     const isGame = appleIsGame(d.primaryGenreId, d.genreIds);
-    upsertAppDetail({
+    await upsertAppDetail({
       store: 'app_store',
       app_id: d.appId,
       title: d.title || null,

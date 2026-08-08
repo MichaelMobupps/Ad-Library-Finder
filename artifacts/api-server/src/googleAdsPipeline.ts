@@ -184,13 +184,13 @@ export function verticalsForJob(pinned: string[] | null | undefined): string[] {
 }
 
 export async function runGoogleAdsJob(job: JobRow): Promise<void> {
-  markJobRunning(job.id);
-  const onLog = (level: 'info' | 'warn' | 'error' | 'debug', msg: string) => {
-    appendLog(job.id, level, msg);
+  await markJobRunning(job.id);
+  const onLog = async (level: 'info' | 'warn' | 'error' | 'debug', msg: string) => {
+    await appendLog(job.id, level, msg);
     log.info(`[job ${job.id}] ${msg}`);
   };
 
-  onLog('info', `google-ads job started: product=${job.product_type}, countries=${job.countries}`);
+  await onLog('info', `google-ads job started: product=${job.product_type}, countries=${job.countries}`);
 
   // Hoisted above the try so the catch can still report the job's traffic burn.
   let trafficBefore: ProxyTrafficSnapshot | null = null;
@@ -211,7 +211,7 @@ export async function runGoogleAdsJob(job: JobRow): Promise<void> {
     trafficBefore = await checkProxyTrafficBeforeJob(onLog);
 
     // Resume-safety: a job deferred for the daily cap replays from the top.
-    clearJobResults(job.id);
+    await clearJobResults(job.id);
 
     // Start each job with a clean scraper session: fresh cookies (re-warmed at
     // discovery) and throttle baseline, so a long-lived server doesn't carry one
@@ -223,7 +223,7 @@ export async function runGoogleAdsJob(job: JobRow): Promise<void> {
     if (activeRunCount('google_ads', 'store_first') <= 1) {
       resetGoogleAdsSession();
     } else {
-      onLog('info', 'google-ads: another GATC-using job is in flight — keeping the shared session warm (no reset)');
+      await onLog('info', 'google-ads: another GATC-using job is in flight — keeping the shared session warm (no reset)');
     }
 
     const params = parseParams(job);
@@ -248,7 +248,7 @@ export async function runGoogleAdsJob(job: JobRow): Promise<void> {
       }
       const cap = params.maxKeywords && params.maxKeywords > 0 ? params.maxKeywords : keywords.length;
       keywords = keywords.slice(0, cap);
-      onLog('info', `google-ads: using ${keywords.length} custom keywords`);
+      await onLog('info', `google-ads: using ${keywords.length} custom keywords`);
     } else {
       const limit = params.maxKeywords && params.maxKeywords > 0 ? params.maxKeywords : DEFAULT_MAX_KEYWORDS;
       // DEMOTED (store-first migration, spec step 14): NAME-TOKEN batteries are
@@ -277,7 +277,7 @@ export async function runGoogleAdsJob(job: JobRow): Promise<void> {
         limit,
       });
       if (!pinnedVerticals) {
-        onLog(
+        await onLog(
           'info',
           "google-ads: name-token app batteries ('apps','apps_nongame') are inactive by default since the store-first migration " +
             '— structural: name search resolves advertiser-name matches only. Pin those verticals explicitly to re-enable them, ' +
@@ -285,7 +285,7 @@ export async function runGoogleAdsJob(job: JobRow): Promise<void> {
         );
       }
       const stats = keywordStats();
-      onLog(
+      await onLog(
         'info',
         `google-ads: drew ${keywords.length} keywords from the exemplar bank (${stats.total} total, ${stats.languages} languages, ${stats.verticals} verticals)` +
           // Only echo the verticals the OPERATOR chose: unpinned jobs now carry the
@@ -297,7 +297,7 @@ export async function runGoogleAdsJob(job: JobRow): Promise<void> {
     }
 
     if (keywords.length === 0) {
-      onLog('warn', 'google-ads: keyword set is empty — nothing to search');
+      await onLog('warn', 'google-ads: keyword set is empty — nothing to search');
     }
 
     // ── 2+3+4. Discover, resolve, classify & persist — STREAMING, real time ──
@@ -306,7 +306,7 @@ export async function runGoogleAdsJob(job: JobRow): Promise<void> {
     // (regex, no LLM), inserts it, and re-flushes the CSV. So the file grows
     // continuously from the first lead and a mid-scrape block/kill loses
     // nothing — discovery and writing are effectively concurrent.
-    setJobPhase(job.id, 'scraping', `searching ${keywords.length} keywords`);
+    await setJobPhase(job.id, 'scraping', `searching ${keywords.length} keywords`);
     const lookupBudget = makeLookupBudget(MAX_CREATIVE_LOOKUPS);
     const nameSearchBudget = makeSearchBudget(WEB_NAME_SEARCHES);
 
@@ -317,7 +317,7 @@ export async function runGoogleAdsJob(job: JobRow): Promise<void> {
     const cpsMode = job.product_type !== 'mobile';
     const skipCreativesFromStart = cpsMode && !CPS_USE_CREATIVES;
     if (skipCreativesFromStart) {
-      onLog('info', 'google-ads: CPS mode — creative lookups OFF (domain-first + name-search); minimal endpoint footprint');
+      await onLog('info', 'google-ads: CPS mode — creative lookups OFF (domain-first + name-search); minimal endpoint footprint');
     }
 
     let processed = 0;
@@ -355,19 +355,19 @@ export async function runGoogleAdsJob(job: JobRow): Promise<void> {
     // and a blocked/interrupted/failed job still exposes everything found so far.
     let csvPathPublished = false;
     let announcedLive = false;
-    const flushCsv = () => {
+    const flushCsv = async () => {
       try {
-        const { path: p, rowsWritten } = buildCsv({ jobId: job.id, productType: job.product_type, results: getResults(job.id) });
+        const { path: p, rowsWritten } = buildCsv({ jobId: job.id, productType: job.product_type, results: await getResults(job.id) });
         if (!csvPathPublished) {
-          setJobCsvPath(job.id, p);
+          await setJobCsvPath(job.id, p);
           csvPathPublished = true;
         }
         if (rowsWritten > 0 && !announcedLive) {
           announcedLive = true;
-          onLog('info', `google-ads: CSV is live (${rowsWritten} ${job.product_type} row(s)) — saved from here on, survives a block/kill`);
+          await onLog('info', `google-ads: CSV is live (${rowsWritten} ${job.product_type} row(s)) — saved from here on, survives a block/kill`);
         }
       } catch (err) {
-        onLog('warn', `google-ads: incremental CSV flush failed (non-fatal): ${(err as Error).message}`);
+        await onLog('warn', `google-ads: incremental CSV flush failed (non-fatal): ${(err as Error).message}`);
       }
     };
 
@@ -377,10 +377,10 @@ export async function runGoogleAdsJob(job: JobRow): Promise<void> {
     const processAdvertiser = async (adv: GoogleAdsAdvertiser): Promise<void> => {
       // Stop button: don't start work on further advertisers — the CSV already
       // holds everything inserted so far; discovery's shouldStop ends the run.
-      if (isCancelRequested(job.id)) return;
+      if (await isCancelRequested(job.id)) return;
       if (processed >= MAX_ADVERTISERS) return;
       processed++;
-      if (processed === 1) setJobPhase(job.id, 'classifying', 'resolving as discovered…');
+      if (processed === 1) await setJobPhase(job.id, 'classifying', 'resolving as discovered…');
 
       const dest = await resolveAdvertiserDestination(adv, { region, lookupBudget, onLog, skipCreativeLookups, mobileFocus: !cpsMode });
 
@@ -401,13 +401,13 @@ export async function runGoogleAdsJob(job: JobRow): Promise<void> {
           const reason = consecutiveTrip
             ? `${consecutiveBlockedLookups} blocked in a row`
             : `${creativeBlocks}/${creativeAttempts} creative lookups blocked`;
-          onLog(
+          await onLog(
             'warn',
             `google-ads: creative endpoint is blocking (${reason}) — PAUSING creative scraping (circuit breaker ON). ` +
               `Remaining advertisers resolve from their verified domain only (instant, no network). ` +
               `Everything found so far is already saved in the CSV.`,
           );
-          flushCsv();
+          await flushCsv();
         }
       }
 
@@ -433,12 +433,12 @@ export async function runGoogleAdsJob(job: JobRow): Promise<void> {
         } catch (err) {
           if (err instanceof BudgetExceededError) {
             nameSearchDisabled = true;
-            onLog(
+            await onLog(
               'warn',
               'google-ads: LLM daily cap reached during name-search — name-search OFF for the rest of this job (domain leads continue; already-saved leads unaffected)',
             );
           } else {
-            onLog('warn', `google-ads: name-search failed for "${adv.name}" (non-fatal): ${(err as Error).message}`);
+            await onLog('warn', `google-ads: name-search failed for "${adv.name}" (non-fatal): ${(err as Error).message}`);
           }
         }
       }
@@ -453,7 +453,7 @@ export async function runGoogleAdsJob(job: JobRow): Promise<void> {
           dupSkipped++;
         } else {
           insertedKeys.add(dedupeKey);
-          insertResult({
+          await insertResult({
             job_id: job.id,
             advertiser_name: adv.name || adv.domain || adv.advertiser_id || '(unknown advertiser)',
             page_url: advertiserUrl(adv),
@@ -464,33 +464,33 @@ export async function runGoogleAdsJob(job: JobRow): Promise<void> {
             country: adv.region || informationalCountry,
           });
           inserted++;
-          setJobLeadsFound(job.id, inserted); // live counter for the UI
+          await setJobLeadsFound(job.id, inserted); // live counter for the UI
           if (cls.classification === 'cps_web') webCount++;
           else mobileCount++;
-          flushCsv(); // real-time: the file reflects every lead the moment it lands
+          await flushCsv(); // real-time: the file reflects every lead the moment it lands
         }
       }
 
       if (processed % 10 === 0) {
-        setJobPhase(job.id, 'classifying', `resolved ${processed} · ${mobileCount} mobile · ${webCount} web`);
+        await setJobPhase(job.id, 'classifying', `resolved ${processed} · ${mobileCount} mobile · ${webCount} web`);
       }
       if (processed % 25 === 0) {
-        onLog(
+        await onLog(
           'info',
           `google-ads: processed ${processed} — mobile ${mobileCount}, web ${webCount}, unresolved ${unresolved} (creative-lookups left ${lookupBudget.remaining()})`,
         );
       }
     };
 
-    setJobProgress(job.id, 3); // proxy checked, session warm — discovery starts
+    await setJobProgress(job.id, 3); // proxy checked, session warm — discovery starts
     const discovery = await discoverAdvertisers(keywords, {
       region,
       onLog,
-      onProgress: (done, total, found) => {
+      onProgress: async (done, total, found) => {
         // Keyword sweep dominates this pipeline's wall-clock: 3..70 of overall.
-        setJobProgress(job.id, 3 + 67 * (done / Math.max(1, total)));
+        await setJobProgress(job.id, 3 + 67 * (done / Math.max(1, total)));
         if (done % 5 === 0 || done === total) {
-          setJobPhase(
+          await setJobPhase(
             job.id,
             processed > 0 ? 'classifying' : 'scraping',
             `keyword ${done}/${total} · ${found} found · ${inserted} saved`,
@@ -498,34 +498,34 @@ export async function runGoogleAdsJob(job: JobRow): Promise<void> {
         }
       },
       onAdvertiser: processAdvertiser,
-      shouldStop: () => processed >= MAX_ADVERTISERS || isCancelRequested(job.id),
+      shouldStop: async () => processed >= MAX_ADVERTISERS || await isCancelRequested(job.id),
     });
     // Stop button pressed mid-discovery: unwind now. The catch below finalizes
     // with everything already inserted (the CSV is flushed on every insert).
-    throwIfCancelled(job.id);
+    await throwIfCancelled(job.id);
 
-    onLog(
+    await onLog(
       'info',
       `google-ads: discovery done — ${discovery.advertisers.length} unique advertisers from ${discovery.keywordsSearched} keywords (${discovery.requestsMade} requests); resolved ${processed}`,
     );
-    for (const note of discovery.notes) onLog('warn', `google-ads: ${note}`);
+    for (const note of discovery.notes) await onLog('warn', `google-ads: ${note}`);
     if (discovery.blocked) {
-      onLog(
+      await onLog(
         'warn',
         'google-ads: some/all requests were blocked (HTTP 403/429 or a challenge page). Google fingerprints non-browser clients — results may be partial. Re-run from a residential/less-flagged IP (set GOOGLE_ADS_PROXY_URL) or lower the keyword count if this persists.',
       );
     }
     if (processed >= MAX_ADVERTISERS) {
-      onLog('warn', `google-ads: hit the ${MAX_ADVERTISERS}-advertiser cap (GOOGLE_ADS_MAX_ADVERTISERS); discovery may have found more.`);
+      await onLog('warn', `google-ads: hit the ${MAX_ADVERTISERS}-advertiser cap (GOOGLE_ADS_MAX_ADVERTISERS); discovery may have found more.`);
     }
     if (discovery.advertisers.length === 0) {
-      onLog(
+      await onLog(
         'warn',
         'google-ads: 0 advertisers discovered. Either the keywords matched nothing or the endpoint is blocking this host. The CSV will be empty.',
       );
     }
 
-    onLog(
+    await onLog(
       'info',
       `google-ads: classification done — inserted ${inserted} rows (mobile ${mobileCount}, web ${webCount}), unresolved ${unresolved}, dup-skipped ${dupSkipped}` +
         (nameSearched > 0 ? `, name-searches ${nameSearched}/${WEB_NAME_SEARCHES}` : ''),
@@ -537,38 +537,38 @@ export async function runGoogleAdsJob(job: JobRow): Promise<void> {
     // re-runs make zero store requests. Best-effort: a failure never fails the
     // job (leads still ship, just Unclassified). Runs BEFORE the CSV so the
     // app_category / is_game columns are populated in the exported file.
-    throwIfCancelled(job.id);
-    setJobProgress(job.id, 72); // discovery + resolution done
+    await throwIfCancelled(job.id);
+    await setJobProgress(job.id, 72); // discovery + resolution done
     if (job.product_type === 'mobile') {
       try {
-        const mobileRows = getResults(job.id).filter(
+        const mobileRows = await (await getResults(job.id)).filter(
           (r) => (r.classification === 'mobile_google_play' || r.classification === 'mobile_app_store') && r.store_url,
         );
         if (mobileRows.length > 0) {
-          setJobPhase(job.id, 'enriching', `categorizing ${mobileRows.length} app(s)`);
+          await setJobPhase(job.id, 'enriching', `categorizing ${mobileRows.length} app(s)`);
           const { byStoreUrl, summary } = await enrichStoreUrls(
             mobileRows.map((r) => r.store_url as string),
             onLog,
           );
           for (const r of mobileRows) {
             const rec = r.store_url ? byStoreUrl.get(r.store_url) : undefined;
-            if (rec) setResultCategory(r.id, rec.category_raw, rec.is_game);
+            if (rec) await setResultCategory(r.id, rec.category_raw, rec.is_game);
           }
-          onLog(
+          await onLog(
             'info',
             `google-ads: category enrichment — ${summary.games} game, ${summary.nonGames} non-game, ${summary.unclassified} unclassified across ${summary.apps} app(s) ` +
               `(${summary.cached} cached, ${summary.requests} store request(s))`,
           );
         }
       } catch (err) {
-        onLog('warn', `google-ads: category enrichment failed (non-fatal): ${(err as Error).message}`);
+        await onLog('warn', `google-ads: category enrichment failed (non-fatal): ${(err as Error).message}`);
       }
     }
 
     // ── 5. CSV (filters by product type) ──
-    setJobProgress(job.id, 78);
-    setJobPhase(job.id, 'building_csv', `writing ${job.product_type} CSV`);
-    const allResults = getResults(job.id);
+    await setJobProgress(job.id, 78);
+    await setJobPhase(job.id, 'building_csv', `writing ${job.product_type} CSV`);
+    const allResults = await getResults(job.id);
     // Operator-chosen lead cap (20/50/100/all). Resolved once and used for BOTH
     // the CSV and the HQ split below, so the Excel bundle never disagrees with the
     // CSV about how many leads this job delivered.
@@ -583,11 +583,11 @@ export async function runGoogleAdsJob(job: JobRow): Promise<void> {
     });
     const exportRows = selectExportRows(allResults, job.product_type, maxLeads);
     if (maxLeads != null && rowsWritten >= maxLeads) {
-      onLog('info', `google-ads: lead cap applied — exported ${rowsWritten} of ${selectExportRows(allResults, job.product_type).length} eligible leads`);
+      await onLog('info', `google-ads: lead cap applied — exported ${rowsWritten} of ${selectExportRows(allResults, job.product_type).length} eligible leads`);
     }
-    onLog('info', `google-ads: CSV written: ${csvPath} (${rowsWritten} ${job.product_type} rows)`);
+    await onLog('info', `google-ads: CSV written: ${csvPath} (${rowsWritten} ${job.product_type} rows)`);
     if (rowsWritten === 0) {
-      onLog(
+      await onLog(
         'warn',
         `google-ads: CSV is empty for product_type=${job.product_type}. ${
           job.product_type === 'mobile'
@@ -596,7 +596,7 @@ export async function runGoogleAdsJob(job: JobRow): Promise<void> {
         } Check the discovery/block warnings above.`,
       );
       if (job.product_type === 'mobile' && webCount > 0) {
-        onLog(
+        await onLog(
           'warn',
           `google-ads: NOTE — ${webCount} WEB (cps_web) leads WERE found and ARE saved. They are excluded from a mobile CSV ` +
             `(store URLs need creative lookups, which were blocked/degraded this run). ` +
@@ -606,46 +606,46 @@ export async function runGoogleAdsJob(job: JobRow): Promise<void> {
     }
 
     // ── 6. HQ split (mobile → store-page HQ; cps → web/domain HQ) ──
-    throwIfCancelled(job.id);
-    setJobProgress(job.id, 82); // completion pins 100
-    setJobPhase(job.id, 'hq_splitting', `resolving HQ for ${rowsWritten} leads`);
+    await throwIfCancelled(job.id);
+    await setJobProgress(job.id, 82); // completion pins 100
+    await setJobPhase(job.id, 'hq_splitting', `resolving HQ for ${rowsWritten} leads`);
     try {
       if (job.product_type === 'mobile') {
         const outcome = await runHqSplit({ jobId: job.id, results: exportRows, onLog });
         if (outcome.zipPath) {
-          setJobHqZipPath(job.id, outcome.zipPath);
+          await setJobHqZipPath(job.id, outcome.zipPath);
           const summary = Object.entries(outcome.perCountryCounts)
             .sort(([, a], [, b]) => b - a)
             .map(([c, n]) => `${c}=${n}`)
             .join(', ');
-          onLog('info', `google-ads hq-split: zip ready (${summary})`);
+          await onLog('info', `google-ads hq-split: zip ready (${summary})`);
         }
         if (outcome.playBlocked) {
-          onLog('warn', 'google-ads hq-split: Play page-fetch was blocked/rate-limited — Android HQ resolution may be degraded');
+          await onLog('warn', 'google-ads hq-split: Play page-fetch was blocked/rate-limited — Android HQ resolution may be degraded');
         }
       } else {
         const outcome = await runHqSplitWeb({ jobId: job.id, results: exportRows, onLog });
         if (outcome.zipPath) {
-          setJobHqZipPath(job.id, outcome.zipPath);
+          await setJobHqZipPath(job.id, outcome.zipPath);
           const summary = Object.entries(outcome.perCountryCounts)
             .sort(([, a], [, b]) => b - a)
             .map(([c, n]) => `${c}=${n}`)
             .join(', ');
-          onLog('info', `google-ads web-hq-split: zip ready (${summary})`);
+          await onLog('info', `google-ads web-hq-split: zip ready (${summary})`);
         }
       }
     } catch (err) {
       if (err instanceof BudgetExceededError) throw err;
-      onLog('warn', `google-ads hq-split failed (non-fatal): ${(err as Error).message}`);
+      await onLog('warn', `google-ads hq-split failed (non-fatal): ${(err as Error).message}`);
     }
 
     // Burn report: what this job actually cost in proxy traffic (best-effort).
     await logProxyTrafficAfterJob(trafficBefore, onLog);
 
-    markJobCompleted(job.id, csvPath, { ads: discovery.advertisers.length, advertisers: rowsWritten });
-    onLog('info', 'google-ads job completed');
+    await markJobCompleted(job.id, csvPath, { ads: discovery.advertisers.length, advertisers: rowsWritten });
+    await onLog('info', 'google-ads job completed');
 
-    const fresh = getJob(job.id);
+    const fresh = await getJob(job.id);
     if (fresh) {
       void notifyJobCompleted(fresh)
         .then(() => onLog('info', 'notification dispatched'))
@@ -666,29 +666,29 @@ export async function runGoogleAdsJob(job: JobRow): Promise<void> {
         const cap = normalizeMaxLeads(
           job.source_params ? (JSON.parse(job.source_params) as Record<string, unknown>).maxLeads : null,
         );
-        const partial = buildCsv({ jobId: job.id, productType: job.product_type, results: getResults(job.id), maxRows: cap });
+        const partial = buildCsv({ jobId: job.id, productType: job.product_type, results: await getResults(job.id), maxRows: cap });
         csvPath = partial.path;
         kept = partial.rowsWritten;
       } catch {
         /* best-effort — the incrementally-flushed file (if any) remains */
       }
-      markJobCancelled(job.id, `stopped by user — ${kept} lead(s) kept`, csvPath);
-      onLog('warn', `google-ads job stopped by user — ${kept} partial lead(s) exported`);
+      await markJobCancelled(job.id, `stopped by user — ${kept} lead(s) kept`, csvPath);
+      await onLog('warn', `google-ads job stopped by user — ${kept} partial lead(s) exported`);
       return;
     }
     if (err instanceof BudgetExceededError) {
       const runAfter = nextJerusalemMidnightMs();
       const when = new Date(runAfter).toISOString();
-      deferJob(job.id, runAfter, `LLM daily cap ($${DAILY_CAP_USD}) reached; resumes after ${when}`);
-      onLog('warn', `google-ads job deferred: LLM daily cap reached; resumes after ${when} (Jerusalem midnight)`);
+      await deferJob(job.id, runAfter, `LLM daily cap ($${DAILY_CAP_USD}) reached; resumes after ${when}`);
+      await onLog('warn', `google-ads job deferred: LLM daily cap reached; resumes after ${when} (Jerusalem midnight)`);
       return;
     }
     const msg = (err as Error).message || 'unknown error';
     log.error(`google-ads job ${job.id} failed`, err);
-    onLog('error', `google-ads job failed: ${msg}`);
-    markJobFailed(job.id, msg);
+    await onLog('error', `google-ads job failed: ${msg}`);
+    await markJobFailed(job.id, msg);
 
-    const fresh = getJob(job.id);
+    const fresh = await getJob(job.id);
     if (fresh) {
       void notifyJobFailed(fresh).catch((e) => onLog('warn', `failure notification error: ${(e as Error).message}`));
     }

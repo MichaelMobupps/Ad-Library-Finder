@@ -74,7 +74,7 @@ interface SplitOptions {
   onLog: (level: 'info' | 'warn' | 'error' | 'debug', msg: string) => void;
 }
 
-const HEADER = [
+export const MOBILE_HQ_HEADER = [
   'advertiser_name',
   'country', // the geo the ad was scraped in
   'store_url',
@@ -91,7 +91,7 @@ const HEADER = [
   'resolve_reasoning',
 ];
 
-function rowFromResult(r: JobResultRow, hq: ResolvedHq | null): (string | number | null)[] {
+export function mobileHqRow(r: JobResultRow, hq: ResolvedHq | null): (string | number | null)[] {
   const storeLabel =
     r.classification === 'mobile_google_play' ? 'google_play' :
     r.classification === 'mobile_app_store' ? 'app_store' : '';
@@ -119,7 +119,7 @@ function rowFromResult(r: JobResultRow, hq: ResolvedHq | null): (string | number
  * zip path or null if there were no mobile results to split.
  */
 export async function runHqSplit(opts: SplitOptions): Promise<HqSplitOutcome> {
-  ensureHqCacheTable();
+  await ensureHqCacheTable();
 
   if (!existsSync(ZIP_DIR)) mkdirSync(ZIP_DIR, { recursive: true });
 
@@ -152,7 +152,7 @@ export async function runHqSplit(opts: SplitOptions): Promise<HqSplitOutcome> {
     const r = mobile[i];
     const storeUrl = r.store_url!;
 
-    let hq: ResolvedHq | null = lookupHqCache(storeUrl);
+    let hq: ResolvedHq | null = await lookupHqCache(storeUrl);
     if (hq) {
       outcome.cacheHits++;
       opts.onLog('debug', `hq-split: cache hit for ${storeUrl} → ${hq.primary_market || 'Unknown'}`);
@@ -174,7 +174,7 @@ export async function runHqSplit(opts: SplitOptions): Promise<HqSplitOutcome> {
       try {
         hq = await resolveHq(page);
         outcome.llmCalls++;
-        storeHqCache(storeUrl, hq);
+        await storeHqCache(storeUrl, hq);
         opts.onLog(
           'debug',
           `hq-split: resolved ${storeUrl} → company="${hq.company_name}" market="${hq.primary_market}" via ${hq.override_source}`
@@ -203,7 +203,7 @@ export async function runHqSplit(opts: SplitOptions): Promise<HqSplitOutcome> {
   for (const [country, items] of Object.entries(bucketed)) {
     const slug = countryToFilenameSlug(country);
     const filename = `${slug}.xlsx`;
-    const rows: (string | number | null)[][] = [HEADER, ...items.map((it) => rowFromResult(it.result, it.hq))];
+    const rows: (string | number | null)[][] = [MOBILE_HQ_HEADER, ...items.map((it) => mobileHqRow(it.result, it.hq))];
     const xlsxBuf = buildXlsx({ name: slug.slice(0, 31), rows });
     zipEntries.push({ path: filename, data: xlsxBuf });
     outcome.perCountryCounts[country] = items.length;

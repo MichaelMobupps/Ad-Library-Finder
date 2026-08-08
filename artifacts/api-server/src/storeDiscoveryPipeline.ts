@@ -134,9 +134,9 @@ import { log } from './logger.js';
 type OnLog = (level: 'info' | 'warn' | 'error' | 'debug', msg: string) => void;
 
 export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
-  markJobRunning(job.id);
-  const onLog: OnLog = (level, msg) => {
-    appendLog(job.id, level, msg);
+  await markJobRunning(job.id);
+  const onLog: OnLog = async (level, msg) => {
+    await appendLog(job.id, level, msg);
     log.info(`[job ${job.id}] ${msg}`);
   };
   onLog('info', `store-first discovery job started`);
@@ -155,7 +155,7 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
         `similarCap=${params.similarMaxAppsPerRun} searchTerms/vert=${params.searchTermsLimit ?? 'all'} confirmBudget=${params.confirmationMaxApiCalls}`,
     );
 
-    purgeUsEraGeoStamps(onLog);
+    await purgeUsEraGeoStamps(onLog);
     // The fast lane's change detector is module state; clear it so THIS run
     // never inherits the previous job's "nothing new" verdict.
     resetFastLaneCache();
@@ -166,7 +166,7 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
     // RESUME they would mark the job's own partial export as "already
     // delivered" and silently drop it from the final CSV. Clearing this job's
     // own rows re-opens exactly those leads to this run — no-op on a fresh job.
-    clearJobResults(job.id);
+    await clearJobResults(job.id);
 
     // Overall progress across EVERY phase, as weighted spans of 0..100 (rough
     // wall-clock shares). Each phase reports fraction-done inside its span;
@@ -179,8 +179,8 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
     //   enrich 40-58 · CHECKPOINT 58-66 · catalogs 66-74 · liveness 74-78 ·
     //   FINAL CHECKPOINT 78-95 · HQ split 95-100 (completion pins 100).
     // A checkpoint that meets the lead target jumps straight to the HQ split.
-    const span = (base: number, width: number, frac: number) =>
-      setJobProgress(job.id, base + width * Math.max(0, Math.min(1, frac)));
+    const span = async (base: number, width: number, frac: number) =>
+      await setJobProgress(job.id, base + width * Math.max(0, Math.min(1, frac)));
 
     // ── Lead harvesting (see the LEAD-FIRST ORDERING note at the top) ────────
     //
@@ -229,7 +229,8 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
      * held three. `seed` is passed in and computed once per checkpoint: nothing
      * persists into job_results mid-checkpoint, so it cannot go stale inside one.
      */
-    const exportableNow = (seed: DedupeSeed): number => dedupePublishers(leadEligiblePublishers(), seed).length;
+    const exportableNow = async (seed: DedupeSeed): Promise<number> =>
+      dedupePublishers(await leadEligiblePublishers(), seed).length;
 
     /**
      * Turn the corpus as it stands into leads, then report whether the job can
@@ -291,7 +292,7 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
        */
       quiet = false,
     ): Promise<boolean> => {
-      if (!quiet) setJobPhase(job.id, phase, `finding advertisers — ${label}`);
+      if (!quiet) await setJobPhase(job.id, phase, `finding advertisers — ${label}`);
       // rollup/scoring log at INFO unconditionally. On a 15-second pump that is
       // two lines a tick forever ("rollup: 0 publishers" x hundreds), which
       // buries the run's real story. Background passes therefore pass a silent
@@ -303,11 +304,11 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
       // after harvesting 8,105 apps. This turns Play list-payload identity
       // (developer + developerId, already in hand) into confirmable publishers
       // immediately. It merges into the same rows the full rollup produces.
-      rollupProvisionalPlayPublishers(passLog);
-      rollupPublishers(passLog);
+      await rollupProvisionalPlayPublishers(passLog);
+      await rollupPublishers(passLog);
 
       const budgetLeft = Math.max(0, params.confirmationMaxApiCalls - confirmSpent);
-      const seed = leadHistorySeed();
+      const seed = await leadHistorySeed();
       const target = params.maxLeads;
 
       // CORPUS FAST PATH: the shared corpus is permanent, so an order small
@@ -315,7 +316,7 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
       // needs no confirmation at all. Checked before the budget is touched, so
       // such a job costs zero paid API calls (and zero residential proxy
       // traffic) and finishes in the time it takes to roll up and write a CSV.
-      const alreadyDeliverable = exportableNow(seed);
+      const alreadyDeliverable = await exportableNow(seed);
       const orderAlreadyFilled = target != null && alreadyDeliverable >= target;
       if (orderAlreadyFilled) {
         onLog(
@@ -327,7 +328,7 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
 
       // Nothing new to check ⇒ no pass. Keeps background ticks free when the
       // discovery streams have not produced a new publisher since last time.
-      const uncheckedNow = filterUncheckedSince(listPublishersForConfirmation(), runStartTs).length;
+      const uncheckedNow = filterUncheckedSince(await listPublishersForConfirmation(), runStartTs).length;
 
       if (budgetLeft > 0 && !orderAlreadyFilled && uncheckedNow > 0) {
         // Recomputed in onProgress and READ by `enough`. storeConfirm calls
@@ -350,21 +351,21 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
           // passes run continuously instead of once.
           skipWarmUp: confirmPasses > 0,
           skipConfirmedSince: runStartTs,
-          shouldStop: () => isCancelRequested(job.id),
+          shouldStop: async () => await isCancelRequested(job.id),
           // Stop the moment the order is filled. Without this a 20-lead job
           // spent its entire budget (and the proxy spend behind it) long after
           // the 20th lead had landed.
           enough: target == null ? undefined : () => liveExportable >= target,
-          onProgress: (st) => {
+          onProgress: async (st) => {
             if (st.confirmed !== lastConfirmedSeen) {
               lastConfirmedSeen = st.confirmed;
-              liveExportable = exportableNow(seed);
-              setJobLeadsFound(job.id, liveExportable);
+              liveExportable = await exportableNow(seed);
+              await setJobLeadsFound(job.id, liveExportable);
             }
             if (!quiet) {
-              span(progressBase, progressWidth, st.processed / Math.max(1, st.queued));
+              await span(progressBase, progressWidth, st.processed / Math.max(1, st.queued));
               if (st.processed % 10 === 0) {
-                setJobPhase(
+                await setJobPhase(
                   job.id,
                   phase,
                   `finding advertisers — ${label} · ${st.processed}/${st.queued} checked, ${st.confirmed} advertising`,
@@ -395,14 +396,14 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
       await enrichConfirmedWinners(passLog);
       // Re-roll so the freshly fetched emails/websites land on the rows before
       // they are scored and exported.
-      rollupPublishers(passLog);
+      await rollupPublishers(passLog);
 
       // Export EVERY time, so a stop (or a crash) at any later point still has a
       // complete, downloadable CSV sitting on disk for this job.
-      scoreAllPublishers(passLog);
-      leadsOnTable = exportLeadsSoFar();
-      setJobLeadsFound(job.id, leadsOnTable);
-      if (!quiet) setJobProgress(job.id, progressBase + progressWidth);
+      await scoreAllPublishers(passLog);
+      leadsOnTable = await exportLeadsSoFar();
+      await setJobLeadsFound(job.id, leadsOnTable);
+      if (!quiet) await setJobProgress(job.id, progressBase + progressWidth);
 
       if (params.maxLeads != null && leadsOnTable >= params.maxLeads) {
         leadTargetMet = true;
@@ -442,7 +443,7 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
       // A confirmed publisher with no contact details is a lead we cannot ship.
       // Provisional (fast-lane) rows are exactly these: identity + chart facts
       // from the list payload, no detail page yet.
-      const needy = leadEligiblePublishers()
+      const needy = (await leadEligiblePublishers())
         .filter((p) => p.name && !p.email && !p.website)
         .slice(0, WINNER_ENRICH_MAX_PUBLISHERS);
       if (needy.length === 0) return;
@@ -452,7 +453,7 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
       for (const p of needy) {
         // Match on the publisher's own name — the same string the list payload
         // stored in discovered_apps.list_developer.
-        for (const a of unenrichedAppsForPlayDevelopers([p.name], WINNER_ENRICH_APPS_PER_PUBLISHER)) {
+        for (const a of await unenrichedAppsForPlayDevelopers([p.name], WINNER_ENRICH_APPS_PER_PUBLISHER)) {
           const k = `${a.app_id}|${a.country}`;
           if (seen.has(k)) continue;
           seen.add(k);
@@ -464,7 +465,7 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
       const budget = Math.min(work.length, enrichSummary.budgetLeft);
       passLog('info', `winners: enriching ${budget} app(s) across ${needy.length} confirmed publisher(s) for contact details`);
       const res = await enrichApps(work, passLog, {
-        shouldStop: () => isCancelRequested(job.id),
+        shouldStop: async () => await isCancelRequested(job.id),
         fetchBudget: budget,
       });
       // Spend comes out of the run's single pool.
@@ -473,15 +474,15 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
       enrichSummary.requests += res.requests;
     }
 
-    function exportLeadsSoFar(): number {
-      const out = rebuildJobLeadExport(job.id, params.maxLeads);
+    async function exportLeadsSoFar(): Promise<number>{
+      const out = await rebuildJobLeadExport(job.id, params.maxLeads);
       const firstExport = csvPath == null;
       csvPath = out.path;
       // REAL-TIME deliverable: point job.csv_path at the file the moment it
       // first exists, exactly like the CPS pipeline's incremental flush. The
       // download route serves it from then on, so the user watches the Excel
       // GROW during the run instead of discovering it after the fact.
-      if (firstExport) setJobCsvPath(job.id, out.path);
+      if (firstExport) await setJobCsvPath(job.id, out.path);
       return out.rowsWritten;
     }
 
@@ -504,13 +505,13 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
         for (let waited = 0; waited < PUMP_INTERVAL_MS && !pumpShutdown; waited += 1_000) {
           await new Promise((r) => setTimeout(r, 1_000));
         }
-        if (pumpShutdown || leadTargetMet || isCancelRequested(job.id)) break;
+        if (pumpShutdown || leadTargetMet || await isCancelRequested(job.id)) break;
         if (confirmSpent >= params.confirmationMaxApiCalls) break; // budget dry — barriers handle the rest
         // Nothing new enriched AND nothing new to confirm ⇒ a rollup would
         // reach the identical answer, so skip the tick entirely. One indexed
         // COUNT instead of loading the whole corpus every 15 seconds.
-        const enrichedNow = countDoneAppDetails();
-        const uncheckedNow = filterUncheckedSince(listPublishersForConfirmation(), runStartTs).length;
+        const enrichedNow = await countDoneAppDetails();
+        const uncheckedNow = filterUncheckedSince(await listPublishersForConfirmation(), runStartTs).length;
         if (enrichedNow === lastEnrichedSeen && uncheckedNow === 0) continue;
         lastEnrichedSeen = enrichedNow;
 
@@ -537,7 +538,7 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
     // reason. Two streams over the same (vertical x market) grid, each behind
     // its own limiter, finish in max() instead of sum() — the same requests,
     // the same politeness, roughly half the wall-clock.
-    setJobPhase(job.id, 'scraping', 'charts');
+    await setJobPhase(job.id, 'scraping', 'charts');
     const chartCells: Array<{ v: NonNullable<ReturnType<typeof verticalById>>; market: string }> = [];
     for (const vId of params.verticals) {
       const v = verticalById(vId);
@@ -546,23 +547,23 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
     }
     let playCellsDone = 0;
     let appleCellsDone = 0;
-    const chartProgress = () => {
-      setJobPhase(
+    const chartProgress = async () => {
+      await setJobPhase(
         job.id,
         'scraping',
         `charts — Play ${playCellsDone}/${chartCells.length} · Apple ${appleCellsDone}/${chartCells.length}`,
       );
-      span(0, 6, (playCellsDone + appleCellsDone) / Math.max(1, chartCells.length * 2));
+      await span(0, 6, (playCellsDone + appleCellsDone) / Math.max(1, chartCells.length * 2));
     };
     const playChartsTask = async () => {
       for (const { v, market } of chartCells) {
-        if (isCancelRequested(job.id) || leadTargetMet) return; // stop/target: unwound after the barrier
+        if (await isCancelRequested(job.id) || leadTargetMet) return; // stop/target: unwound after the barrier
         const playCats = expandPlayCategories(v.play, !!v.expandGames);
         for (const chart of params.playCharts) {
           for (const cat of playCats) {
             const apps = await playChart(cat, chart, market, onLog);
-            apps.forEach((a, i) => {
-              upsertDiscoveredApp({
+            for (const [i, a] of apps.entries()) {
+              await upsertDiscoveredApp({
                 store: 'google_play', app_id: a.appId, title: a.title, vertical: v.id, country: market,
                 source: 'chart', discovery_depth: 0, chart, rank: i + 1,
                 // Publisher identity rides along in the list payload we already
@@ -570,34 +571,34 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
                 // publisher is confirmable before any detail page is fetched.
                 list_developer: a.developer, list_developer_id: a.developerId,
               });
-            });
+            }
             chartRows += apps.length;
           }
         }
         playCellsDone++;
-        chartProgress();
+        await chartProgress();
       }
     };
     const appleChartsTask = async () => {
       for (const { v, market } of chartCells) {
-        if (isCancelRequested(job.id) || leadTargetMet) return;
+        if (await isCancelRequested(job.id) || leadTargetMet) return;
         for (const _c of params.appleCharts) {
           const apps = await appleChart(v.appleGenre, market, onLog);
-          apps.forEach((a, i) => {
-            upsertDiscoveredApp({
+          for (const [i, a] of apps.entries()) {
+            await upsertDiscoveredApp({
               store: 'app_store', app_id: a.appId, title: a.title, vertical: v.id, country: market,
               source: 'chart', discovery_depth: 0, chart: 'top-free', rank: i + 1,
             });
-          });
+          }
           chartRows += apps.length;
         }
         appleCellsDone++;
-        chartProgress();
+        await chartProgress();
       }
     };
     await Promise.all([playChartsTask(), appleChartsTask()]);
-    throwIfCancelled(job.id);
-    onLog('info', `charts done: ${chartRows} chart sightings; ${countDiscoveredApps()} distinct (store,app,country) rows`);
+    await throwIfCancelled(job.id);
+    onLog('info', `charts done: ${chartRows} chart sightings; ${await countDiscoveredApps()} distinct (store,app,country) rows`);
 
     // ── LEAD CHECKPOINT 1 — the cheapest, highest-yield one ──────────────────
     // Charted publishers are the TOP tier of listPublishersForConfirmation's
@@ -606,7 +607,7 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
     // leads can be on the table about a minute into a job, and a small order is
     // frequently filled here outright — before a single enrichment fetch.
     if (await queueHarvest('top charts', 'scraping', 6, 12)) return await finishRun();
-    throwIfCancelled(job.id);
+    await throwIfCancelled(job.id);
 
     // ── Phases 2+3: similar crawl (Play) OVERLAPPED with the search battery ──
     //
@@ -618,9 +619,9 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
     // Each store half keeps its own per-(store, cell) rotation stamp, so the
     // capped budget still sweeps the whole grid across runs per store. Total
     // requests spent are unchanged; the wall-clock is max(tracks), not the sum.
-    setJobPhase(job.id, 'scraping', 'similar crawl + store search');
-    ensureSimilarCrawlTable();
-    ensureSearchBatteryTables();
+    await setJobPhase(job.id, 'scraping', 'similar crawl + store search');
+    await ensureSimilarCrawlTable();
+    await ensureSearchBatteryTables();
 
     const searchCells: SearchCell[] = [];
     for (const vId of params.verticals) {
@@ -647,23 +648,23 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
 
     /** One store's half of the battery: LRU-ordered over ITS OWN stamps. */
     const runSearchStore = async (store: StoreKind): Promise<{ cells: number; rows: number }> => {
-      const ordered = orderByProgress(searchCells, searchCellKey, searchCellTimesForStore(store));
+      const ordered = orderByProgress(searchCells, searchCellKey, (await searchCellTimesForStore(store)));
       let cells = 0;
       let rows = 0;
       for (const cell of ordered) {
-        if (isCancelRequested(job.id) || leadTargetMet) break; // stop/target: unwound after the barrier
+        if (await isCancelRequested(job.id) || leadTargetMet) break; // stop/target: unwound after the barrier
         if (cells >= perStoreSearchBudget) break;
         cells++;
         // Stamped whether or not it yields — a barren or blocked cell goes to the
         // BACK of this store's rotation rather than re-consuming budget.
-        markSearchCellForStore(store, cell);
+        await markSearchCellForStore(store, cell);
         const apps =
           store === 'google_play'
             ? await playSearch(cell.term, cell.market, onLog)
             : await appleSearch(cell.term, cell.market, onLog);
-        p23tick();
+        await p23tick();
         for (const a of apps) {
-          upsertDiscoveredApp({
+          await upsertDiscoveredApp({
             store, app_id: a.appId, title: a.title, vertical: cell.vertical, country: cell.market, source: 'search',
             // Only the Play half carries a stable developerId; the Apple search
             // shape has no equivalent, and the fast lane is Play-only by design.
@@ -681,14 +682,14 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
     const runSimilarCrawl = async (): Promise<{ newApps: number; requests: number }> => {
       let newSimilar = 0;
       let similarRequests = 0;
-      const crawledAt = similarCrawlTimes('google_play');
+      const crawledAt = await similarCrawlTimes('google_play');
       outer: for (let depth = 0; depth < SIMILAR_MAX_DEPTH; depth++) {
         if (newSimilar >= params.similarMaxAppsPerRun) break;
         // Seeds are Play apps of the ACTIVE verticals whose shallowest graph
         // sighting is exactly this depth; never-crawled first, then least-recent
         // (the anti-starvation rotation — see orderByProgress).
         const seeds = orderByProgress(
-          similarSeedApps('google_play', depth, params.verticals),
+          await similarSeedApps('google_play', depth, params.verticals),
           (s) => s.app_id,
           crawledAt,
         );
@@ -699,7 +700,7 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
             `(new so far ${newSimilar}/${params.similarMaxAppsPerRun})`,
         );
         for (const seed of seeds) {
-          if (isCancelRequested(job.id) || leadTargetMet) break outer; // stop/target: unwound after the barrier
+          if (await isCancelRequested(job.id) || leadTargetMet) break outer; // stop/target: unwound after the barrier
           if (newSimilar >= params.similarMaxAppsPerRun) break outer;
           // Independent REQUEST bound. Without it a saturated graph inserts
           // nothing, never reaches the app cap, and re-walks every seed for hours.
@@ -710,13 +711,13 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
           similarRequests++;
           // Stamped whether or not this seed yields anything — spent budget sends
           // it to the back of the queue either way.
-          markSimilarCrawled('google_play', seed.app_id);
+          await markSimilarCrawled('google_play', seed.app_id);
           // Queried in the seed's own storefront (geo-restricted seeds resolve
           // only there).
           const sims = await playSimilar(seed.app_id, seed.country, onLog);
-          p23tick();
+          await p23tick();
           for (const a of sims) {
-            const { inserted } = upsertDiscoveredApp({
+            const { inserted } = await upsertDiscoveredApp({
               store: 'google_play', app_id: a.appId, title: a.title, country: seed.country,
               // Inherit the seed's vertical so deeper levels stay attributable.
               vertical: seed.vertical,
@@ -740,19 +741,19 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
       (async () => {
         const similar = await runSimilarCrawl();
         onLog('info', `similar crawl done: +${similar.newApps} new apps from ${similar.requests} requests`);
-        setJobPhase(job.id, 'scraping', 'store search (Play half)');
+        await setJobPhase(job.id, 'scraping', 'store search (Play half)');
         const search = await runSearchStore('google_play');
         return { similar, search };
       })(),
       runSearchStore('app_store'),
     ]);
-    throwIfCancelled(job.id);
+    await throwIfCancelled(job.id);
     newSimilar = playTrack.similar.newApps;
     searchRows = playTrack.search.rows + appleSearchHalf.rows;
     onLog(
       'info',
       `search battery done: Play ${playTrack.search.cells} + Apple ${appleSearchHalf.cells} cells ` +
-        `(budget ${perStoreSearchBudget}/store), ${searchRows} sightings; ${countDiscoveredApps()} distinct rows total`,
+        `(budget ${perStoreSearchBudget}/store), ${searchRows} sightings; ${await countDiscoveredApps()} distinct rows total`,
     );
     if (playTrack.search.cells >= perStoreSearchBudget || appleSearchHalf.cells >= perStoreSearchBudget) {
       onLog(
@@ -762,41 +763,41 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
       );
     }
 
-    setJobProgress(job.id, 32); // phase 2+3 barrier
+    await setJobProgress(job.id, 32); // phase 2+3 barrier
 
     // ── LEAD CHECKPOINT 2 — after the long-tail discovery ────────────────────
     // The similar crawl and the search battery add the tail publishers that the
     // charts miss; confirm what they found BEFORE paying for enrichment, which
     // is by far the most expensive phase in the run.
     if (await queueHarvest('long-tail discovery', 'scraping', 32, 8)) return await finishRun();
-    throwIfCancelled(job.id);
+    await throwIfCancelled(job.id);
 
     // ── Phase 4: enrichment (+ install-band gate) ────────────────────────────
-    setJobPhase(job.id, 'enriching', 'app detail');
+    await setJobPhase(job.id, 'enriching', 'app detail');
     const stopCheck = {
       // The pump can satisfy the lead target MID-ENRICHMENT — from that moment
       // every further store fetch is pure waste, so the streams drain out here
       // exactly like a user Stop, except the job then completes successfully.
-      shouldStop: () => isCancelRequested(job.id) || leadTargetMet,
+      shouldStop: async () => await isCancelRequested(job.id) || leadTargetMet,
       onProgress: (done: number, total: number) => span(40, 18, done / Math.max(1, total)),
     };
     // ONE fetch budget for the whole run, threaded through both enrichment
     // passes. It used to be a fresh ENRICH_MAX_APPS_PER_RUN per call, so a run
     // quietly spent up to double the configured ceiling.
-    enrichSummary = await enrichApps(buildWorklist(), onLog, {
+    enrichSummary = await enrichApps((await buildWorklist()), onLog, {
       ...stopCheck,
       fetchBudget: ENRICH_MAX_APPS_PER_RUN,
     });
     logEnrich(onLog, 'enrichment', enrichSummary);
-    throwIfCancelled(job.id);
-    setJobProgress(job.id, 58);
+    await throwIfCancelled(job.id);
+    await setJobProgress(job.id, 58);
 
     // ── LEAD CHECKPOINT 3 — after enrichment ─────────────────────────────────
     // Enrichment is what unlocks the in-band tail tiers (an app needs its
     // install count and developer contact before it can qualify), so this is
     // where the tail publishers become confirmable.
     if (await queueHarvest('enriched catalog', 'enriching', 58, 8)) return await finishRun();
-    throwIfCancelled(job.id);
+    await throwIfCancelled(job.id);
 
     // Target met mid-enrichment (pump) drains the streams and lands here —
     // everything after this point is corpus upkeep the filled order does not
@@ -804,31 +805,31 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
     if (leadTargetMet) return await finishRun();
 
     // ── Phase 5: developer-catalog expansion, then a second enrichment pass ──
-    setJobPhase(job.id, 'enriching', 'developer catalogs');
+    await setJobPhase(job.id, 'enriching', 'developer catalogs');
     catalogApps = await expandDeveloperCatalogs(onLog, job.id);
-    setJobProgress(job.id, 70);
+    await setJobProgress(job.id, 70);
     if (catalogApps > 0) {
       onLog('info', `dev-catalog: +${catalogApps} portfolio apps discovered; re-enriching`);
       // Relabel: this is a SECOND enrichment pass, not the catalog fetch. Leaving
       // the detail on "developer catalogs" is precisely what made the reported
       // job look frozen — it sat at 73% under that label for the better part of
       // an hour while it was actually enriching.
-      setJobPhase(job.id, 'enriching', `app detail (portfolio pass — ${catalogApps} new apps)`);
+      await setJobPhase(job.id, 'enriching', `app detail (portfolio pass — ${catalogApps} new apps)`);
       // Spends only what the FIRST pass left of the run's single fetch budget.
       // Previously this call received a fresh full budget, so one run could make
       // 2x ENRICH_MAX_APPS_PER_RUN network fetches (measured: 3,202 + 2,480
       // against a stated cap of 4,000) — the single largest block of wall-clock
       // in the whole pipeline, most of it spent re-walking backlog rather than
       // the catalog apps this pass exists to enrich.
-      enrichSummary = await enrichApps(buildWorklist(), onLog, {
+      enrichSummary = await enrichApps((await buildWorklist()), onLog, {
         shouldStop: stopCheck.shouldStop,
         onProgress: (done, total) => span(70, 4, done / Math.max(1, total)),
         fetchBudget: enrichSummary.budgetLeft,
       });
       logEnrich(onLog, 're-enrichment', enrichSummary);
     }
-    throwIfCancelled(job.id);
-    setJobProgress(job.id, 74);
+    await throwIfCancelled(job.id);
+    await setJobProgress(job.id, 74);
 
     if (leadTargetMet) return await finishRun(); // pump satisfied the order during catalogs
 
@@ -836,14 +837,14 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
     // The catalog is permanent and never re-fetched, which is what makes repeat
     // runs fast; this is the counterweight that keeps it honest. Runs BEFORE the
     // final checkpoint so a delisting is reflected in this run's publishers.
-    setJobPhase(job.id, 'enriching', 'liveness sweep');
+    await setJobPhase(job.id, 'enriching', 'liveness sweep');
     await sweepLiveness(onLog, job.id);
-    throwIfCancelled(job.id);
-    setJobProgress(job.id, 78);
+    await throwIfCancelled(job.id);
+    await setJobProgress(job.id, 78);
 
     // ── FINAL LEAD CHECKPOINT — spend whatever budget is left ────────────────
     await queueHarvest('full catalog', 'classifying', 78, 17);
-    throwIfCancelled(job.id);
+    await throwIfCancelled(job.id);
 
     return await finishRun();
 
@@ -863,9 +864,9 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
       // Every path into finishRun has run at least one checkpoint, so the CSV is
       // already on disk. Rebuild defensively rather than trusting that invariant
       // to survive a future edit — it is local DB work and idempotent.
-      if (csvPath == null) leadsOnTable = exportLeadsSoFar();
+      if (csvPath == null) leadsOnTable = await exportLeadsSoFar();
       const exportPath = csvPath as string;
-      const discovered = listPublishersByScore(1_000_000);
+      const discovered = await listPublishersByScore(1_000_000);
       const confirmedCount = discovered.filter((p) => p.confirmed_advertiser === 1).length;
       if (EXPORT_CONFIRMED_ONLY) {
         const unchecked = discovered.filter((p) => p.last_confirm_at == null).length;
@@ -885,16 +886,16 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
       );
 
       // ── per-HQ-country .xlsx bundle ───────────────────────────────────────
-      setJobProgress(job.id, 95);
+      await setJobProgress(job.id, 95);
       await buildExcelBundle(job.id, leadsOnTable, onLog);
 
-      printRunSummary(onLog, { confirm: confirmTotals, enrichSummary, publishers: confirmedCount });
+      await printRunSummary(onLog, { confirm: confirmTotals, enrichSummary, publishers: confirmedCount });
 
       // `ads` is this RUN's discovery volume, not the lifetime size of the
       // discovered_apps table — that table accumulates across every run, so
       // reporting its total made each job look like it had re-scraped everything.
       const appsThisRun = chartRows + newSimilar + searchRows + catalogApps;
-      markJobCompleted(job.id, exportPath, { ads: appsThisRun, advertisers: leadsOnTable });
+      await markJobCompleted(job.id, exportPath, { ads: appsThisRun, advertisers: leadsOnTable });
       onLog(
         'info',
         leadTargetMet
@@ -902,7 +903,7 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
           : 'store-first job completed',
       );
 
-      const done = getJob(job.id);
+      const done = await getJob(job.id);
       if (done) {
         void notifyJobCompleted(done)
           .then(() => onLog('info', 'notification dispatched'))
@@ -914,14 +915,14 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
     // after finalize would rewrite the CSV/lead rows of a settled job.
     if (shutdownPump) await shutdownPump().catch(() => {});
     if (err instanceof JobCancelledError) {
-      finalizeCancelledStoreJob(job, onLog);
+      await finalizeCancelledStoreJob(job, onLog);
       return;
     }
     const msg = (err as Error).message || 'unknown error';
     log.error(`store-first job ${job.id} failed`, err);
     onLog('error', `job failed: ${msg}`);
-    markJobFailed(job.id, msg);
-    const fresh = getJob(job.id);
+    await markJobFailed(job.id, msg);
+    const fresh = await getJob(job.id);
     if (fresh) void notifyJobFailed(fresh).catch(() => {});
   }
 }
@@ -933,22 +934,22 @@ export async function runStoreDiscoveryJob(job: JobRow): Promise<void> {
  * partial deliverable instead of throwing it away. Best-effort throughout — a
  * failure here still marks the job cancelled, never failed.
  */
-function finalizeCancelledStoreJob(job: JobRow, onLog: OnLog): void {
+async function finalizeCancelledStoreJob(job: JobRow, onLog: OnLog): Promise<void>{
   let csvPath: string | null = null;
   let kept = 0;
   try {
-    setJobPhase(job.id, 'building_csv', 'stopped — exporting what was found so far');
-    rollupPublishers(onLog);
-    scoreAllPublishers(onLog);
+    await setJobPhase(job.id, 'building_csv', 'stopped — exporting what was found so far');
+    await rollupPublishers(onLog);
+    await scoreAllPublishers(onLog);
     const params = resolveStoreParams(job.source_params ? JSON.parse(job.source_params) : null);
-    const out = rebuildJobLeadExport(job.id, params.maxLeads);
+    const out = await rebuildJobLeadExport(job.id, params.maxLeads);
     csvPath = out.path;
     kept = out.rowsWritten;
-    setJobLeadsFound(job.id, kept);
+    await setJobLeadsFound(job.id, kept);
   } catch (e) {
     onLog('warn', `stop-finalize could not export partial leads (non-fatal): ${(e as Error).message}`);
   }
-  markJobCancelled(job.id, `stopped by user — ${kept} lead(s) kept`, csvPath);
+  await markJobCancelled(job.id, `stopped by user — ${kept} lead(s) kept`, csvPath);
   onLog('warn', `store-first job stopped by user — ${kept} partial lead(s) exported`);
 }
 
@@ -957,8 +958,8 @@ function finalizeCancelledStoreJob(job: JobRow, onLog: OnLog): void {
 /** Publishers eligible to become leads right now, score-descending. The export
  *  is confirmed-only by default: an unconfirmed publisher is a candidate, not a
  *  lead, and stays in the Publishers table until its verdict comes back. */
-function leadEligiblePublishers() {
-  const discovered = listPublishersByScore(1_000_000);
+async function leadEligiblePublishers() {
+  const discovered = await listPublishersByScore(1_000_000);
   return EXPORT_CONFIRMED_ONLY ? discovered.filter((p) => p.confirmed_advertiser === 1) : discovered;
 }
 
@@ -974,19 +975,19 @@ function leadEligiblePublishers() {
  * exported" — the checkpoint had persisted them, then the stop-finalize deduped
  * them against themselves.
  */
-function rebuildJobLeadExport(jobId: string, maxLeads: number | null): { path: string; rowsWritten: number } {
-  clearJobResults(jobId);
-  const out = buildPublisherCsv(jobId, leadEligiblePublishers(), leadHistorySeed(), maxLeads);
-  persistPublisherLeads(jobId, out.exported);
+async function rebuildJobLeadExport(jobId: string, maxLeads: number | null): Promise<{ path: string; rowsWritten: number; }>{
+  await clearJobResults(jobId);
+  const out = await buildPublisherCsv(jobId, (await leadEligiblePublishers()), (await leadHistorySeed()), maxLeads);
+  await persistPublisherLeads(jobId, out.exported);
   return { path: out.path, rowsWritten: out.rowsWritten };
 }
 
 /** Build the enrichment worklist: distinct (store, app_id) for both stores, with
  *  is_chart carried through so enrichment can order + band-gate correctly. */
-function buildWorklist(): EnrichWorkItem[] {
+async function buildWorklist(): Promise<EnrichWorkItem[]>{
   const items: EnrichWorkItem[] = [];
   for (const store of ['google_play', 'app_store'] as StoreKind[]) {
-    for (const a of distinctAppsForStore(store)) {
+    for (const a of await distinctAppsForStore(store)) {
       items.push({ store, app_id: a.app_id, is_chart: a.is_chart === 1, country: a.country });
     }
   }
@@ -1006,10 +1007,10 @@ function buildWorklist(): EnrichWorkItem[] {
  *
  * The table lives here rather than in storeDiscoveryDb.ts because this phase is
  * its only reader and writer; it is created idempotently on first use, exactly
- * like the tables ensureStoreDiscoveryTables() owns.
+ * like the tables the baseline migration owns.
  */
-function ensureCatalogExpansionTable(): void {
-  getDb().exec(`
+async function ensureCatalogExpansionTable(): Promise<void>{
+  await getDb().exec(`
     CREATE TABLE IF NOT EXISTS developer_catalog_expansion (
       store TEXT NOT NULL,
       developer_id TEXT NOT NULL,
@@ -1020,8 +1021,8 @@ function ensureCatalogExpansionTable(): void {
 }
 
 /** developer id → ms epoch of its last catalog fetch, for one store. */
-function catalogExpansionTimes(store: StoreKind): Map<string, number> {
-  const rows = getDb()
+async function catalogExpansionTimes(store: StoreKind): Promise<Map<string, number>>{
+  const rows = await getDb()
     .prepare(`SELECT developer_id, last_expanded_at FROM developer_catalog_expansion WHERE store = ?`)
     .all(store) as Array<{ developer_id: string; last_expanded_at: number }>;
   return new Map(rows.map((r) => [r.developer_id, r.last_expanded_at]));
@@ -1071,7 +1072,7 @@ function catalogExpansionTimes(store: StoreKind): Map<string, number> {
  * completed work as a failure and hide a good CSV behind a 'failed' status.
  */
 async function buildExcelBundle(jobId: string, rowsWritten: number, onLog: OnLog): Promise<void> {
-  const spent = spentTodayUsd();
+  const spent = await spentTodayUsd();
   if (spent >= DAILY_CAP_USD) {
     onLog(
       'warn',
@@ -1080,11 +1081,11 @@ async function buildExcelBundle(jobId: string, rowsWritten: number, onLog: OnLog
     );
     return;
   }
-  setJobPhase(jobId, 'hq_splitting', `resolving HQ for ${rowsWritten} publishers`);
+  await setJobPhase(jobId, 'hq_splitting', `resolving HQ for ${rowsWritten} publishers`);
   try {
-    const outcome = await runHqSplit({ jobId, results: getResults(jobId), onLog });
+    const outcome = await runHqSplit({ jobId, results: await getResults(jobId), onLog });
     if (outcome.zipPath) {
-      setJobHqZipPath(jobId, outcome.zipPath);
+      await setJobHqZipPath(jobId, outcome.zipPath);
       const summary = Object.entries(outcome.perCountryCounts)
         .sort(([, a], [, b]) => b - a)
         .map(([c, n]) => `${c}=${n}`)
@@ -1117,12 +1118,12 @@ async function sweepLiveness(onLog: OnLog, jobId?: string): Promise<{ checked: n
 
   // Play: one throttled request per app, so the budget is small.
   const playSweep = async () => {
-    const playCandidates = listLivenessCandidates('google_play', staleBefore, LIVENESS_MAX_PLAY_PER_RUN);
+    const playCandidates = await listLivenessCandidates('google_play', staleBefore, LIVENESS_MAX_PLAY_PER_RUN);
     for (const c of playCandidates) {
-      if (jobId && isCancelRequested(jobId)) break; // Stop button — sweep resumes next run
+      if (jobId && await isCancelRequested(jobId)) break; // Stop button — sweep resumes next run
       const action = livenessAction(await playAppLiveness(c.app_id, c.country, onLog));
       if (action === 'skip') continue; // inconclusive: ask again next run
-      markAppLiveness('google_play', c.app_id, action === 'mark_gone');
+      await markAppLiveness('google_play', c.app_id, action === 'mark_gone');
       checked++;
       if (action === 'mark_gone') delisted++;
     }
@@ -1133,7 +1134,7 @@ async function sweepLiveness(onLog: OnLog, jobId?: string): Promise<{ checked: n
   // market may still be live in another, and asking in the wrong one is a false
   // delisting. Same country preference the enrichment worklist uses.
   const appleSweep = async () => {
-    const appleCandidates = listLivenessCandidates('app_store', staleBefore, LIVENESS_MAX_APPLE_PER_RUN);
+    const appleCandidates = await listLivenessCandidates('app_store', staleBefore, LIVENESS_MAX_APPLE_PER_RUN);
     const byCountry = new Map<string, string[]>();
     for (const c of appleCandidates) {
       const cc = (c.country || 'us').toLowerCase();
@@ -1141,12 +1142,12 @@ async function sweepLiveness(onLog: OnLog, jobId?: string): Promise<{ checked: n
       byCountry.get(cc)!.push(c.app_id);
     }
     for (const [cc, ids] of byCountry) {
-      if (jobId && isCancelRequested(jobId)) break; // Stop button — sweep resumes next run
+      if (jobId && await isCancelRequested(jobId)) break; // Stop button — sweep resumes next run
       const verdicts = await appleLiveness(ids, cc, onLog);
       for (const [appId, verdict] of verdicts) {
         const action = livenessAction(verdict);
         if (action === 'skip') continue;
-        markAppLiveness('app_store', appId, action === 'mark_gone');
+        await markAppLiveness('app_store', appId, action === 'mark_gone');
         checked++;
         if (action === 'mark_gone') delisted++;
       }
@@ -1160,7 +1161,7 @@ async function sweepLiveness(onLog: OnLog, jobId?: string): Promise<{ checked: n
     onLog(
       'info',
       `liveness: re-checked ${checked} known apps, ${delisted} newly delisted and dropped from rollup ` +
-        `(${countDelistedApps()} delisted in total)`,
+        `(${await countDelistedApps()} delisted in total)`,
     );
   } else {
     onLog('info', 'liveness: nothing due for re-check this run');
@@ -1195,9 +1196,9 @@ export function searchCellKey(cell: SearchCell): string {
  * slower one never actually searched. The legacy combined table seeds the
  * per-store table once, so rotation history from before the split carries over.
  */
-function ensureSearchBatteryTables(): void {
+async function ensureSearchBatteryTables(): Promise<void>{
   const db = getDb();
-  db.exec(`
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS search_battery_cell (
       vertical TEXT NOT NULL,
       market TEXT NOT NULL,
@@ -1218,23 +1219,24 @@ function ensureSearchBatteryTables(): void {
   // in BOTH stores, so both per-store rows inherit its stamp. INSERT OR IGNORE
   // keeps newer per-store stamps untouched on later runs.
   for (const store of ['google_play', 'app_store']) {
-    db.prepare(
-      `INSERT OR IGNORE INTO search_battery_cell_store (store, vertical, market, term, last_searched_at)
-        SELECT ?, vertical, market, term, last_searched_at FROM search_battery_cell`,
+    await db.prepare(
+      `INSERT INTO search_battery_cell_store (store, vertical, market, term, last_searched_at)
+        SELECT ?, vertical, market, term, last_searched_at FROM search_battery_cell
+        ON CONFLICT (store, vertical, market, term) DO NOTHING`,
     ).run(store);
   }
 }
 
 /** cell key → ms epoch of this STORE's last search of it. */
-function searchCellTimesForStore(store: StoreKind): Map<string, number> {
-  const rows = getDb()
+async function searchCellTimesForStore(store: StoreKind): Promise<Map<string, number>>{
+  const rows = await getDb()
     .prepare(`SELECT vertical, market, term, last_searched_at FROM search_battery_cell_store WHERE store = ?`)
     .all(store) as Array<SearchCell & { last_searched_at: number }>;
   return new Map(rows.map((r) => [searchCellKey(r), r.last_searched_at]));
 }
 
-function markSearchCellForStore(store: StoreKind, cell: SearchCell): void {
-  getDb()
+async function markSearchCellForStore(store: StoreKind, cell: SearchCell): Promise<void>{
+  await getDb()
     .prepare(
       `INSERT INTO search_battery_cell_store (store, vertical, market, term, last_searched_at) VALUES (?, ?, ?, ?, ?)
        ON CONFLICT(store, vertical, market, term) DO UPDATE SET last_searched_at = excluded.last_searched_at`,
@@ -1242,8 +1244,8 @@ function markSearchCellForStore(store: StoreKind, cell: SearchCell): void {
     .run(store, cell.vertical, cell.market, cell.term, Date.now());
 }
 
-function ensureSimilarCrawlTable(): void {
-  getDb().exec(`
+async function ensureSimilarCrawlTable(): Promise<void>{
+  await getDb().exec(`
     CREATE TABLE IF NOT EXISTS similar_crawl_seed (
       store TEXT NOT NULL,
       app_id TEXT NOT NULL,
@@ -1254,15 +1256,15 @@ function ensureSimilarCrawlTable(): void {
 }
 
 /** seed app id → ms epoch of the last similar-crawl request made FROM it. */
-function similarCrawlTimes(store: StoreKind): Map<string, number> {
-  const rows = getDb()
+async function similarCrawlTimes(store: StoreKind): Promise<Map<string, number>>{
+  const rows = await getDb()
     .prepare(`SELECT app_id, last_crawled_at FROM similar_crawl_seed WHERE store = ?`)
     .all(store) as Array<{ app_id: string; last_crawled_at: number }>;
   return new Map(rows.map((r) => [r.app_id, r.last_crawled_at]));
 }
 
-function markSimilarCrawled(store: StoreKind, appId: string): void {
-  getDb()
+async function markSimilarCrawled(store: StoreKind, appId: string): Promise<void>{
+  await getDb()
     .prepare(
       `INSERT INTO similar_crawl_seed (store, app_id, last_crawled_at) VALUES (?, ?, ?)
        ON CONFLICT(store, app_id) DO UPDATE SET last_crawled_at = excluded.last_crawled_at`,
@@ -1270,8 +1272,8 @@ function markSimilarCrawled(store: StoreKind, appId: string): void {
     .run(store, appId, Date.now());
 }
 
-function markCatalogExpanded(store: StoreKind, developerId: string): void {
-  getDb()
+async function markCatalogExpanded(store: StoreKind, developerId: string): Promise<void>{
+  await getDb()
     .prepare(
       `INSERT INTO developer_catalog_expansion (store, developer_id, last_expanded_at) VALUES (?, ?, ?)
        ON CONFLICT(store, developer_id) DO UPDATE SET last_expanded_at = excluded.last_expanded_at`,
@@ -1298,15 +1300,15 @@ function markCatalogExpanded(store: StoreKind, developerId: string): void {
  */
 const GEO_STAMP_PURGE_MARKER = 'store_discovery.geo_stamp_purge_v1';
 
-export function purgeUsEraGeoStamps(onLog: OnLog): void {
+export async function purgeUsEraGeoStamps(onLog: OnLog): Promise<void>{
   const db = getDb();
-  if (db.prepare(`SELECT value FROM settings WHERE key = ?`).get(GEO_STAMP_PURGE_MARKER)) return;
+  if (await db.prepare(`SELECT value FROM settings WHERE key = ?`).get(GEO_STAMP_PURGE_MARKER)) return;
   // Both stamp tables must exist before the DELETEs reference them: on a fresh
   // database (nothing to purge) they may not have been created yet.
-  ensureSimilarCrawlTable();
-  ensureCatalogExpansionTable();
+  await ensureSimilarCrawlTable();
+  await ensureCatalogExpansionTable();
   const nonUs = (col: string) => `${sightedCountrySql(col)} <> 'us'`;
-  const seeds = db
+  const seeds = await db
     .prepare(
       `DELETE FROM similar_crawl_seed
         WHERE store = 'google_play'
@@ -1319,8 +1321,8 @@ export function purgeUsEraGeoStamps(onLog: OnLog): void {
   // expansion sets apply: a stamp for a developer outside those sets is never
   // consulted, so over-deleting is harmless while under-deleting leaves the
   // us-era latency in place.
-  const purgeCatalog = (store: string, idCol: string) =>
-    db
+  const purgeCatalog = async (store: string, idCol: string) =>
+    await db
       .prepare(
         `DELETE FROM developer_catalog_expansion
           WHERE store = '${store}'
@@ -1334,9 +1336,9 @@ export function purgeUsEraGeoStamps(onLog: OnLog): void {
               HAVING ${nonUs('a.country')})`,
       )
       .run();
-  const play = purgeCatalog('google_play', 'developer_id');
-  const apple = purgeCatalog('app_store', 'artist_id');
-  db.prepare(
+  const play = await purgeCatalog('google_play', 'developer_id');
+  const apple = await purgeCatalog('app_store', 'artist_id');
+  await db.prepare(
     `INSERT INTO settings (key, value, updated_at) VALUES (?, '1', ?)
        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
   ).run(GEO_STAMP_PURGE_MARKER, Date.now());
@@ -1378,7 +1380,7 @@ export function orderByProgress<T>(
 async function expandDeveloperCatalogs(onLog: OnLog, jobId?: string): Promise<number> {
   const total = DEV_CATALOG_MAX_PER_RUN;
   if (total <= 0) return 0;
-  ensureCatalogExpansionTable();
+  await ensureCatalogExpansionTable();
   let newApps = 0;
 
   /** Fetch up to `budget` catalogs for one store. Returns catalogs actually fetched. */
@@ -1389,8 +1391,8 @@ async function expandDeveloperCatalogs(onLog: OnLog, jobId?: string): Promise<nu
     store: 'google_play' | 'app_store',
   ): Promise<number> => {
     let used = 0;
-    for (const dev of orderByProgress(devs, (d) => d.id, catalogExpansionTimes(store))) {
-      if (jobId && isCancelRequested(jobId)) break; // Stop button — everything fetched so far is stamped
+    for (const dev of orderByProgress(devs, (d) => d.id, (await catalogExpansionTimes(store)))) {
+      if (jobId && await isCancelRequested(jobId)) break; // Stop button — everything fetched so far is stamped
       if (used >= budget) break;
       if (newApps >= DEV_CATALOG_MAX_APPS_PER_RUN) break;
       used++;
@@ -1405,9 +1407,9 @@ async function expandDeveloperCatalogs(onLog: OnLog, jobId?: string): Promise<nu
       // spent either way, and a blocked fetch goes to the BACK of the queue to be
       // retried on a later run rather than re-consuming the budget ahead of the
       // developers behind it (store calls degrade to [] instead of throwing).
-      markCatalogExpanded(store, dev.id);
+      await markCatalogExpanded(store, dev.id);
       for (const a of apps) {
-        const { inserted } = upsertDiscoveredApp({
+        const { inserted } = await upsertDiscoveredApp({
           // Sighted in the storefront the catalog was fetched from, NOT
           // CRAWL_COUNTRY: recording us for a de-fetched catalog would point
           // the app's own detail fetch at a storefront it may not exist in.
@@ -1432,8 +1434,8 @@ async function expandDeveloperCatalogs(onLog: OnLog, jobId?: string): Promise<nu
   // first against one shared counter, so with more Play developers than budget
   // the Apple loop never executed a single request; and serial execution paid
   // Play-time + Apple-time even though the two stores throttle independently.
-  const playDevs = playDevelopersWithContact();
-  const appleDevs = appleArtistsWithContact();
+  const playDevs = await playDevelopersWithContact();
+  const appleDevs = await appleArtistsWithContact();
   const playShare = Math.ceil(total / 2);
   let [playUsed, appleUsed] = await Promise.all([
     runStore(playDevs, playShare, (id, cc) => playDeveloper(id, cc, onLog), 'google_play'),
@@ -1443,17 +1445,17 @@ async function expandDeveloperCatalogs(onLog: OnLog, jobId?: string): Promise<nu
   // expanded — re-reading the fresh stamps guards against burning leftover on
   // re-expansion while un-expanded developers exist elsewhere in neither list.
   let leftover = total - playUsed - appleUsed;
-  if (leftover > 0 && newApps < DEV_CATALOG_MAX_APPS_PER_RUN && !(jobId && isCancelRequested(jobId))) {
-    const unexpanded = (devs: Array<{ id: string }>, store: StoreKind) => {
-      const t = catalogExpansionTimes(store);
+  if (leftover > 0 && newApps < DEV_CATALOG_MAX_APPS_PER_RUN && !(jobId && await isCancelRequested(jobId))) {
+    const unexpanded = async (devs: Array<{ id: string }>, store: StoreKind) => {
+      const t = await catalogExpansionTimes(store);
       return devs.filter((d) => !t.has(d.id)).length;
     };
-    const appleExtra = Math.min(leftover, unexpanded(appleDevs, 'app_store'));
+    const appleExtra = Math.min(leftover, await unexpanded(appleDevs, 'app_store'));
     if (appleExtra > 0) {
       appleUsed += await runStore(appleDevs, appleExtra, (id, cc) => appleDeveloper(id, cc, onLog), 'app_store');
       leftover = total - playUsed - appleUsed;
     }
-    const playExtra = Math.min(leftover, unexpanded(playDevs, 'google_play'));
+    const playExtra = Math.min(leftover, await unexpanded(playDevs, 'google_play'));
     if (playExtra > 0) {
       playUsed += await runStore(playDevs, playExtra, (id, cc) => playDeveloper(id, cc, onLog), 'google_play');
     }
@@ -1478,21 +1480,21 @@ function logEnrich(onLog: OnLog, label: string, s: EnrichSummary): void {
   );
 }
 
-function printRunSummary(
+async function printRunSummary(
   onLog: OnLog,
   ctx: { confirm: Awaited<ReturnType<typeof confirmPublishers>>; enrichSummary: EnrichSummary; publishers: number },
-): void {
-  const bySource = discoveredCountsBySource();
-  const totalApps = countDiscoveredApps();
+): Promise<void>{
+  const bySource = await discoveredCountsBySource();
+  const totalApps = await countDiscoveredApps();
   const nonChart = totalApps - (bySource.chart ?? 0);
-  const publishers = countPublishers();
-  const confirmed = countConfirmedPublishers();
-  const withEmail = countPublishersWithEmail();
+  const publishers = await countPublishers();
+  const confirmed = await countConfirmedPublishers();
+  const withEmail = await countPublishersWithEmail();
   // Store calls are free; the only paid surface is GATC confirmation via the
   // residential proxy. A rough per-call proxy-traffic estimate keeps the operator
   // oriented without pretending to bill exact bytes.
   const estUsd = (ctx.confirm.apiCalls * 0.002).toFixed(3); // ~2/10¢ per RPC round-trip, order-of-magnitude
-  const top = listPublishersByScore(10);
+  const top = await listPublishersByScore(10);
 
   onLog('info', '──────── RUN SUMMARY ────────');
   onLog('info', `apps by source: ${Object.entries(bySource).map(([k, n]) => `${k}=${n}`).join(', ') || '(none)'}`);

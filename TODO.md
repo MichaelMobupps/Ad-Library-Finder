@@ -3032,3 +3032,226 @@ exact-pathname prefix check), 1 × (c) existed and evolved (adb2342 H1: env-firs
 redirect URI existed in 1399d18, deliberately demoted by 4cbfba0 May 22, restored
 Aug 2 — continuous authored lineage, not a rollback). Apollo/contact-cap concepts:
 never existed on any ref. Full evidence tables: `diagnostic.md`.
+
+---
+
+## L-3.4g — Durability: Leadfinder's memory moves off the deployment disk (2026-08-08)
+
+Branch `leadfinder-l34g-durable-db`. Blast radius: this repo only. Two read-only
+`GET`s against the live seam (the rescue, below) and no other live call; no
+publish, no secret change, no scraping run, no email, no vendor call. The dev
+managed PostgreSQL was migrated by the app's own `initDb()` — see *Dev database*.
+
+### The three verification answers, before anything changed
+
+1. **Where the state lived.** One engine, one seam: `better-sqlite3`, opened at
+   exactly one place — `src/db.ts:134` — at `path.resolve('data')/ad-library.sqlite`.
+   That path is cwd-relative and the deploy runs `pnpm --filter api-server start`,
+   so in production it was **`artifacts/api-server/data/ad-library.sqlite`**.
+   Nineteen tables, no second store.
+2. **Was it in the deploy image?** **Excluded, explicitly.** `.replitignore` listed
+   `data/` and `artifacts/api-server/data/` under "NEVER ship local dev state to a
+   deployment". With `deploymentTarget = "vm"` that is the worst of both: the image
+   carries no database, and the VM disk that accumulates one does not survive a
+   publish.
+3. **Had it published since the two chief jobs ran?** Yes — and the rescue proved
+   the damage rather than predicting it. Last publish commit `91beb6e`,
+   2026-08-06 19:15Z. `job_u5I0sjFlo_` was created 2026-08-07 15:11Z, after it, and
+   survived. `job_7nQAfTUr1v` ran before it and **answered 404 on the live seam**.
+   Corroborated twice over: the surviving job's lead ids are **21–40** (a database
+   holding months of history does not number its August rows in the twenties), and
+   Activity History showed zero past jobs on August 7. Caveat stated plainly:
+   "Published your App" commits are a proxy for publishes, not a log of them.
+
+Reality matched the exposure story, so the order proceeded.
+
+### The rescue (scope 1) — what was saved, what was confirmed lost
+
+Read-only, from the live seam, before any change.
+
+| Job | Outcome |
+|---|---|
+| `job_7nQAfTUr1v` | **404 — GONE.** Not recoverable by any means available. Its leads went with the deployment disk at the 2026-08-06 publish. Recorded as a fixture that says so. |
+| `job_u5I0sjFlo_` | **Rescued in full.** `completed`, external_id `chief-discovery-2026-08-07-7b6ead3287fe`, 20 leads (ids 21–40), all GB / `mobile_google_play`. |
+
+Fixtures live in `artifacts/api-server/rescue/`, ship in the deploy image, and are
+replayed idempotently at every boot by `src/rescueSeed.ts`.
+
+**What the fixtures could not carry**, because the seam was the only permitted way
+in and `leadToChiefDto` does not put these on the wire:
+
+- `ad_text` — deliberately omitted from the seam (unbounded ad creative). The
+  rescued rows carry NULL. Every field the Chief's ICP backfill reads —
+  `page_url`, `is_game`, `found_at` — **is** carried.
+- `total_ads_scraped` — no such DTO field; seeded 0 rather than invented.
+  `total_advertisers` is set from the lead count, which the seam does report.
+- `source_params` — reconstructed as `{"maxLeads":20}`, the only key anything
+  reads back off it. The original Google Ads run parameters are gone.
+
+**Human job history from the old disk is accepted as lost.** Users received those
+results by email and CSV at the time. Nothing was recovered for them and nothing
+pretends to be.
+
+### The table mapping
+
+Nineteen tables ported one for one in migration 1, with the column order the SQLite
+database had (base `CREATE` first, then each `ALTER`-added column in the order it
+arrived) — because `SELECT *` rows are serialised straight into API responses, so
+column order **is** JSON key order and the DARK baseline pins it.
+
+| SQLite | PostgreSQL | Why |
+|---|---|---|
+| `TEXT` | `text` | — |
+| `INTEGER` | **`bigint`** | SQLite's INTEGER is 64-bit and this schema stores epoch **milliseconds** in it. `int4` tops out at 2147483647, which epoch-ms passed in 1970 — a column of `integer` would turn every timestamp write into an out-of-range error. |
+| `REAL` | `double precision` | `pg` parses float8 to a number; `numeric` would come back a string. |
+| `INTEGER PRIMARY KEY AUTOINCREMENT` | `bigint GENERATED **BY DEFAULT** AS IDENTITY` | `BY DEFAULT`, not `ALWAYS`, so the rescue seed can restore a lead under the id the Chief already recorded as `lf_lead_id`. |
+
+Tables: `jobs`, `job_logs`, `job_results`, `settings`, `users`, `sessions`,
+`gmail_tokens`, `llm_spend`, `chief_jobs`, `hq_cache`, `app_category_cache`,
+`discovered_apps`, `store_app_detail`, `publishers`, `publisher_identity`,
+`developer_catalog_expansion`, `search_battery_cell`, `search_battery_cell_store`,
+`similar_crawl_seed` — plus every index, and `schema_migrations` for the state.
+
+Dialect conversions, all of them: scalar two-argument `MIN`/`MAX` → `LEAST`/`GREATEST`
+(PostgreSQL has only the aggregate); `GROUP_CONCAT(DISTINCT x)` → `string_agg(DISTINCT x, ',')`;
+`INSERT OR IGNORE` → `ON CONFLICT DO NOTHING`; `lastInsertRowid` → `RETURNING id`;
+`PRAGMA table_info` deleted with the hand-rolled `addColumnIfMissing` it served;
+`SQLITE_CONSTRAINT_*` → SQLSTATE `23505`. `?` and `@name` placeholders are translated
+in `sql.ts` rather than in 115 SQL strings, so each module still runs the SQL it wrote.
+
+### The download mechanism
+
+`src/download.ts`. Result CSVs and per-HQ-country `.xlsx` bundles are **regenerated
+from the database at download time** — rows from `job_results`, HQ resolutions from
+the `hq_cache` table the split already populated, bytes built in memory, no
+filesystem on any path. `csv_path` / `hq_zip_path` survive only as markers.
+
+**No vendor call, ever.** The original split resolves an unknown HQ by fetching the
+store page and asking an LLM; regeneration does not. A cache miss buckets under
+"Unknown", exactly as an unresolvable row always did. A user clicking an old link
+must never be able to spend money or block on a rate limit.
+
+**Deterministic.** The manifest and both ZIP layers are stamped from the *job's* own
+completion time, never `new Date()`.
+
+**Pre-migration links are already broken by past publishes.** Nothing was changed
+about them and nothing can be: the files they name are gone.
+
+### The persistence proof
+
+`scripts/check-durability.mjs`, in the test gate. Everything crosses a real process
+boundary — separate `node` invocations, `SIGKILL` for the restart — so nothing but
+the database can be carrying state.
+
+1. A job, its 3 leads, its session and its chief mapping written by one process are
+   read back by a **second** process.
+2. The rescue seed is idempotent over repeated boots: one job, 20 leads, ids still
+   21–40, and a **new** lead gets id 44 — the identity sequence was realigned, so a
+   live job cannot collide with a rescued id.
+3. A download link answers **byte-identically** before and after a SIGKILL restart,
+   over real HTTP, and a session issued by the dead process still authenticates.
+4. The server refuses to boot without `DATABASE_URL`, naming the variable, with no
+   sqlite anywhere in the failure.
+5. Booted against a URL carrying a password: the password appears **nowhere** in the
+   process output, no raw connection URL is printed, and the boot line still names
+   `host:port/database`.
+6. The adopt path, end to end (below).
+
+`scripts/smoke-l34g.mjs`, both modes, separate ports, ephemeral clusters, runner
+disabled: the seeded chief job is compared **field by field against the recorded
+live bytes**, and **all 20 leads are byte-identical to what live returned** — in
+DARK and in LIT. Eight baseline probes are byte-identical between modes.
+
+### Tests proven able to fail
+
+Two mutations, both of which found something:
+
+- **Downloads back on the filesystem** → 3 failures. It also revealed that the
+  byte-identity assertion passed on a *pair of 404s*, since two identical 404 bodies
+  hash the same. The assertion now requires 200 as well.
+- **Rescue-seed idempotency guard removed** → passed at first, for the wrong reason:
+  the `jobs` primary key rejected the duplicate insert and the seeder logged the
+  failure, so the row counts still held. A broken seeder was passing a green test.
+  It now asserts the seeder's own outcome, and fails under the mutation.
+
+The download proof also caught a real defect: an `.xlsx` is itself a ZIP, so
+`buildXlsx` stamped every part inside it with `new Date()`, and the outer archive's
+bytes changed whenever two downloads straddled a two-second DOS-timestamp boundary.
+Intermittent, which is worse than false — it passes most of the time.
+
+### Bugs the port surfaced, none of which the compiler could see
+
+TypeScript catches a missing `await` on a *read* (a Promise is not a `JobRow`) and
+cannot catch one on a *write*. `scripts/check-storage-seam.mjs` now does, and found:
+
+- `upsertPublisher` called without `await` in the fast lane — it reported "1
+  publisher" while the row was still in flight and the table stayed empty.
+- `absorbPublisher` unawaited — publisher merges lost under any concurrency.
+- **every `throwIfCancelled` left unawaited — the Stop button had silently stopped
+  working.**
+- `forEach(async …)` in the chart crawl: the loop moved on while inserts were in
+  flight.
+- `POST /api/jobs` returned an array of unresolved promises — `[{}, {}]` on the wire.
+- 140 further discarded storage promises across the pipelines.
+
+And from the audit round: `upsertUser` and `upsertGmailTokens` read-then-inserted.
+Under sqlite that pair was one uninterruptible turn; `upsertUser` runs on the OAuth
+callback, so two tabs finishing sign-in together would collide on `users_email_key`
+and one would see a 500 on an ordinary login. Both now use `ON CONFLICT`.
+
+### Operator notes for the publish
+
+1. **Expected migration plan: one migration, id 1, on an empty database.** The boot
+   line reads `db: postgres <host>:<port>/<database> — migrations applied 1 (schema 1)`.
+   On an already-migrated database it reads `already current` and applies nothing.
+2. **If the paired production database already holds tables but no migration state**,
+   boot **refuses** and names the fix. Restart **once** with `LEADFINDER_DB_ADOPT=1`
+   to record the baseline as applied without running it — adopting creates, alters
+   and drops nothing. Remove the flag before the next boot. Tested end to end
+   (durability phase 6), because untested operator instructions are how a publish
+   goes wrong at the worst moment.
+3. **A generated migration containing DROP is never approved.** Not a convention
+   here: `assertNoDestructiveMigrations()` refuses `DROP` and `TRUNCATE` statically
+   and the test gate calls it, so a destructive migration cannot reach a database.
+4. **⚠ THE OLD HAZARD MOVED INTO `DATABASE_URL`.** `.replitignore` used to keep dev
+   jobs out of the deployment because the deploy's queue processor runs any
+   `pending` rows at boot — that once replayed stale smoke jobs against the live
+   endpoint and got the proxy IP rate-limited. **If the deployment is pointed at the
+   same database as the workspace, a dev-created `pending` job is a production job
+   the moment the deployment boots.** No ignore file can guard this; it is an
+   environment setting. Confirm the deployment has its own database before publishing.
+5. Migrations take an advisory lock, so two processes racing to migrate is safe.
+
+### Dev database
+
+`heliumdb` was migrated by the app's own `initDb()` and now holds the schema plus
+the rescued chief job (20 leads, ids 21–40) and nothing else. The first gate run —
+before the tests were pinned — inherited the workspace `DATABASE_URL` and wrote its
+fixture jobs and users into it; those rows were deleted with Michael's approval.
+That is exactly why `assertEphemeral()` now exists: tests refuse to run against
+anything but a throwaway cluster reached over a unix socket in a `pgtest-*` temp
+directory, and every check script strips the inherited URL from its children.
+
+### Deliberately not done, and why
+
+- **`scripts/smoke-store-first.mjs`, `sample-publishers.mjs`, `verify-tail-confirm.mjs`
+  were not ported.** All three are built on a sandbox *directory* (cwd → a throwaway
+  sqlite file) and all three drive a live discovery run against Google Play, the App
+  Store and Ads Transparency. This order forbids starting a real scraping or
+  verification run, so a rewrite could not have been executed even once before being
+  committed. They now **refuse with an explanation** and a note saying what porting
+  involves, rather than building a sandbox nothing reads. Follow-up work.
+- **`upsertPublisher`'s read-modify-write is no longer atomic.** It resolves identity
+  keys, absorbs orphans, then upserts — three round trips where sqlite had one
+  synchronous turn. Worst case is a duplicate publisher row, which the
+  `publisher_identity` table exists to heal on the next run, and `ON CONFLICT(merge_key)`
+  bounds. Making it one transaction means threading the handle through
+  `absorbPublisher`; left for an order that can test it properly.
+
+### Gates
+
+typecheck clean · `pnpm build` clean (dashboard + api-server) · **1,747 unit assertions
+across 34 modules, plus 1,933 integration assertions, 0 failed** — chief surface 1,532,
+legacy addresses 233, OAuth 70, durability 39, L-3.4g smoke 38, fast lane 18, storage
+seam 3 · `better-sqlite3` removed from the dependency tree entirely, so the deploy no
+longer compiles a native module it cannot use.

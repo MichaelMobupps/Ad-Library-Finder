@@ -27,6 +27,7 @@
 import http from 'node:http';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
+import { startCluster, assertEphemeral } from './pgtest.mjs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -52,6 +53,7 @@ const HEADER_CASES = [
 const mode = (process.argv.find((a) => a.startsWith('--mode=')) || '').slice(7);
 if (!mode) {
   let failed = 0;
+  const cluster = await startCluster('oauth');
   for (const [m, env] of [
     ['lit', { BASE_PATH: '/leadfinder/', PUBLIC_BASE_URL: 'https://tools.mobupps.net/leadfinder' }],
     ['dark', {}],
@@ -61,6 +63,7 @@ if (!mode) {
     const childEnv = { ...process.env };
     delete childEnv.BASE_PATH;
     delete childEnv.PUBLIC_BASE_URL;
+    childEnv.DATABASE_URL = cluster.createDatabase(`oauth_${m.replace(/-/g, '_')}`);
     const res = spawnSync(process.execPath, [fileURLToPath(import.meta.url), `--mode=${m}`], {
       cwd: dir, encoding: 'utf8', env: { ...childEnv, ...env },
     });
@@ -77,7 +80,9 @@ let passed = 0;
 const failures = [];
 const check = (c, d) => (c ? passed++ : failures.push(`FAIL [${mode}] ${d}`));
 
+assertEphemeral(process.env.DATABASE_URL);
 const { initDb, getDb } = await import(`${DIST}/db.js`);
+const { closeDatabase } = await import(`${DIST}/sql.js`);
 const { getRedirectUriFromReq } = await import(`${DIST}/oauth.js`);
 const { buildApp } = await import(`${DIST}/app.js`);
 const urls = await import(`${DIST}/urls.js`);
@@ -179,7 +184,7 @@ if (mode === 'lit') {
 }
 
 srv.close();
-getDb().close();
+await closeDatabase();
 
 console.log(`oauth-redirect-uri [${mode}]: ${passed} passed, ${failures.length} failed`);
 for (const f of failures) console.log(`  ${f}`);

@@ -52,7 +52,7 @@ interface SplitOptions {
   onLog: (level: 'info' | 'warn' | 'error' | 'debug', msg: string) => void;
 }
 
-const HEADER = [
+export const WEB_HQ_HEADER = [
   'advertiser_name',
   'country', // geo the lead was tagged with (informational)
   'website_url',
@@ -67,7 +67,7 @@ const HEADER = [
   'resolve_reasoning',
 ];
 
-function rowFromResult(r: JobResultRow, hq: ResolvedHq | null): (string | number | null)[] {
+export function webHqRow(r: JobResultRow, hq: ResolvedHq | null): (string | number | null)[] {
   return [
     r.advertiser_name || '',
     r.country || '',
@@ -141,7 +141,7 @@ export async function resolveWebHq(
 }
 
 export async function runHqSplitWeb(opts: SplitOptions): Promise<WebHqSplitOutcome> {
-  ensureHqCacheTable();
+  await ensureHqCacheTable();
   if (!existsSync(ZIP_DIR)) mkdirSync(ZIP_DIR, { recursive: true });
 
   const web = opts.results.filter((r) => r.classification === 'cps_web' && r.landing_url);
@@ -168,7 +168,7 @@ export async function runHqSplitWeb(opts: SplitOptions): Promise<WebHqSplitOutco
     const r = web[i];
     const url = r.landing_url!;
 
-    let hq: ResolvedHq | null = lookupHqCache(url);
+    let hq: ResolvedHq | null = await lookupHqCache(url);
     if (hq) {
       outcome.cacheHits++;
     } else {
@@ -184,7 +184,7 @@ export async function runHqSplitWeb(opts: SplitOptions): Promise<WebHqSplitOutco
         else outcome.llmCalls++;
 
         hq = await resolveWebHq(url, r.advertiser_name || '', r.ad_text || '');
-        storeHqCache(url, hq);
+        await storeHqCache(url, hq);
       } catch (err) {
         if (err instanceof BudgetExceededError) throw err;
         opts.onLog('error', `web-hq-split: resolve threw for ${url} — ${(err as Error).message}`);
@@ -207,7 +207,7 @@ export async function runHqSplitWeb(opts: SplitOptions): Promise<WebHqSplitOutco
   const zipEntries: ZipEntry[] = [];
   for (const [country, items] of Object.entries(bucketed)) {
     const slug = countryToFilenameSlug(country);
-    const rows: (string | number | null)[][] = [HEADER, ...items.map((it) => rowFromResult(it.result, it.hq))];
+    const rows: (string | number | null)[][] = [WEB_HQ_HEADER, ...items.map((it) => webHqRow(it.result, it.hq))];
     const xlsxBuf = buildXlsx({ name: slug.slice(0, 31), rows });
     zipEntries.push({ path: `${slug}.xlsx`, data: xlsxBuf });
     outcome.perCountryCounts[country] = items.length;
@@ -274,7 +274,7 @@ const isMain =
   process.argv[1] &&
   (process.argv[1].endsWith('hqSplitWeb.js') || process.argv[1].endsWith('hqSplitWeb.ts'));
 if (isMain) {
-  runHqSplitWebUnitTests().then(({ passed, failed, failures }) => {
+  void runHqSplitWebUnitTests().then(({ passed, failed, failures }) => {
     console.log(`hqSplitWeb unit tests: ${passed} passed, ${failed} failed`);
     for (const f of failures) console.log('  ' + f);
     process.exit(failed === 0 ? 0 : 1);
