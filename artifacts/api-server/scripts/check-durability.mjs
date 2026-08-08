@@ -23,6 +23,13 @@
  *   4. THE SERVER REFUSES TO BOOT WITHOUT A DATABASE. No fallback, no local
  *      file, no silent degradation.
  *
+ *   6. THE ADOPT PATH DOES WHAT THE OPERATOR NOTES SAY. A database that already
+ *      holds this app's tables but no migration state is REFUSED, and the
+ *      one-boot LEADFINDER_DB_ADOPT=1 escape records the baseline as applied
+ *      without creating, altering or dropping anything. Tested because it is an
+ *      instruction handed to a human for use during a publish, and untested
+ *      operator instructions are how a publish goes wrong at the worst moment.
+ *
  *   5. THE DATABASE PASSWORD NEVER REACHES THE LOG. `DATABASE_URL` carries a
  *      credential, and the boot line names the backend. Proved by booting
  *      against a URL that HAS a password and reading every byte the process
@@ -39,7 +46,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
-import { startCluster, assertEphemeral } from './pgtest.mjs';
+import { startCluster, assertEphemeral, pgEnv } from './pgtest.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');
@@ -254,6 +261,72 @@ try {
     check(
       !/sqlite|data\/ad-library/i.test(out),
       'it does not fall back to a local file (no sqlite anywhere in the failure)',
+    );
+  }
+
+  // ── 6. the adopt path ────────────────────────────────────────────────────
+  {
+    // A database carrying the schema but no migration state — exactly what a
+    // paired production database looks like when something other than this
+    // migrator created it.
+    const adoptUrl = cluster.createDatabase('adopt_target');
+    // Real rows first, so "adopting destroys nothing" is a claim about DATA and
+    // not just about the schema surviving.
+    const seeded = spawnSync(process.execPath, [SELF, '--phase=write'], {
+      cwd: ROOT,
+      encoding: 'utf8',
+      env: { ...childEnv(), DATABASE_URL: adoptUrl },
+    });
+    check(seeded.status === 0, 'phase 6: a fresh database migrates normally and takes rows');
+
+    // Erase ONLY the migration state, leaving every table in place.
+    const wiped = spawnSync(
+      'psql',
+      ['-d', adoptUrl, '-v', 'ON_ERROR_STOP=1', '-c', 'DELETE FROM schema_migrations'],
+      { encoding: 'utf8', env: pgEnv() },
+    );
+    check(wiped.status === 0, 'phase 6: migration state cleared, tables left alone');
+
+    const refused = spawnSync(process.execPath, [SELF, '--phase=read'], {
+      cwd: ROOT,
+      encoding: 'utf8',
+      env: { ...childEnv(), DATABASE_URL: adoptUrl },
+    });
+    const refusedOut = `${refused.stdout || ''}${refused.stderr || ''}`;
+    check(refused.status !== 0, 'phase 6: a schema with no migration state is REFUSED, not guessed at');
+    check(
+      /LEADFINDER_DB_ADOPT=1/.test(refusedOut),
+      'phase 6: the refusal names the exact one-boot escape the operator notes give',
+    );
+    check(
+      /already holds \d+ of this app's tables/.test(refusedOut),
+      'phase 6: it says WHAT it found rather than failing obscurely',
+    );
+
+    const adopted = spawnSync(process.execPath, [SELF, '--phase=read'], {
+      cwd: ROOT,
+      encoding: 'utf8',
+      env: { ...childEnv(), DATABASE_URL: adoptUrl, LEADFINDER_DB_ADOPT: '1' },
+    });
+    const adoptedOut = `${adopted.stdout || ''}${adopted.stderr || ''}`;
+    check(adopted.status === 0, 'phase 6: LEADFINDER_DB_ADOPT=1 boots');
+    check(/ADOPTED an existing schema/.test(adoptedOut), 'phase 6: adopting says so, loudly, in the log');
+    const readBack = JSON.parse((adopted.stdout.match(/^READ=(.+)$/m) || ['', '{}'])[1]);
+    check(
+      readBack.leads === 3 && readBack.status === 'completed',
+      'phase 6: adopting CREATED AND DESTROYED NOTHING — the rows are all still there',
+    );
+
+    // And the next boot needs no flag: the state is recorded now.
+    const after = spawnSync(process.execPath, [SELF, '--phase=read'], {
+      cwd: ROOT,
+      encoding: 'utf8',
+      env: { ...childEnv(), DATABASE_URL: adoptUrl },
+    });
+    check(after.status === 0, 'phase 6: the boot AFTER adopting needs no flag');
+    check(
+      !/ADOPTED an existing schema/.test(`${after.stdout || ''}${after.stderr || ''}`),
+      'phase 6: and does not adopt again',
     );
   }
 

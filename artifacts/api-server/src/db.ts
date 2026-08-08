@@ -578,12 +578,24 @@ export async function upsertUser(input: { id?: string; email: string; name?: str
   }
   const id = input.id ?? `usr_${randomBytes(8).toString('hex')}`;
   const now = Date.now();
+  // ON CONFLICT (email) DO NOTHING, then re-read.
+  //
+  // The read above and this insert used to be one uninterruptible synchronous
+  // turn, so "no user with this email" could not stop being true between them.
+  // Against a network database they are two round trips, and this runs on the
+  // OAuth callback — two browser tabs finishing sign-in together would race,
+  // one would hit users_email_key, and the loser would see a 500 on a
+  // perfectly ordinary login. DO NOTHING makes the loser fall through to the
+  // re-read and find the winner's row, which is the answer it wanted anyway.
   await getDb()
     .prepare(
-      `INSERT INTO users (id, email, name, default_recipient, created_at) VALUES (?, ?, ?, NULL, ?)`
+      `INSERT INTO users (id, email, name, default_recipient, created_at) VALUES (?, ?, ?, NULL, ?)
+       ON CONFLICT (email) DO NOTHING`,
     )
     .run(id, input.email, input.name ?? null, now);
-  return (await getUserById(id))!;
+  // By email, not by id: on a lost race the surviving row carries the WINNER's
+  // id, and `id` above names a row that was never inserted.
+  return (await getUserByEmail(input.email))!;
 }
 
 export async function setUserDefaultRecipient(userId: string, recipient: string | null) {
@@ -634,10 +646,22 @@ export async function upsertGmailTokens(input: {
   const existing = await getGmailTokensForUser(input.userId);
   const now = Date.now();
   if (!existing) {
+    // ON CONFLICT DO UPDATE rather than a plain INSERT: the read above is a
+    // separate round trip now, so a second call arriving in that window would
+    // otherwise fail on the primary key. Falling through to the same
+    // COALESCE-shaped update keeps the "never blank a refresh_token we already
+    // hold" rule below true on this path too — losing a refresh token means the
+    // user has to reconnect Gmail by hand.
     await getDb()
       .prepare(
         `INSERT INTO gmail_tokens (user_id, access_token, refresh_token, expires_at, gmail_email, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?)`
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT (user_id) DO UPDATE SET
+           access_token  = COALESCE(excluded.access_token, gmail_tokens.access_token),
+           refresh_token = COALESCE(excluded.refresh_token, gmail_tokens.refresh_token),
+           expires_at    = COALESCE(excluded.expires_at, gmail_tokens.expires_at),
+           gmail_email   = COALESCE(excluded.gmail_email, gmail_tokens.gmail_email),
+           updated_at    = excluded.updated_at`,
       )
       .run(
         input.userId,

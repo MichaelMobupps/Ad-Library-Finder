@@ -1,5 +1,7 @@
 packages:
   - "artifacts/*"
 
-onlyBuiltDependencies:
-  - better-sqlite3
+# No native build steps are approved. better-sqlite3 was here until order
+# L-3.4g moved this app's storage to PostgreSQL; `pg` is pure JavaScript, so
+# nothing in this workspace needs to compile at install time any more.
+onlyBuiltDependencies: []

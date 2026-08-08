@@ -24,10 +24,28 @@
 .cache/replit
 .cache/fontconfig
 
-# NEVER ship local dev state to a deployment. The dev SQLite DB carries dev
-# jobs — the deploy's queue processor runs any 'pending' rows at boot, which
-# once replayed stale smoke-test jobs against the live endpoint through the
-# operator's proxy and got its IP rate-limited before real jobs even started.
+# NEVER ship local dev state to a deployment.
+#
+# HISTORY, and the reason this app now stores nothing here: these directories
+# held the SQLite database and the exported CSV/zip files. Excluding the
+# database from the image was correct — a dev DB carries dev jobs, and the
+# deploy's queue processor runs any 'pending' rows at boot, which once replayed
+# stale smoke-test jobs against the live endpoint through the operator's proxy
+# and got its IP rate-limited before real jobs even started. But it was also
+# half the problem: with the file excluded AND a Reserved VM's disk replaced on
+# every publish, the deployment started from an empty database every single
+# deploy. Order L-3.4g moved storage to PostgreSQL for exactly that reason.
+#
+# THE SAME HAZARD NOW LIVES IN DATABASE_URL, NOT HERE. If the deployment is
+# pointed at the SAME database as the workspace, a dev-created 'pending' job is
+# a production job the moment the deployment boots. That is an environment
+# setting, which no ignore file can guard — see the L-3.4g ledger's operator
+# notes.
+#
+# data/ is kept excluded because it costs nothing and stops a stale
+# ad-library.sqlite from ever riding along again. csv-output/ still holds the
+# working files the completion email attaches during a run; downloads are
+# regenerated from the database and never read them.
 data/
 artifacts/api-server/data/
 csv-output/
