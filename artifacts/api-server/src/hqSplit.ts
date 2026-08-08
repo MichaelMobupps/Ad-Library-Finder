@@ -74,7 +74,7 @@ interface SplitOptions {
   onLog: (level: 'info' | 'warn' | 'error' | 'debug', msg: string) => void;
 }
 
-const HEADER = [
+export const MOBILE_HQ_HEADER = [
   'advertiser_name',
   'country', // the geo the ad was scraped in
   'store_url',
@@ -91,7 +91,7 @@ const HEADER = [
   'resolve_reasoning',
 ];
 
-function rowFromResult(r: JobResultRow, hq: ResolvedHq | null): (string | number | null)[] {
+export function mobileHqRow(r: JobResultRow, hq: ResolvedHq | null): (string | number | null)[] {
   const storeLabel =
     r.classification === 'mobile_google_play' ? 'google_play' :
     r.classification === 'mobile_app_store' ? 'app_store' : '';
@@ -203,7 +203,7 @@ export async function runHqSplit(opts: SplitOptions): Promise<HqSplitOutcome> {
   for (const [country, items] of Object.entries(bucketed)) {
     const slug = countryToFilenameSlug(country);
     const filename = `${slug}.xlsx`;
-    const rows: (string | number | null)[][] = [HEADER, ...items.map((it) => rowFromResult(it.result, it.hq))];
+    const rows: (string | number | null)[][] = [MOBILE_HQ_HEADER, ...items.map((it) => mobileHqRow(it.result, it.hq))];
     const xlsxBuf = buildXlsx({ name: slug.slice(0, 31), rows });
     zipEntries.push({ path: filename, data: xlsxBuf });
     outcome.perCountryCounts[country] = items.length;

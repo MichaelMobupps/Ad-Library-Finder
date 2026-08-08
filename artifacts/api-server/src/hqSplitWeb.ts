@@ -52,7 +52,7 @@ interface SplitOptions {
   onLog: (level: 'info' | 'warn' | 'error' | 'debug', msg: string) => void;
 }
 
-const HEADER = [
+export const WEB_HQ_HEADER = [
   'advertiser_name',
   'country', // geo the lead was tagged with (informational)
   'website_url',
@@ -67,7 +67,7 @@ const HEADER = [
   'resolve_reasoning',
 ];
 
-function rowFromResult(r: JobResultRow, hq: ResolvedHq | null): (string | number | null)[] {
+export function webHqRow(r: JobResultRow, hq: ResolvedHq | null): (string | number | null)[] {
   return [
     r.advertiser_name || '',
     r.country || '',
@@ -207,7 +207,7 @@ export async function runHqSplitWeb(opts: SplitOptions): Promise<WebHqSplitOutco
   const zipEntries: ZipEntry[] = [];
   for (const [country, items] of Object.entries(bucketed)) {
     const slug = countryToFilenameSlug(country);
-    const rows: (string | number | null)[][] = [HEADER, ...items.map((it) => rowFromResult(it.result, it.hq))];
+    const rows: (string | number | null)[][] = [WEB_HQ_HEADER, ...items.map((it) => webHqRow(it.result, it.hq))];
     const xlsxBuf = buildXlsx({ name: slug.slice(0, 31), rows });
     zipEntries.push({ path: `${slug}.xlsx`, data: xlsxBuf });
     outcome.perCountryCounts[country] = items.length;
