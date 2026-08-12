@@ -9,8 +9,11 @@
  *
  * THE PATTERN, proven on two apps before this one: report per UTC day per
  * vendor in $0.50 quanta, one request per quantum, `external_id` idempotent,
- * retry 5xx with the SAME `external_id`, never retry 4xx, and let a 4xx latch
+ * retry 5xx with the SAME `external_id`, never retry a 4xx, and let a 4xx latch
  * the reporter off loudly rather than loop.
+ *
+ * ONE DELIBERATE DEPARTURE: 429 retries rather than latching. It is the only
+ * 4xx that is not a verdict on the request — see classifyStatus().
  *
  * ── TWO DAY BOUNDARIES, BOTH REAL ────────────────────────────────────────────
  *
@@ -198,23 +201,28 @@ export function ingestUrl(cfg: ReporterConfig): string {
 
 export type PostOutcome =
   | { kind: 'ok' }
-  /** 5xx or transport failure: the same external_id may be sent again. */
+  /** 5xx, 429 or transport failure: the same external_id may be sent again. */
   | { kind: 'retry'; detail: string }
   /** 4xx: this request is wrong and repeating it will stay wrong. Latch off. */
   | { kind: 'fatal'; status: number; detail: string };
 
 /**
- * How an HTTP status is treated.
+ * How an HTTP status is treated: 2xx succeeds, 5xx and 429 retry, every other
+ * 4xx is fatal and latches the reporter off.
  *
- * The rule as ordered: 2xx succeeds, 5xx retries, EVERY 4xx is fatal and
- * latches the reporter off. 429 is included in that — see the note in the
- * L-3.5a ledger entry, which asks the Chief's contract to confirm it never
- * rate-limits ingest, since under this rule a single 429 silences reporting
- * until the next boot.
+ * WHY 429 IS NOT FATAL, despite being a 4xx. Every other 4xx is a verdict on
+ * the request itself — wrong credential, unknown field, rejected id — and
+ * repeating it would loop on a request that cannot succeed. A 429 says "later",
+ * not "wrong": the request is fine and the only thing at fault is the timing.
+ * Latching on it would let one rate-limit reply silence this app's spend
+ * reporting until its next boot, which is precisely the blind spot O-25 exists
+ * to close. The Chief's ingest does not rate-limit today; it may later, and
+ * this app should not need a code change on the day it starts.
  */
 export function classifyStatus(status: number): PostOutcome {
   if (status >= 200 && status < 300) return { kind: 'ok' };
   if (status >= 500) return { kind: 'retry', detail: `HTTP ${status}` };
+  if (status === 429) return { kind: 'retry', detail: 'HTTP 429 (rate limited)' };
   if (status >= 400) {
     return { kind: 'fatal', status, detail: `HTTP ${status}` };
   }
@@ -447,10 +455,13 @@ export class SpendReporter {
   /**
    * Stop reporting, loudly, once.
    *
-   * A 4xx means the Chief has rejected the SHAPE of what this app sends —
+   * A fatal 4xx means the Chief has rejected the SHAPE of what this app sends —
    * wrong token, unknown field, a rejected `external_id`. Repeating it cannot
    * fix it, and looping on it would bury the one line an operator needs in a
    * stream of identical failures. Nothing about the token appears here.
+   *
+   * A 429 never arrives here: it retries, because a rate limit is a statement
+   * about timing rather than about the request.
    */
   private latch(outcome: Extract<PostOutcome, { kind: 'fatal' }>, day: string, q: number): void {
     this.latched = true;
@@ -749,12 +760,34 @@ export function runSpendReporterTests(): { passed: number; failed: number; failu
   check(classifyStatus(404).kind === 'fatal', 'status: 404 is fatal');
   check(classifyStatus(409).kind === 'fatal', 'status: 409 is fatal');
   check(classifyStatus(422).kind === 'fatal', 'status: 422 — a refused field — is fatal');
-  check(classifyStatus(429).kind === 'fatal', 'status: 429 latches, as ordered (flagged in the ledger)');
   check(classifyStatus(302).kind === 'fatal', 'status: a redirect is fatal, not followed into the unknown');
-  // The property the order names: no 4xx is ever retryable.
+
+  // 429 is the ONE 4xx that retries. A rate limit says "later", not "wrong", so
+  // latching on it would silence reporting until the next boot for a request
+  // that was never faulty.
+  check(classifyStatus(429).kind === 'retry', 'status: 429 retries rather than latching');
+  check(
+    classifyStatus(429).kind !== 'fatal',
+    'status: a rate limit can never silence the reporter until the next boot',
+  );
+  check(
+    (classifyStatus(429) as { detail: string }).detail.includes('429'),
+    'status: the 429 retry names itself in the log detail',
+  );
+  // …and it is the ONLY one. Every other 4xx is a verdict on the request.
   let anyRetryable4xx = false;
-  for (let s = 400; s < 500; s++) if (classifyStatus(s).kind === 'retry') anyRetryable4xx = true;
-  check(!anyRetryable4xx, 'status: NO 4xx is retryable, across the whole range');
+  let retryableWitness = '';
+  for (let s = 400; s < 500; s++) {
+    if (s === 429) continue;
+    if (classifyStatus(s).kind === 'retry') {
+      anyRetryable4xx = true;
+      retryableWitness = String(s);
+    }
+  }
+  check(
+    !anyRetryable4xx,
+    `status: no 4xx OTHER than 429 is retryable, across the whole range (${retryableWitness || 'none'})`,
+  );
   let all5xxRetry = true;
   for (let s = 500; s < 600; s++) if (classifyStatus(s).kind !== 'retry') all5xxRetry = false;
   check(all5xxRetry, 'status: every 5xx retries, across the whole range');

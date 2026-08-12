@@ -3343,7 +3343,7 @@ migrator has never recorded anything in. Once it owns the schema, later migratio
 | **Idempotency** | `external_id = leadfinder:<vendor>:<utc-day>:q<n>`. A retry, a timeout or a crash re-sends the identical id. |
 | **Attribution** | **`initiated_by` is omitted entirely.** Not guessed, not defaulted. |
 | **Transport** | `POST <CHIEF_URL>/api/ingest/spend`, `Authorization: Bearer <CHIEF_INGEST_TOKEN>`, `content-type: application/json`. Body is exactly five fields: `app`, `vendor`, `day`, `amount_usd`, `external_id`. |
-| **Retries** | 5xx and transport errors: up to 4 attempts, 500ms linear backoff, same `external_id`. Any 4xx: **never retried**, reporter latches off with one loud line. |
+| **Retries** | 5xx, **429** and transport errors: up to 4 attempts, 500ms linear backoff, same `external_id`. Every other 4xx: **never retried**, reporter latches off with one loud line. |
 | **Cursor** | `chief_spend_cursor(utc_day, vendor, reported_quanta, updated_at)`, advanced only after a 2xx, monotonic via `GREATEST`. |
 | **Cadence** | One sweep at boot, then every 5 minutes. 7-day lookback; a day that falls off the back still owing quanta is named out loud, with the shortfall in dollars. |
 | **Dormancy** | Unset `CHIEF_URL` or `CHIEF_INGEST_TOKEN` ⇒ dormant, one loud warning per boot, no crash, no request. |
@@ -3384,10 +3384,15 @@ the fake Chief actually received.
    `0.50`.
 3. **`external_id` dedup across retries**, since at-least-once delivery is the
    only thing a crash between "accepted" and "cursor written" can offer.
-4. **Never a 429 on ingest.** As ordered, every 4xx latches the reporter off and
-   429 is a 4xx — so one rate-limit reply would silence this app's reporting
-   until its next boot. Flagged rather than silently deviated from: if the Chief
-   can 429, that status wants moving to the retry branch in a follow-up.
+4. ~~**Never a 429 on ingest.**~~ **Amended 2026-08-12, by decision: 429 now
+   RETRIES.** It was first built to the order's literal rule — every 4xx latches
+   — which made a single rate-limit reply enough to silence this app's reporting
+   until its next boot. That was flagged rather than quietly deviated from, and
+   the decision came back to move it: 429 is the one 4xx that is not a verdict
+   on the request, so it retries on the same bounded backoff as a 5xx, with the
+   same `external_id`, and never latches. The Chief's ingest does not rate-limit
+   today; it may later, and this app will not need a code change on that day.
+   Nothing is required of the Chief here any more.
 
 The Chief's `CONTRACT.md` was **not reachable** from this workspace, so the shape
 above mirrors the proven pattern as described in the order. Every assumption in

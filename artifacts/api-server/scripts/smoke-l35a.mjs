@@ -338,6 +338,38 @@ if (phase) {
       );
     }
 
+    // C2 — 429 is the one 4xx that RETRIES. Same bounded backoff as a 5xx, same
+    // external_id, and it must never latch: a rate-limit reply that silenced
+    // reporting until the next boot would reopen the exact blind spot O-25
+    // closes. The Chief does not rate-limit ingest today and may later.
+    {
+      rewindCursor();
+      const chief = await startFakeChief((_r, n) => ({ status: n <= 2 ? 429 : 202 }));
+      const reporter = new sr.SpendReporter(cfg(chief.url), fetch, () => NOW);
+      const captured = await captureLogs(() => reporter.sweep());
+      await chief.stop();
+      const firstThree = chief.seen.slice(0, 3);
+      check(firstThree.length === 3, 'C2: a 429 is retried, not latched on');
+      check(
+        new Set(firstThree.map((r) => r.body?.external_id)).size === 1,
+        'C2: every 429 retry carries the SAME external_id',
+      );
+      check(reporter.state === 'active', 'C2: the reporter is still active after a rate limit');
+      check(
+        captured.lines.filter(([lvl]) => lvl === 'error').length === 0,
+        'C2: a rate limit is not an error — nothing latched',
+      );
+      check(
+        chief.seen.length === DAY_A_QUANTA + DAY_B_QUANTA + 2,
+        `C2: reporting completed in full after the rate limit cleared (got ${chief.seen.length})`,
+      );
+      check(await sr.readCursor(DAY_A) === DAY_A_QUANTA, 'C2: the rate-limited quantum settled exactly once');
+      check(
+        captured.lines.every(([, text]) => !text.includes(INGEST_TOKEN)),
+        'C2: the token appears in no log line during a rate limit',
+      );
+    }
+
     // D — a 400 on the first quantum latches the reporter off with one line.
     {
       rewindCursor();
