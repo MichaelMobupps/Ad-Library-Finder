@@ -3466,3 +3466,64 @@ the one caveat that attribution is reported as absent rather than split —
 per-row attribution needs `llm_spend` to carry a job identity, which is a
 schema and plumbing change across `classifier.ts`, `hqResolver.ts` and
 `webResolver.ts`, and has its own order.
+
+### Publish-time schema diff proposed a DROP — root cause and fix (2026-08-12)
+
+The first publish attempt after this order offered this SQL:
+
+```sql
+ALTER TABLE "chief_spend_cursor" DISABLE ROW LEVEL SECURITY;
+DROP TABLE "chief_spend_cursor" CASCADE;
+DROP INDEX "idx_llm_spend_ts";
+```
+
+**It must not be approved, and it is not a bug in this repo.** There is no
+schema-diff tool here — no Drizzle, no Prisma, no schema file, and `.replit`
+has no migration hook; its deployment steps are `pnpm install`, `install:playwright`,
+`pnpm build`, `pnpm start` and nothing else. The SQL comes from Replit's own
+publish-time schema reconciliation.
+
+**Root cause: the DEV database was the stale side of the diff.** Verified
+read-only before anything was changed — `helium:5432/heliumdb` held
+`schema_migrations = {1}`, had `llm_spend` and `idx_llm_spend_day`, and had
+neither `chief_spend_cursor` nor `idx_llm_spend_ts`. Production had run
+migration 002 at boot. The diff took dev as the reference, saw two objects in
+production that dev had never heard of, and proposed deleting them.
+
+Dev was behind for a good reason: since L-3.4g the test suite only ever runs
+against throwaway clusters (`assertEphemeral`), so no gate run touches the real
+database any more. That safety property has a cost — dev no longer drifts
+forward by accident, so it has to be moved forward deliberately.
+
+**Why approving it would have been bad.** `schema_migrations` would still record
+002 as applied while its table was gone, so no later boot would recreate it —
+`applyMigrations` skips what is already recorded. Spend reporting would have
+failed against a missing table indefinitely. This is the same failure shape as
+the adopt-path landmine above, arriving by a different road.
+
+**The fix, and the standing procedure.** Do not hand-edit generated SQL. Make
+the diff empty by aligning dev through the app's own migrator first, so dev and
+production reach the schema by the identical path. New script:
+
+```
+node scripts/align-dev-db.mjs            # dry run: shows pending migrations and their SQL
+node scripts/align-dev-db.mjs --apply    # applies them
+```
+
+Migrations and nothing else — deliberately not `initDb()`, which also seeds the
+chief principal, replays the rescue fixtures, GCs sessions and settles jobs left
+`running`. Those are boot concerns and have no business in a schema alignment.
+It prints the backend as `host:port/database` with no credentials, runs
+`assertNoDestructiveMigrations()` before connecting, and applies inside the same
+transaction production uses. Not wired into the gate, and it must never be: it
+is the one script that intentionally touches a real database.
+
+**Applied 2026-08-12.** `heliumdb` went from `{1}` to `{1,2}`; `chief_spend_cursor`
+and `idx_llm_spend_ts` now exist there. Purely additive — the rescued chief job
+and its 20 leads were verified unchanged afterwards. The publish diff should now
+propose nothing.
+
+**Before every future publish that ships a migration:** run the dry run, apply
+it, then publish. If a diff still offers a DROP afterwards, stop — that means
+something other than this migrator changed the schema, and the answer is never
+to approve the DROP.
