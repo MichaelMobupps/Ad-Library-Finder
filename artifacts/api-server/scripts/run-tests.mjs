@@ -160,6 +160,27 @@ if (smoke.status === 0) {
   failedModules.push('smoke-l34g');
 }
 
+// L-3.5a smoke: outbound spend reporting, both modes, ephemeral clusters, a
+// fake Chief on loopback and nothing leaving the machine. Pins the properties
+// the order exists for — quanta per UTC day, an idempotent id across retries, a
+// restart that reports nothing twice, a 4xx that latches off loudly, and the
+// agreement between the status card's UTC figure and the quanta actually
+// posted. Also proves migration 002 applies to an already-migrated database,
+// which is the case that had never been exercised before this order.
+const smokeSpend = spawnSync(process.execPath, [path.join(ROOT, 'scripts', 'smoke-l35a.mjs')], {
+  cwd: ROOT,
+  encoding: 'utf8',
+});
+if (smokeSpend.status === 0) {
+  console.log('  ✓ L-3.5a smoke (spend quanta, idempotent retries, restart safety, 4xx latch, status agreement)');
+} else {
+  console.log('  ✗ L-3.5a SMOKE BROKEN');
+  for (const line of `${smokeSpend.stdout || ''}${smokeSpend.stderr || ''}`.trim().split('\n')) {
+    if (!/^\[\d{4}-/.test(line)) console.log(`      ${line}`);
+  }
+  failedModules.push('smoke-l35a');
+}
+
 // Cross-package mirror gate: constants/validators duplicated into the dashboard
 // must behave identically to the server's copy. A unit suite cannot see across
 // the package boundary, so this runs as its own step.

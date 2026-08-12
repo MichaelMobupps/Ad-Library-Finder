@@ -47,6 +47,7 @@ import {
   spendTodayUsd,
   validateCreateBody,
 } from './chief.js';
+import { getSpendReporter, spendReportingStatus } from './spendReporter.js';
 import { log } from './logger.js';
 
 export const chiefRouter: Router = Router();
@@ -78,16 +79,27 @@ const unavailable = (res: Response, what: string, err: unknown) => {
 };
 
 // ── GET /api/chief/status ────────────────────────────────────────────────────
-// Liveness plus the three facts the Chief schedules against. Every value is
-// read; none is asserted. A failed read is a 503, never a plausible zero.
+// Liveness plus the facts the Chief schedules against. Every value is read;
+// none is asserted. A failed read is a 503, never a plausible zero.
+//
+// TWO SPEND FIGURES, EACH NAMING ITS WINDOW (order L-3.5a). `spend_today_usd`
+// is the Asia/Jerusalem day the $100 cap is enforced against and is unchanged.
+// `spend_today_utc_usd` is the UTC day, which is the scope and boundary the
+// quanta posted to the Chief are counted in — so THAT is the field the Chief's
+// card reconciles against, and the field the agreement test binds to. The two
+// differ for three hours a day and both are correct; the window names are what
+// keep that from looking like a bug.
 chiefRouter.get('/status', async (_req: Request, res: Response) => {
   try {
+    const reporting = await spendReportingStatus(getSpendReporter());
     res.json({
       app: 'leadfinder',
       ok: true,
       accepting_jobs: await acceptingJobs(),
       active_jobs: await activeJobCount(),
       spend_today_usd: await spendTodayUsd(jerusalemDay()),
+      spend_today_window: 'Asia/Jerusalem',
+      ...reporting,
       server_time: new Date().toISOString(),
     });
   } catch (err) {

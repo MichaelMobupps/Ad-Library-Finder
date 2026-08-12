@@ -3,6 +3,7 @@ import { initDb } from './db.js';
 import { buildApp } from './app.js';
 import { prepareStableLibraryClosure } from './browserSetup.js';
 import { startQueue } from './queue.js';
+import { startSpendReporter } from './spendReporter.js';
 import {
   BASE_PATH,
   PUBLIC_URL,
@@ -22,6 +23,11 @@ async function main() {
   const app = buildApp();
 
   startQueue();
+
+  // Outbound spend reporting (L-3.5a). Started HERE and nowhere else: buildApp()
+  // must stay inert so a test or smoke boot never posts to anything. Prints one
+  // line per boot whether it is active or dormant.
+  startSpendReporter();
 
   const port = Number(process.env.PORT) || 3001;
   app.listen(port, '0.0.0.0', () => {
