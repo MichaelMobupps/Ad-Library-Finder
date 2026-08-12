@@ -326,8 +326,17 @@ if (FULL) {
   check(st.status === 200, `status -> 200 (got ${st.status})`);
   check(st.cacheControl === 'no-store', 'status carries Cache-Control: no-store');
   check(st.type === 'application/json', 'status answers JSON');
+  // The field list grew in order L-3.5a, which added outbound spend reporting.
+  // TWO spend figures now, each NAMING its window: `spend_today_usd` is the
+  // Asia/Jerusalem day the $100 cap is enforced against and is unchanged, and
+  // `spend_today_utc_usd` is the UTC day the quanta posted to the Chief are
+  // counted in. They legitimately differ for three hours a day, which is
+  // exactly why neither is served without its window beside it.
   check(
-    Object.keys(st.json).join(',') === 'app,ok,accepting_jobs,active_jobs,spend_today_usd,server_time',
+    Object.keys(st.json).join(',') ===
+      'app,ok,accepting_jobs,active_jobs,spend_today_usd,spend_today_window,' +
+        'spend_today_utc_usd,spend_today_utc_window,spend_unreported_usd,' +
+        'spend_reported_quanta,spend_reporter,server_time',
     `status has exactly the contracted fields (got ${Object.keys(st.json).join(',')})`,
   );
   check(st.json.app === 'leadfinder', 'status: app is leadfinder');
@@ -335,6 +344,18 @@ if (FULL) {
   check(st.json.accepting_jobs === true, 'status: accepting_jobs is true');
   check(st.json.active_jobs === 0, `status: active_jobs starts at 0 (got ${st.json.active_jobs})`);
   check(st.json.spend_today_usd === 0, 'status: spend is 0 on a fresh ledger');
+  check(st.json.spend_today_window === 'Asia/Jerusalem', 'status: the app-day figure names its window');
+  check(st.json.spend_today_utc_usd === 0, 'status: UTC spend is 0 on a fresh ledger');
+  check(st.json.spend_today_utc_window === 'UTC', 'status: the UTC figure names its window');
+  check(st.json.spend_unreported_usd === 0, 'status: nothing is lagging on a fresh ledger');
+  check(st.json.spend_reported_quanta === 0, 'status: no quanta reported on a fresh ledger');
+  // This gate boots with no CHIEF_URL / CHIEF_INGEST_TOKEN, so the honest answer
+  // is dormant — and a dormant reporter must SAY so rather than look healthy.
+  check(st.json.spend_reporter === 'dormant', 'status: an unconfigured reporter reads dormant');
+  check(
+    st.json.spend_today_utc_usd === st.json.spend_reported_quanta * 0.5 + st.json.spend_unreported_usd,
+    'status: the UTC figure agrees with reported quanta + lag',
+  );
   const t = Date.parse(st.json.server_time);
   check(Number.isFinite(t) && Math.abs(Date.now() - t) < 60_000, 'status: server_time is a fresh ISO-8601 instant');
   check(st.json.server_time.endsWith('Z'), 'status: server_time is UTC');

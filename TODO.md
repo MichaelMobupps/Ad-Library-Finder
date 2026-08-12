@@ -3255,3 +3255,209 @@ across 34 modules, plus 1,933 integration assertions, 0 failed** — chief surfa
 legacy addresses 233, OAuth 70, durability 39, L-3.4g smoke 38, fast lane 18, storage
 seam 3 · `better-sqlite3` removed from the dependency tree entirely, so the deploy no
 longer compiles a native module it cannot use.
+
+---
+
+## L-3.5a — Leadfinder reports its own spend (2026-08-12)
+
+Branch `claude/l-35a-spend-reporting`. Rollback tag `pre-l-35a-main-tip` pushed to
+origin before any change.
+
+### Blast radius, written before anything was touched
+
+**In scope, this repo only.** `artifacts/api-server/src/`: a new `spendReporter.ts`;
+`migrations.ts` (one new migration, plus the adopt-path fix below); `chief.ts` and
+`routes-chief.ts` (status fields only); `index.ts` (boot line). New gate scripts under
+`artifacts/api-server/scripts/`. No dashboard change, no human UI change.
+
+**Explicitly not touched.** The `$100/day` cap and its Asia/Jerusalem window
+(`llmBudget.ts` is read, never modified). The machine surface's job endpoints
+(`POST /api/chief/jobs`, `GET /api/chief/jobs/:id`, `/leads`) — their bodies are pinned
+by the DARK baseline and stay byte-identical. The scraping engines. O-20 through O-24.
+No publish. No secret change: `CHIEF_URL` and `CHIEF_INGEST_TOKEN` are named here and
+set by Michael; `CHIEF_TOKEN` (this app's inbound secret, which equals the Chief's
+`LEAD_FINDER_TOKEN`) is untouched.
+
+**Network.** Zero live calls. Tests and smoke run against a fake Chief bound to
+127.0.0.1 on an ephemeral port; the reporter is dormant unless `CHIEF_URL` is set, and
+no test sets it to anything off-machine. No vendor call, no email.
+
+### The two premise answers that shaped the order (decided by Michael, 2026-08-12)
+
+1. **Day boundary — option A.** Report **UTC** quanta to the Chief. Leave
+   `spend_today_usd` and the `$100` cap on **Asia/Jerusalem**, untouched. Add a distinct
+   UTC-scoped status field and bind the agreement test to *that* field. Both fields name
+   their window in the contract, because the Chief's card and this app's own screen
+   legitimately differ for three hours a day. Mirrors the Email Followupper, whose
+   `health.budget` carries both windows for the same reason.
+2. **`initiated_by` — omitted entirely.** The Chief treats an absent value as
+   legacy-unattributed: counted for truth, never braking. No attribution is invented, no
+   column is added, no job identity is threaded. Per-row attribution gets its own order.
+
+### Scope item 3, answered: the 2026-08-11 reading was legitimate — no defect
+
+The Chief's card showed `spend_today_usd` at `$7.6492` all evening on 2026-08-11 and
+`$0.0000` at 21:00 UTC. Both readings were correct.
+
+- **It is read from the durable ledger, not an in-process accumulator.**
+  `routes-chief.ts:90` → `chief.ts:871` →
+  `SELECT COALESCE(SUM(usd),0) FROM llm_spend WHERE spend_day = ?`. That is the
+  PostgreSQL table L-3.4g moved this app onto. A restart does not reset it, and
+  `chief.ts` deliberately does not use `llmBudget.spentTodayUsd()` because that helper
+  swallows a failed read and returns 0 — right for a budget gate, wrong for a status
+  figure that must 503 instead of fabricating a zero.
+- **The day boundary is Asia/Jerusalem, not UTC.** `llmBudget.jerusalemDay()` tags every
+  row, and the same sum enforces the cap.
+- **21:00 UTC is Jerusalem midnight.** Verified by execution rather than by arithmetic:
+  `jerusalemDay()` returns `2026-08-11` at `20:59:59Z` and `2026-08-12` at `21:00:00Z`
+  (IDT = UTC+3 in August). The reset landed on the boundary to the second.
+
+Nothing to fix. Recorded and moved on, as instructed.
+
+### A landmine found in the blast radius, fixed here because this order trips it
+
+`applyMigrations()` refuses to run *any* pending migration when the baseline tables are
+already present, and offers `LEADFINDER_DB_ADOPT=1` as the way out. That is correct for
+the case it was written for — a schema created by something other than this migrator,
+with no migration state at all — but the condition it actually tests is
+`pending.length > 0 && baseline tables exist`, which every future migration satisfies.
+
+L-3.5a ships migration `002`, the first migration after the baseline, so it is the first
+order to trip it. Left alone, the production database (which has `001` recorded and all
+nineteen tables) would have **refused to boot**, and an operator following the error's own
+instruction would have set `LEADFINDER_DB_ADOPT=1` and recorded `002` as applied
+**without creating `chief_spend_cursor`** — after which no later boot would ever create
+it and the reporter would fail against a missing table forever.
+
+Fixed by gating the adopt path on `applied.size === 0`: adopt exists for a database this
+migrator has never recorded anything in. Once it owns the schema, later migrations run.
+
+### As built — what is reported, how, and what the Chief will show
+
+| | |
+|---|---|
+| **Figure reported** | This app's own `llm_spend` ledger — the same rows the $100 cap is enforced against. Summed as a RANGE over `llm_spend.ts` (absolute epoch-ms), never re-derived from anywhere else. |
+| **Vendor** | `anthropic`, one today. Per-vendor by construction: a second paid vendor is another cursor row and another quantum stream, no mechanism change. |
+| **Day boundary** | **UTC**, per the Chief's fleet contract. `spendReporter.utcDay()` / `utcDayBounds()` are the only definition, and a unit invariant plus a smoke assertion pin them as exact inverses. |
+| **Quanta** | `$0.50`. One HTTP request per quantum, numbered `q1..qn` within a vendor-day. The sub-quantum remainder is never rounded — it stays visible as lag. |
+| **Idempotency** | `external_id = leadfinder:<vendor>:<utc-day>:q<n>`. A retry, a timeout or a crash re-sends the identical id. |
+| **Attribution** | **`initiated_by` is omitted entirely.** Not guessed, not defaulted. |
+| **Transport** | `POST <CHIEF_URL>/api/ingest/spend`, `Authorization: Bearer <CHIEF_INGEST_TOKEN>`, `content-type: application/json`. Body is exactly five fields: `app`, `vendor`, `day`, `amount_usd`, `external_id`. |
+| **Retries** | 5xx and transport errors: up to 4 attempts, 500ms linear backoff, same `external_id`. Any 4xx: **never retried**, reporter latches off with one loud line. |
+| **Cursor** | `chief_spend_cursor(utc_day, vendor, reported_quanta, updated_at)`, advanced only after a 2xx, monotonic via `GREATEST`. |
+| **Cadence** | One sweep at boot, then every 5 minutes. 7-day lookback; a day that falls off the back still owing quanta is named out loud, with the shortfall in dollars. |
+| **Dormancy** | Unset `CHIEF_URL` or `CHIEF_INGEST_TOKEN` ⇒ dormant, one loud warning per boot, no crash, no request. |
+
+**What the Chief's card will show.** The sum of this app's whole $0.50 quanta for
+the UTC day, with no `initiated_by`, i.e. entirely legacy-unattributed. It will
+trail this app's own ledger by up to $0.49 (the open quantum) and by whatever is
+in flight between ticks. It will NOT equal `spend_today_usd` on that card for
+three hours a day — from 21:00 UTC, when the Jerusalem day rolls, until 00:00
+UTC, when the UTC day does. That gap is the design, not a fault, and both
+windows are named in the response so nobody has to guess which is which.
+
+**What `/api/chief/status` now serves** (the four fields before it are unchanged):
+
+```
+spend_today_usd         2.37     ← Asia/Jerusalem day; the figure the $100 cap uses
+spend_today_window      "Asia/Jerusalem"
+spend_today_utc_usd     2.37     ← UTC day; the scope and boundary the Chief is sent
+spend_today_utc_window  "UTC"
+spend_reported_quanta   4        ← $2.00 acknowledged
+spend_unreported_usd    0.37     ← the cursor's lag, so a silent reporter is visible
+spend_reporter          "active" ← dormant | active | latched
+```
+
+The agreement test binds to the UTC field, not to `spend_today_usd`:
+`spend_today_utc_usd == spend_reported_quanta × 0.50 + spend_unreported_usd`,
+asserted in the unit suite, over real HTTP in both modes, and against the quanta
+the fake Chief actually received.
+
+### What the real Chief must accept
+
+1. **A body with no `initiated_by`.** The smoke proves the reporter latches off
+   rather than inventing an attribution when a Chief 422s the omission — so if
+   the real Chief rejects it, reporting stops dead and says so, but it never
+   ships a fabricated split. Confirm the ingest endpoint treats an absent value
+   as legacy-unattributed.
+2. **`day` as a UTC calendar date**, `YYYY-MM-DD`, with `amount_usd` always
+   `0.50`.
+3. **`external_id` dedup across retries**, since at-least-once delivery is the
+   only thing a crash between "accepted" and "cursor written" can offer.
+4. **Never a 429 on ingest.** As ordered, every 4xx latches the reporter off and
+   429 is a 4xx — so one rate-limit reply would silence this app's reporting
+   until its next boot. Flagged rather than silently deviated from: if the Chief
+   can 429, that status wants moving to the retry branch in a follow-up.
+
+The Chief's `CONTRACT.md` was **not reachable** from this workspace, so the shape
+above mirrors the proven pattern as described in the order. Every assumption in
+it is listed here rather than buried in the code.
+
+### Gates, audits and proofs
+
+Full suite green: **1828 offline assertions across 35 modules**, plus the storage
+seam, fast lane, durability, the L-3.4g smoke, the cross-package mirrors, the
+OAuth gates, and `chief-surface` in all four modes (dark, lit, unset, padded).
+Build green for both packages. The new `smoke-l35a` runs in the gate.
+
+Mutation proofs, each applied, observed to bite, and reverted:
+
+| Mutation | What bit |
+|---|---|
+| Cursor write removed | `B: after a real restart the same days send nothing` — **35 quanta re-sent** |
+| 4xx made retryable | 8 unit assertions, plus smoke `D` and `E` — the 4xx was attempted 4 times and never latched |
+| UTC day shifted 3h in one place | 2 unit assertions immediately; **the smoke did not bite at first** |
+
+That third result was the useful one. The boundary is expressed by two functions
+facing opposite ways — `utcDay()` labels an instant, `utcDayBounds()` gives a
+label's range — and every assertion happened to exercise only one of them, so a
+three-hour shift in one slipped through. Fixed by pinning the property that
+actually matters: the day an instant is labelled with must be the day whose
+bounds contain it, asserted over ten instants in the unit suite and over the
+real fixture rows in the smoke. The mutation then bit in both.
+
+Security round: the ingest token is read once, appears in exactly one expression
+in the whole module (the `Authorization` header), and reaches no log line, error
+message or response — asserted in the unit suite (`announce` with a planted
+secret) and in the smoke (log capture across a 5xx retry and a 4xx latch). The
+inbound `CHIEF_TOKEN` is untouched. End-user round: no human-facing change —
+the dashboard is not touched, `/api/chief/*` is machine-only behind the token,
+and the legacy-redirect and form-CSS gates are green.
+
+### Two things found on the way, both fixed here
+
+1. **The adopt-path landmine** (above). Migration 002 would have refused to boot
+   against production, and adopting past it would have recorded the migration
+   without creating its table. Proved in the smoke: 002 now applies cleanly to a
+   database that already has 001, and the adopt path still refuses an unrecorded
+   schema and still records-without-running under `LEADFINDER_DB_ADOPT=1`.
+2. **A warning that would have cried wolf every five minutes.** The out-of-window
+   notice first fired on the mere existence of ledger rows older than the sweep
+   window — true for every app older than a week. Narrowed to the case worth
+   hearing: an old day that is still unsettled, named with its dollar shortfall.
+
+### Operator notes for the publish
+
+- **Migration plan:** one new migration, `002 chief spend reporting cursor`. It
+  creates `chief_spend_cursor` and one index, `idx_llm_spend_ts`. Additive only;
+  no table is altered and nothing is dropped.
+- **Do not adopt past it.** `LEADFINDER_DB_ADOPT=1` is for a database with NO
+  migration state. Production has `001` recorded, so 002 will simply run. If a
+  future boot ever demands adoption, that means the migration state is missing,
+  and adopting would record 002 without creating its table — investigate instead.
+- **The standing rule is unchanged:** a generated migration containing DROP is
+  never approved, and `assertNoDestructiveMigrations()` enforces it in the gate.
+- **Secrets Michael sets:** `CHIEF_URL` and `CHIEF_INGEST_TOKEN`. Until both are
+  set the app boots normally and logs one dormant warning per boot. `CHIEF_TOKEN`
+  stays exactly as it is; it is a different secret from `CHIEF_INGEST_TOKEN`.
+- **Not published by this order.** The no-publish-until-close rule from L-3.4g
+  still applies.
+
+### Still open, untouched by this order
+
+O-20 rate limiting, O-21 `/leads` cost, O-22 Activity crowding, O-23
+cancellation, O-24 AppGoblin categories. **O-25 is closed by this order**, with
+the one caveat that attribution is reported as absent rather than split —
+per-row attribution needs `llm_spend` to carry a job identity, which is a
+schema and plumbing change across `classifier.ts`, `hqResolver.ts` and
+`webResolver.ts`, and has its own order.

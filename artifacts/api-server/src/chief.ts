@@ -836,7 +836,26 @@ export interface ChiefStatus {
   ok: true;
   accepting_jobs: boolean;
   active_jobs: number;
+  /**
+   * This app's own spend figure, on this app's own day. UNCHANGED by L-3.5a and
+   * deliberately so: it is the number the $100 cap is enforced against, and a
+   * card showing a figure the cap does not use would be worse than no card.
+   */
   spend_today_usd: number;
+  /**
+   * The window `spend_today_usd` is measured in. Named because the UTC figure
+   * beside it is measured in a different one, and for three hours a day
+   * (21:00–24:00 UTC in summer) the two legitimately disagree.
+   */
+  spend_today_window: 'Asia/Jerusalem';
+  /** UTC-day spend — the same scope and boundary reported to the Chief. */
+  spend_today_utc_usd: number;
+  spend_today_utc_window: 'UTC';
+  /** This UTC day's USD not yet acknowledged by the Chief: the cursor's lag. */
+  spend_unreported_usd: number;
+  spend_reported_quanta: number;
+  /** dormant | active | latched — so a silent reporter is visible, not assumed. */
+  spend_reporter: 'dormant' | 'active' | 'latched';
   server_time: string;
 }
 

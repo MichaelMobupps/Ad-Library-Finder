@@ -326,8 +326,44 @@ const BASELINE = `
   );
 `;
 
+/**
+ * 002 — the Chief spend-reporting cursor (order L-3.5a).
+ *
+ * What has been reported to the Chief, per UTC day per vendor, counted in
+ * whole $0.50 quanta. The reporter emits one request per quantum and advances
+ * this row in the SAME transaction as the request it just got a 2xx for, so a
+ * restart at any instant never double-reports and never loses a quantum.
+ *
+ * The day here is UTC, unlike `llm_spend.spend_day`, which is Asia/Jerusalem.
+ * That is deliberate and decided: the Chief's fleet contract counts UTC days,
+ * while this app's own $100 cap resets at Jerusalem midnight. Both windows are
+ * real, they differ by three hours, and each is named wherever it is served.
+ * The UTC day is derived from `llm_spend.ts` — an absolute epoch-ms stamp — so
+ * this is the same ledger read on a different boundary, never a second source
+ * of spend truth.
+ *
+ * `reported_quanta` is a count, not an amount: it is exact in integers, where
+ * a running USD total accumulated in binary floating point would not be.
+ */
+const CHIEF_SPEND_CURSOR = `
+  -------------------------------------------------------- chief_spend_cursor
+  CREATE TABLE chief_spend_cursor (
+    utc_day         text NOT NULL,
+    vendor          text NOT NULL,
+    reported_quanta bigint NOT NULL DEFAULT 0,
+    updated_at      bigint NOT NULL,
+    PRIMARY KEY (utc_day, vendor)
+  );
+
+  -- The reporter sums a UTC day as a RANGE over llm_spend.ts, because the only
+  -- indexed column, spend_day, carries the Jerusalem day. Without this index
+  -- every sweep is a sequential scan that grows with the ledger forever.
+  CREATE INDEX idx_llm_spend_ts ON llm_spend(ts);
+`;
+
 export const MIGRATIONS: readonly Migration[] = [
   { id: 1, name: 'baseline schema ported from sqlite', sql: BASELINE },
+  { id: 2, name: 'chief spend reporting cursor', sql: CHIEF_SPEND_CURSOR },
 ];
 
 /** Every table the baseline owns — the set the adopt check looks for. */
@@ -470,7 +506,22 @@ export async function applyMigrations(
     if (pending.length === 0) return;
 
     // Is there already a schema here that this migrator did not record?
-    const present = await existingBaselineTables(t);
+    //
+    // ONLY when it has recorded NOTHING. The adopt path exists for one state: a
+    // database whose schema was created by something other than this migrator,
+    // so `schema_migrations` is empty while the tables are there. Once even one
+    // migration is recorded, this migrator owns the schema and every later
+    // migration simply runs.
+    //
+    // Gating on `pending.length > 0` instead — which is what this did until
+    // order L-3.5a — breaks the moment a SECOND migration is ever added: the
+    // production database has 001 recorded and all nineteen baseline tables, so
+    // the pending 002 would trip the refusal and the app would not boot. Worse,
+    // an operator following the error's own instruction would set
+    // LEADFINDER_DB_ADOPT=1 and record 002 as applied WITHOUT running it,
+    // leaving a table that no later boot would ever create. L-3.5a ships the
+    // first post-baseline migration and is therefore the first order to trip it.
+    const present = applied.size === 0 ? await existingBaselineTables(t) : [];
     if (present.length > 0) {
       if (!opts.adopt) {
         throw new Error(
@@ -600,6 +651,28 @@ export function runMigrationsTests(): { passed: number; failed: number; failures
   check(
     !/GENERATED ALWAYS AS IDENTITY/.test(baselineSql),
     'migrations: no identity is ALWAYS — the rescue seed inserts explicit ids',
+  );
+
+  // ── 002, the spend cursor (L-3.5a) ──
+  const m2 = MIGRATIONS.find((m) => m.id === 2);
+  check(!!m2, 'migrations: 002 is shipped');
+  check(
+    !!m2 && /CREATE TABLE chief_spend_cursor\b/.test(m2.sql),
+    'migrations: 002 creates chief_spend_cursor',
+  );
+  check(
+    !!m2 && /PRIMARY KEY \(utc_day, vendor\)/.test(m2.sql),
+    'migrations: the cursor is keyed per UTC day per vendor',
+  );
+  check(
+    !!m2 && !/\binteger\b/i.test(m2.sql),
+    'migrations: 002 uses bigint, not int4 — updated_at is epoch-ms',
+  );
+  // The cursor is NOT a baseline table. Listing it would make the adopt check
+  // look for a table migration 001 never creates.
+  check(
+    !BASELINE_TABLES.includes('chief_spend_cursor'),
+    'migrations: the cursor is not claimed by the baseline',
   );
 
   return { passed, failed: failures.length, failures };
